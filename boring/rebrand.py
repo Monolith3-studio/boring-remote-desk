@@ -32,6 +32,41 @@ LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Sour
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 
+# Ticket 18: what the connect box says when a name doesn't resolve to a tailnet
+# address. It is also the translation key (src/lang/*.rs, English everywhere).
+NOT_FOUND = "Couldn't find that machine. Type its Tailscale name or IP."
+# Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
+# out (check.py derives them from TAILNET and compares).
+TAILNET_RESOLVER = f"""
+// boring-remote: connect by tailnet name. A name (with or without a port) goes
+// through the system resolver, which covers MagicDNS, and connects Direct IP only
+// if every address it resolves to is a Tailscale one. Anything else is refused.
+const BORING_NOT_FOUND: &str = "{NOT_FOUND}";
+
+fn boring_is_tailnet(addr: SocketAddr) -> bool {{
+    match hbb_common::try_into_v4(addr).ip() {{
+        std::net::IpAddr::V4(ip) => ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64,
+        std::net::IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }}
+}}
+
+async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {{
+    let lookup = hbb_common::tokio::time::timeout(
+        std::time::Duration::from_millis(CONNECT_TIMEOUT),
+        hbb_common::tokio::net::lookup_host(check_port(peer, RELAY_PORT + 1)),
+    )
+    .await;
+    let addrs: Vec<SocketAddr> = match lookup {{
+        Ok(Ok(addrs)) => addrs.collect(),
+        _ => bail!(BORING_NOT_FOUND),
+    }};
+    if addrs.is_empty() || !addrs.iter().all(|a| boring_is_tailnet(*a)) {{
+        bail!(BORING_NOT_FOUND);
+    }}
+    Ok(addrs.iter().find(|a| a.is_ipv4()).copied().unwrap_or(addrs[0]))
+}}
+"""
+
 GUARD = "if true { return; } // boring-remote: stripped"
 GUARD_OK = "if true { return Ok(()); } // boring-remote: stripped"
 
@@ -163,6 +198,24 @@ PATCHES = [
      "                    check_port(*first, RENDEZVOUS_PORT),\n"
      "                    rest.iter()\n",
      "id@public peer fails cleanly"),
+    # --- ticket 18: connect box takes a tailnet name, never an ID --------------
+    ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
+     TAILNET_RESOLVER + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
+     "tailnet name resolver"),
+    ("src/client.rs",
+     "        // Allow connect to {domain}:{port}\n"
+     "        if hbb_common::is_domain_port_str(peer) {\n"
+     "            return Ok((\n"
+     "                (\n"
+     "                    connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,\n",
+     "        // boring-remote: anything that is not an IP is a tailnet name, never an ID.\n"
+     "        // There is no rendezvous server, so the ID path below can't be reached.\n"
+     "        if true {\n"
+     "            return Ok((\n"
+     "                (\n"
+     "                    connect_tcp_local(boring_tailnet_addr(peer).await?, None, CONNECT_TIMEOUT)\n"
+     "                        .await?,\n",
+     "names connect Direct IP to a tailnet address; no ID/rendezvous path"),
     # --- lock bypasses: these write past OVERWRITE_SETTINGS ------------------
     ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n",
      "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n"
@@ -430,6 +483,7 @@ OUR_WORKFLOW_PREFIX = "boring-"
 # display name; a value that is a RustDesk link becomes "" (the UI no longer shows those).
 LANG_DIR = "src/lang"
 LANG_VALUE = re.compile(r'(\(\s*"(?:[^"\\]|\\.)*",\s*")((?:[^"\\]|\\.)*)("\s*\))')
+LANG_END = re.compile(r"\),?\n(\s*\]\.iter\(\)\.cloned\(\)\.collect\(\);)")  # the last entry
 RUSTDESK_LINK = re.compile(r"rustdesk\.com|github\.com/rustdesk")
 
 
@@ -486,9 +540,11 @@ def plan(root):
             texts[rel] = _read(p)
         text, crlf = texts[rel]
         text2 = LANG_VALUE.sub(_lang_value, text)
+        if f'("{NOT_FOUND}", ' not in text2:
+            text2 = LANG_END.sub(f'),\n        ("{NOT_FOUND}", ""),\n\\1', text2, count=1)
         if text2 != text:
             texts[rel] = (text2, crlf)
-            changed.append(f"{rel}: translations say {DISPLAY_NAME}")
+            changed.append(f"{rel}: translations say {DISPLAY_NAME}, plain not-found error")
     writes, deletes = {}, []
     for rel, (text, crlf) in texts.items():
         if text is not None:
