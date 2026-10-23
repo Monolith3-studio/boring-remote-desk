@@ -196,13 +196,31 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", "        let addr = hbb_common::try_into_v4(addr);\n", "")
         self.assert_check_fails("whitelist is enforced on incoming connections")
 
-    def test_moved_patch_target_stops_the_script(self):
+    def test_moved_patch_target_stops_the_script_and_writes_nothing(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
         cfg.write_text(cfg.read_text().replace('&["rs-ny.rustdesk.com"]', '&["rs-sg.rustdesk.com"]'))
+        before = tree_hashes(self.root)
         r = run(REBRAND, self.root)
         self.assertEqual(r.returncode, 2)
         self.assertIn("patch target moved", r.stderr)
         self.assertIn("libs/hbb_common/src/config.rs", r.stderr)
+        self.assertIn("rebrand: nothing written", r.stdout)
+        self.assertEqual(before, tree_hashes(self.root))  # no patch, copy or workflow removal
+
+    def test_line_endings_are_kept(self):
+        crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",
+                "libs/hbb_common/src/config.rs"]
+        for rel in crlf:
+            path = self.root / rel
+            path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        self.rebrand()
+        for rel in crlf:
+            data = (self.root / rel).read_bytes()
+            self.assertEqual(data.count(b"\n"), data.count(b"\r\n"), f"{rel} lost CRLF")
+        self.assertIn(b"PRODUCT_NAME = BoringRemote\r\n", (self.root / crlf[0]).read_bytes())
+        for rel in ("src/common.rs", "flutter/windows/runner/Runner.rc"):  # LF stays LF
+            self.assertNotIn(b"\r", (self.root / rel).read_bytes(), rel)
+        self.assertIn("rebrand: 0 changed, 0 moved", self.rebrand().stdout)
 
 
 if __name__ == "__main__":

@@ -9,8 +9,9 @@ not a mass find-replace: every change below names the file, the exact upstream
 text it expects, and why. Running it twice changes nothing the second time.
 
 If upstream moved a patch target (neither the upstream text nor our text is
-there), the script stops with exit 2 and names every moved target. Fix the
-entry here, never by hand-editing the tree.
+there), the script stops with exit 2, names every moved target and writes
+nothing: every target is checked before any file changes. Fix the entry here,
+never by hand-editing the tree. Patched files keep their line endings.
 
 Stdlib only. Checked by boring/check.py.
 """
@@ -278,46 +279,76 @@ COPIES = [
 OUR_WORKFLOW_PREFIX = "boring-"
 
 
-def apply(root):
+def _read(path):
+    """(text with LF endings, True if the file uses CRLF), or (None, False) if missing.
+
+    Patches are written with LF; a CRLF checkout (Windows, text=auto) is matched
+    on LF and written back as CRLF, so a patched file keeps its endings."""
+    if not path.is_file():
+        return None, False
+    text = path.read_bytes().decode("utf-8")
+    return text.replace("\r\n", "\n"), "\r\n" in text
+
+
+def _patch(text, old, new):
+    """(patched text, replacements made); 0 replacements if already applied."""
+    if isinstance(old, re.Pattern):
+        return old.subn(new.replace("\\", "\\\\"), text)
+    if old in new:  # an insertion: applied once `new` is there
+        return text.replace(old, new), (0 if new in text else text.count(old))
+    return text.replace(old, new), text.count(old)
+
+
+def plan(root):
+    """Everything a run would do, without touching the tree.
+
+    Returns (writes {rel: bytes}, deletes [rel], changed [msg], moved [msg])."""
     root = pathlib.Path(root)
-    changed, moved = [], []
-    texts = {}
+    changed, moved, texts = [], [], {}
     for rel, old, new, why in PATCHES:
-        path = root / rel
         if rel not in texts:
-            texts[rel] = path.read_text(encoding="utf-8") if path.is_file() else None
-        text = texts[rel]
+            texts[rel] = _read(root / rel)
+        text, crlf = texts[rel]
         if text is None:
             moved.append(f"{rel}: file missing ({why})")
             continue
-        if isinstance(old, re.Pattern):
-            text2, n = old.subn(new.replace("\\", "\\\\"), text)
-        elif old in new:  # an insertion: applied once `new` is there
-            n = 0 if new in text else text.count(old)
-            text2 = text.replace(old, new)
-        else:
-            n = text.count(old)
-            text2 = text.replace(old, new)
+        text2, n = _patch(text, old, new)
         if n:
-            texts[rel] = text2
+            texts[rel] = (text2, crlf)
             changed.append(f"{rel}: {why}")
         elif new not in text:
             moved.append(f"{rel}: patch target moved ({why})")
-    for rel, text in texts.items():
-        if text is not None and (root / rel).read_text(encoding="utf-8") != text:
-            (root / rel).write_text(text, encoding="utf-8")
+    writes, deletes = {}, []
+    for rel, (text, crlf) in texts.items():
+        if text is not None:
+            data = (text.replace("\n", "\r\n") if crlf else text).encode("utf-8")
+            if (root / rel).read_bytes() != data:
+                writes[rel] = data
     for src, rel, why in COPIES:
         data, dest = (HERE / src).read_bytes(), root / rel
         if not dest.is_file() or dest.read_bytes() != data:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
+            writes[rel] = data
             changed.append(f"{rel}: {why}")
     wf = root / ".github" / "workflows"
     if wf.is_dir():
         for f in sorted(wf.iterdir()):
             if f.suffix in (".yml", ".yaml") and not f.name.startswith(OUR_WORKFLOW_PREFIX):
-                f.unlink()
+                deletes.append(f".github/workflows/{f.name}")
                 changed.append(f".github/workflows/{f.name}: removed upstream workflow")
+    return writes, deletes, changed, moved
+
+
+def apply(root):
+    """Patch the tree, all or nothing: if any target moved, nothing is written."""
+    root = pathlib.Path(root)
+    writes, deletes, changed, moved = plan(root)
+    if moved:
+        return [], moved
+    for rel, data in writes.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    for rel in deletes:
+        (root / rel).unlink()
     return changed, moved
 
 
@@ -328,8 +359,11 @@ def main(argv):
         print("patched", c)
     for m in moved:
         print("ERROR", m, file=sys.stderr)
-    print(f"rebrand: {len(changed)} changed, {len(moved)} moved")
-    return 2 if moved else 0
+    if moved:
+        print(f"rebrand: nothing written, {len(moved)} moved")
+        return 2
+    print(f"rebrand: {len(changed)} changed, 0 moved")
+    return 0
 
 
 if __name__ == "__main__":

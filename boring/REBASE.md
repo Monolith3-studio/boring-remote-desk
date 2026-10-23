@@ -52,7 +52,7 @@ Then run the same tests, `rebrand.py` and `check.py` as above. Push, wait for gr
 
 ## When `rebrand.py` exits 2 (patch target moved)
 
-It prints `ERROR <file>: patch target moved (<why>)` for every entry whose upstream text it can't find, and writes nothing that matters. Fix the script, not the tree:
+It checks every target before it changes any file. It prints `ERROR <file>: patch target moved (<why>)` for every entry whose upstream text it can't find, then `rebrand: nothing written, N moved`, and leaves the tree exactly as it was: no patch, no copied art, no workflow removed. So there's nothing to reset. Fix the script, not the tree:
 
 1. Find what upstream did: `git log -p OLD..NEW -- <file>` (run it inside `libs/hbb_common` for `libs/hbb_common/...` paths).
 2. Edit that entry in `PATCHES` in `boring/rebrand.py`. The new `old` text has to be upstream's current text exactly. Keep `new` doing the same job. If the setting moved to another file, change the path.
