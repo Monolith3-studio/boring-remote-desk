@@ -4,11 +4,11 @@
 Usage:  python3 boring/art/make_app_art.py [--icns PATH]
 
 One icon family on every surface: ink body, paper screen, coral pointer, the
-same glyph as the Mac kit (the-boring-remote/app/AppIcon.icns, make-icon.swift)
+same glyph as the Mac kit (the-boring-remote/design/icon/AppIcon.icns, make-icon.swift)
 and the Windows MSI icon (boring/msi/make_art.py). Flat colours only.
 
 --icns is the Mac kit's AppIcon.icns, copied as-is (default:
-~/code/the-boring-remote/app/AppIcon.icns). Its largest image is the master
+~/code/the-boring-remote/design/icon/AppIcon.icns). Its largest image is the master
 for the PNG sizes upstream ships. The Windows tray icon and icon.svg are drawn
 from the same grid as boring/msi/make_art.py. The menu-bar icon is a template
 glyph: pure black plus alpha, so macOS tints it for light and dark menu bars.
@@ -93,7 +93,7 @@ def on(bg, glyph, tint, scale):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--icns", type=pathlib.Path,
-                    default=pathlib.Path("~/code/the-boring-remote/app/AppIcon.icns").expanduser())
+                    default=pathlib.Path("~/code/the-boring-remote/design/icon/AppIcon.icns").expanduser())
     args = ap.parse_args()
     if not args.icns.is_file():
         sys.exit(f"missing {args.icns}: pass --icns (the Mac kit's AppIcon.icns)")
