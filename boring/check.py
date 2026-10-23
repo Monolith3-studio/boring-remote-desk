@@ -10,8 +10,9 @@ test / updater / LAN discovery unreachable, no RustDesk public server named in s
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
-translations, app metadata, every logo slot; one AGPL line on the About page), and
-that the protocol files are upstream's. It only reads the tree.
+translations, app metadata, every logo slot; one AGPL line on the About page), that
+the connect box takes an IP or a tailnet name and never reaches the ID/rendezvous
+path, and that the protocol files are upstream's. It only reads the tree.
 Idempotence is proved by test_rebrand.py and the CI clean-diff step.
 
 Prints one PASS/FAIL line per fact, then
@@ -472,6 +473,68 @@ def branding_checks(c):
                and 0.08 < len(ink) / len(img[2]) < 0.7, img and f"{img[0]}x{img[1]}")
 
 
+TAILNET_GUARD = ("        if true {\n            return Ok((\n                (\n"
+                 "                    connect_tcp_local(boring_tailnet_addr(peer).await?, None, CONNECT_TIMEOUT)\n")
+ROUTE_AROUND = re.compile(r"rendezvous|RENDEZVOUS|_start_inner|other_server|is_domain_port_str|get_lch")
+
+
+def tailnet_exprs():
+    """The Rust tests for rebrand.TAILNET's two ranges, derived from the CIDRs."""
+    import ipaddress
+    v4, v6 = (ipaddress.ip_network(n) for n in rebrand.TAILNET.split(","))
+    assert v4.prefixlen == 10 and v6.prefixlen == 48, "boring_is_tailnet is written for a /10 and a /48"
+    o = v4.network_address.packed
+    mask = (0xFF << (16 - v4.prefixlen)) & 0xFF
+    segs = ", ".join(f"0x{int.from_bytes(v6.network_address.packed[i:i + 2], 'big'):x}" for i in (0, 2, 4))
+    return (f"ip.octets()[0] == {o[0]} && (ip.octets()[1] & 0x{mask:x}) == {o[1]}",
+            f"ip.segments()[..3] == [{segs}]")
+
+
+def connect_checks(c):
+    """Ticket 18: the connect box takes an IP or a tailnet name, never an ID."""
+    client = c.read("src/client.rs")
+    body = fn_body(client, "    async fn _start(\n") or ""
+    guard = body.find(TAILNET_GUARD)
+    pre = strip_tests_and_comments(body[:guard]) if guard >= 0 else ""
+    block = body[guard:body.find("\n        }\n", guard)] if guard >= 0 else ""
+    tops = [l.strip() for l in pre.splitlines() if l.startswith("        ") and not l.startswith("         ")]
+    why = []
+    if guard < 0:
+        why.append("no unconditional tailnet return after the IP branch")
+    if ROUTE_AROUND.search(pre):
+        why.append(f"_start touches the ID path first: {ROUTE_AROUND.findall(pre)}")
+    if "if hbb_common::is_ip_str(peer) {" not in pre or any(not t.startswith(("if ", "}")) for t in tops):
+        why.append(f"only the incoming-only and IP branches may come first: {tops}")
+    if guard >= 0 and ("return Ok((" not in block or "else" in block):
+        why.append("the tailnet block does not always return")
+    calls = [m.start() for m in re.finditer(r"Self::_start_inner\(", client)]
+    start = client.find("    async fn _start(\n")
+    if not calls or any(not (start < i < start + len(body) + 200) for i in calls) or \
+            len(re.findall(r"::_start\(", client)) != 1:
+        why.append("_start / _start_inner are called from somewhere else")
+    c.fact("connect box never reaches the ID/rendezvous path", not why, "; ".join(why))
+
+    resolver = fn_body(client, "async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {") or ""
+    is_tailnet = fn_body(client, "fn boring_is_tailnet(addr: SocketAddr) -> bool {") or ""
+    v4, v6 = tailnet_exprs()
+    why = []
+    if f'const BORING_NOT_FOUND: &str = "{rebrand.NOT_FOUND}";' not in client:
+        why.append("error text is not rebrand.NOT_FOUND")
+    for need in ("lookup_host(check_port(peer, RELAY_PORT + 1))", "_ => bail!(BORING_NOT_FOUND),",
+                 "if addrs.is_empty() || !addrs.iter().all(|a| boring_is_tailnet(*a)) {\n        bail!(BORING_NOT_FOUND);"):
+        if need not in resolver:
+            why.append(f"resolver lost: {need.splitlines()[0]}")
+    for need in ("hbb_common::try_into_v4(addr).ip()", f"V4(ip) => {v4},", f"V6(ip) => {v6},"):
+        if need not in is_tailnet:
+            why.append(f"tailnet test is not {need}")
+    c.fact("names connect Direct IP only to Tailscale addresses, else the plain error", not why, "; ".join(why))
+
+    key = f'("{rebrand.NOT_FOUND}", '
+    langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
+    missing = [p.name for p in langs if p.read_text(encoding="utf-8").count(key) != 1]
+    c.fact("plain not-found error is in every translation file", langs and not missing, ", ".join(missing))
+
+
 def run_checks(root):
     c = Check(root)
     cfg = c.read(HBB)
@@ -617,6 +680,7 @@ def run_checks(root):
 
     msi_checks(c, workflows)
     branding_checks(c)
+    connect_checks(c)
 
     # protocol untouched: every .proto in the tree is upstream's, byte for byte
     c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))

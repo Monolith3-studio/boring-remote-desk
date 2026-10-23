@@ -20,6 +20,9 @@ import check  # noqa: E402  (shares the installer-string reader with check.py)
 import rebrand  # noqa: E402
 
 REPO = HERE.parent
+CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
+CONNECT_TAILNET = "names connect Direct IP only to Tailscale addresses, else the plain error"
+NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 
@@ -77,7 +80,8 @@ class RebrandSeam(unittest.TestCase):
                      "no RustDesk name or link in any translation",
                      "no RustDesk in app metadata", "window titles and tray tooltip say Boring Remote",
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
-                     "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph"):
+                     "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
+                     CONNECT_DIRECT, CONNECT_TAILNET, NOT_FOUND_TRANSLATED):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -287,6 +291,44 @@ class RebrandSeam(unittest.TestCase):
                   "color: MyTheme.accent,")
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*desktop_setting_page.dart:\d+")
+
+    # --- ticket 18: connect by tailnet name ----------------------------------
+    def test_domain_port_branch_back_in_connect_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        if true {\n            return Ok((\n                (\n"
+                  "                    connect_tcp_local(boring_tailnet_addr(peer).await?",
+                  "        if hbb_common::is_domain_port_str(peer) {\n            return Ok((\n                (\n"
+                  "                    connect_tcp_local(boring_tailnet_addr(peer).await?")
+        self.assert_check_fails(CONNECT_DIRECT)
+
+    def test_rendezvous_lookup_before_the_tailnet_guard_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        // boring-remote: anything that is not an IP is a tailnet name",
+                  "        let _ = crate::get_rendezvous_server(1_000).await;\n"
+                  "        // boring-remote: anything that is not an IP is a tailnet name")
+        self.assert_check_fails(CONNECT_DIRECT)
+
+    def test_non_tailnet_answer_accepted_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "!addrs.iter().all(|a| boring_is_tailnet(*a))",
+                  "!addrs.iter().any(|a| boring_is_tailnet(*a))")
+        self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_widened_tailnet_range_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "(ip.octets()[1] & 0xc0) == 64", "(ip.octets()[1] & 0x80) == 0")
+        self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_reworded_error_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.NOT_FOUND, "failed to lookup address information")
+        self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_not_found_key_missing_from_a_language_fails_check(self):
+        self.rebrand()
+        self.edit("src/lang/fr.rs", f'        ("{rebrand.NOT_FOUND}", ""),\n', "")
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, rf"FAIL {NOT_FOUND_TRANSLATED}: .*fr.rs")
 
     def test_moved_patch_target_stops_the_script_and_writes_nothing(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
