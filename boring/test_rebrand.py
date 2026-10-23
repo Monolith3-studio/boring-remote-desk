@@ -66,7 +66,7 @@ class RebrandSeam(unittest.TestCase):
         return r
 
     def test_check_fails_on_clean_upstream_tree(self):
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         for fact in ("rendezvous servers empty", "whitelist", "app name", "hwcodec",
                      "MSI product name", "MSI banner art"):
@@ -89,7 +89,7 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         (self.root / ".github/workflows/boring-sneaky.yml").write_text(
             "jobs:\n  b:\n    steps:\n      - run: python3 build.py --flutter --vram\n")
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("boring-sneaky.yml", r.stdout)
 
@@ -143,7 +143,7 @@ class RebrandSeam(unittest.TestCase):
         wxl = self.root / "res/msi/Package/Language/Package.en-us.wxl"
         wxl.write_text(wxl.read_text(encoding="utf-8-sig").replace(
             'Value="Uninstall Boring Remote"', 'Value="Uninstall RustDesk"'), encoding="utf-8")
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         self.assertRegex(r.stdout, r"FAIL no RustDesk in installer text: .*Uninstall RustDesk")
 
@@ -152,7 +152,7 @@ class RebrandSeam(unittest.TestCase):
         bmp = self.root / "res/msi/Package/Resources/WixUIDialogBmp.bmp"
         data = bmp.read_bytes()
         bmp.write_bytes(data[:54] + bytes(len(data) - 54))  # same size, all black
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("FAIL MSI dialog art", r.stdout)
 
@@ -160,7 +160,7 @@ class RebrandSeam(unittest.TestCase):
         cargo = self.root / "Cargo.toml"
         cargo.write_text(re.sub(r'(?m)^version = "[^"]*"', 'version = "9.9.9"', cargo.read_text(), 1))
         self.rebrand()
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("FAIL workflow VERSION matches Cargo.toml version", r.stdout)
         self.assertIn("9.9.9", r.stdout)
@@ -172,7 +172,7 @@ class RebrandSeam(unittest.TestCase):
         path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
     def assert_check_fails(self, fact):
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"FAIL {fact}", r.stdout)
 
@@ -203,7 +203,7 @@ class RebrandSeam(unittest.TestCase):
             path = self.root / rel
             path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
         self.rebrand()
-        self.assertIn("PASS protocol files are upstream's", run(CHECK, self.root, "--no-rerun").stdout)
+        self.assertIn("PASS protocol files are upstream's", run(CHECK, self.root).stdout)
 
     def test_new_protocol_file_fails_check(self):
         self.rebrand()
@@ -220,7 +220,7 @@ class RebrandSeam(unittest.TestCase):
     def test_license_check_is_behaviour_not_the_comment(self):
         self.rebrand()
         self.edit("res/msi/preprocess.py", self.LICENSE_SKIP, "    if app_name:  # reworded, same effect\n")
-        r = run(CHECK, self.root, "--no-rerun")
+        r = run(CHECK, self.root)
         self.assertIn("PASS installer license is the Boring Remote AGPL notice", r.stdout)
 
     def test_moved_patch_target_stops_the_script_and_writes_nothing(self):

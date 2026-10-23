@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rebrand check: prove a scripted tree is the Boring Remote Desk app.
 
-Usage:  python3 boring/check.py [ROOT] [--no-rerun]
+Usage:  python3 boring/check.py [ROOT]
 
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
@@ -9,7 +9,8 @@ on all interfaces, allow-only-conn-window-open available and off, sync / NAT
 test / updater / LAN discovery unreachable, no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
-tags), and (unless --no-rerun) that a second rebrand run changes nothing.
+tags), and that the protocol files are upstream's. It only reads the tree.
+Idempotence is proved by test_rebrand.py and the CI clean-diff step.
 
 Prints one PASS/FAIL line per fact, then
     rebrand check: <n> passed, <m> failed
@@ -27,7 +28,7 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rebrand  # noqa: E402
 
-AGENT, HOSTD = "io.boringlabs.remote.agent", "io.boringlabs.remote.hostd"
+AGENT, HOSTD, APP, SHOWN = rebrand.AGENT_ID, rebrand.HOSTD_ID, rebrand.APP_NAME, rebrand.DISPLAY_NAME
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
 BANNED = re.compile(r"hwcodec|vram")
 BUILD_CALL = re.compile(r"build\.py|cargo\b|FEATURES")
@@ -188,15 +189,15 @@ def msi_checks(c, workflows):
     pkg = c.root / MSI_DIR
     wxs = c.read(f"{MSI_DIR}/Package.wxs")
     pre = c.read("res/msi/preprocess.py")
-    c.fact("MSI product name is Boring Remote (installer, Apps list)",
+    c.fact(f"MSI product name is {SHOWN} (installer, Apps list)",
            f'<Package Name="{rebrand.DISPLAY_NAME}"' in wxs)
     app = re.search(r'"--app-name", type=str, default="([^"]*)"', pre)
     c.fact(f"MSI installs {rebrand.APP_NAME}.exe", app and app.group(1) == rebrand.APP_NAME
            and 'Name="$(var.Product).exe"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"), app and app.group(1))
     m = re.search(r'"--manufacturer",\s*type=str,\s*default="([^"]*)"', pre)
-    c.fact("MSI manufacturer is Boring Labs", m and m.group(1) == rebrand.MANUFACTURER, m and m.group(1))
+    c.fact(f"MSI manufacturer is {rebrand.MANUFACTURER}", m and m.group(1) == rebrand.MANUFACTURER, m and m.group(1))
     shortcut = re.search(r'<String Id="SC_Client" Value="([^"]*)"', c.read(rebrand.WXL))
-    c.fact("Start menu shortcut is Boring Remote", shortcut and shortcut.group(1) == rebrand.DISPLAY_NAME)
+    c.fact(f"Start menu shortcut is {SHOWN}", shortcut and shortcut.group(1) == rebrand.DISPLAY_NAME)
 
     hits = [h for h in installer_strings(pkg) if "rustdesk" in h.split(": ", 1)[1].lower()]
     arp = re.search(r"g_arpsystemcomponent = \{(.*?)\n\}", pre, re.S)
@@ -211,13 +212,13 @@ def msi_checks(c, workflows):
                and f'"{name}"' in pre and "Package/Resources/{var}.bmp" in pre, str(facts))
     ours_lic = (rebrand.HERE / "msi/License.rtf").read_bytes()
     built = license_after_preprocess(c.root, app and app.group(1))
-    c.fact("installer license is the Boring Remote AGPL notice",
+    c.fact(f"installer license is the {SHOWN} AGPL notice",
            b"GNU Affero General Public License" in ours_lic and b"personal data" not in ours_lic
            and b"modified version of RustDesk" in ours_lic  # the upstream credit stays
            and built == ours_lic and '<WixVariable Id="WixUILicenseRtf" Value="License.rtf" />' in wxs,
            "preprocess.py rewrites License.rtf" if built != ours_lic else "")
     icon = (rebrand.HERE / "msi/icon.ico").read_bytes()
-    c.fact("product icon is Boring Remote's", all(
+    c.fact(f"product icon is {SHOWN}'s", all(
         (c.root / p).is_file() and (c.root / p).read_bytes() == icon
         for p in ("res/icon.ico", "flutter/windows/runner/resources/app_icon.ico")))
     amyuni = [w.name for w in workflows if "usbmmidd" in w.read_text()]
@@ -235,28 +236,28 @@ def msi_checks(c, workflows):
            writers and all("-NoNewline" in l and '`n"' in l for l in writers), str(writers))
 
 
-def run_checks(root, rerun=True):
+def run_checks(root):
     c = Check(root)
     cfg = c.read(HBB)
 
     # identity
     m = re.search(r'static ref APP_NAME: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
     app_name = m and m.group(1)
-    c.fact("app name is BoringRemote", app_name == "BoringRemote", app_name)
+    c.fact(f"app name is {APP}", app_name == APP, app_name)
     try:
         info = plistlib.loads((c.root / "flutter/macos/Runner/Info.plist").read_bytes())
     except Exception:
         info = {}
-    c.fact("app name shown as Boring Remote on Mac", info.get("CFBundleDisplayName") == "Boring Remote")
-    c.fact("app name shown as Boring Remote on Windows",
-           'VALUE "ProductName", "Boring Remote"' in c.read("flutter/windows/runner/Runner.rc"))
+    c.fact(f"app name shown as {SHOWN} on Mac", info.get("CFBundleDisplayName") == SHOWN)
+    c.fact(f"app name shown as {SHOWN} on Windows",
+           f'VALUE "ProductName", "{SHOWN}"' in c.read("flutter/windows/runner/Runner.rc"))
     ids = set(re.findall(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;\s]+)",
                          c.read("flutter/macos/Runner.xcodeproj/project.pbxproj")
                          + c.read("flutter/macos/Runner/Configs/AppInfo.xcconfig")))
-    c.fact("Mac bundle id is io.boringlabs.remote.agent", ids == {AGENT}, str(ids))
-    c.fact("LaunchAgent label is io.boringlabs.remote.agent",
+    c.fact(f"Mac bundle id is {AGENT}", ids == {AGENT}, str(ids))
+    c.fact(f"LaunchAgent label is {AGENT}",
            plist_label(c, "src/platform/privileges_scripts/agent.plist") == AGENT)
-    c.fact("LaunchDaemon label is io.boringlabs.remote.hostd",
+    c.fact(f"LaunchDaemon label is {HOSTD}",
            plist_label(c, "src/platform/privileges_scripts/daemon.plist") == HOSTD)
     mac = c.read("src/platform/macos.rs")
     stale = re.findall(r"com\.carriez\.\{\}|\{\}_server|\{\}_service", mac)
@@ -271,9 +272,9 @@ def run_checks(root, rerun=True):
     install = c.read("src/platform/privileges_scripts/install.scpt")
     dirs = set(re.findall(r"Library/Preferences/([^/\"]+)/", install))
     tomls = set(re.findall(r'"([^"/]+\.toml)"', install))
-    c.fact("install script copies the real config dir, Preferences/io.boringlabs.BoringRemote/",
-           conf_dir == "io.boringlabs.BoringRemote" and dirs == {conf_dir}
-           and tomls == {"BoringRemote.toml", "BoringRemote2.toml"}, f"config dir {conf_dir}, script {dirs} {tomls}")
+    c.fact(f"install script copies the real config dir, Preferences/{rebrand.ORG}.{APP}/",
+           conf_dir == f"{rebrand.ORG}.{APP}" and dirs == {conf_dir}
+           and tomls == {f"{APP}.toml", f"{APP}2.toml"}, f"config dir {conf_dir}, script {dirs} {tomls}")
 
     # servers and locked settings
     c.fact("rendezvous servers empty", re.search(r"RENDEZVOUS_SERVERS: &\[&str\] = &\[\s*\];", cfg))
@@ -383,17 +384,6 @@ def run_checks(root, rerun=True):
     # protocol untouched: every .proto in the tree is upstream's, byte for byte
     c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))
 
-    if rerun:
-        def snap():
-            files = {rel for rel, *_ in rebrand.PATCHES} | {rel for _, rel, _ in rebrand.COPIES} | {
-                f".github/workflows/{w.name}" for w in workflows}
-            return {f: hashlib.sha256((c.root / f).read_bytes()).hexdigest()
-                    for f in files if (c.root / f).is_file()}
-        before = snap()
-        changed, moved = rebrand.apply(c.root)
-        c.fact("second rebrand run is a no-op", not changed and not moved and snap() == before,
-               "; ".join(changed + moved))
-
     print(f"rebrand check: {c.passed} passed, {c.failed} failed")
     return 1 if c.failed else 0
 
@@ -401,4 +391,4 @@ def run_checks(root, rerun=True):
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     root = args[0] if args else pathlib.Path(__file__).resolve().parent.parent
-    sys.exit(run_checks(root, rerun="--no-rerun" not in sys.argv))
+    sys.exit(run_checks(root))
