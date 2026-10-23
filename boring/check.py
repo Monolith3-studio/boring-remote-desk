@@ -9,7 +9,9 @@ on all interfaces, allow-only-conn-window-open available and off, sync / NAT
 test / updater / LAN discovery unreachable, no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
-tags), and that the protocol files are upstream's. It only reads the tree.
+tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
+translations, app metadata, every logo slot; one AGPL line on the About page), and
+that the protocol files are upstream's. It only reads the tree.
 Idempotence is proved by test_rebrand.py and the CI clean-diff step.
 
 Prints one PASS/FAIL line per fact, then
@@ -236,6 +238,192 @@ def msi_checks(c, workflows):
            writers and all("-NoNewline" in l and '`n"' in l for l in writers), str(writers))
 
 
+# --- branding: what a person sees on Mac and Windows ------------------------
+BRAND = re.compile(r"RustDesk|rustdesk\.com|github\.com/rustdesk")
+NOT_SHIPPED = ("flutter/lib/mobile/", "flutter/lib/web/",  # Android/iOS pages and the web client
+               "src/lang/",  # translations: their own fact below
+               "src/ui/", "src/ui.rs")  # the old Sciter UI, not built with --flutter
+LINUX_ONLY = ("src/server/wayland.rs", "src/server/uinput.rs", "src/server/dbus.rs", "src/ipc/drm.rs",
+              "src/whiteboard/linux.rs", "src/clipboard.rs")  # clipboard.rs: the KDE-only placeholder
+UI_SOURCES = (("flutter/lib", (".dart",)), ("src", (".rs",)),
+              ("flutter/macos/Runner", (".swift",)), ("flutter/windows/runner", (".cpp", ".h")))
+# (file, regex the whole literal matches): never shown to a person. Code names, paths, driver ids.
+INTERNAL = {
+    ("flutter/lib/models/rustdesk_terminal.dart", r"\[RustDeskTerminal\] .*"): "debug log tag",
+    ("src/common.rs", r"RustDesk"): "is_rustdesk() / is_custom_client() compare the app name",
+    ("src/common.rs", r"\.?rustdesk\.com"): "is_public() spots RustDesk's hosts to refuse them",
+    ("src/lang.rs", r"RustDesk"): "the translation lookup's own replacement logic",
+    ("src/platform/macos.rs", r"RustDesk"): "correct_app_name() rewrites scripts to our app name",
+    ("src/platform/macos.rs", r"(?s).*\[root-update\] RustDesk GUI process did not stop.*"): "updater log line",
+    ("src/platform/windows.rs", r"RustDesk(CustomClientStaging)?"): "custom-client staging dir",
+    ("src/privacy_mode/win_topmost_window.rs", r"RustDeskPrivacyWindow(Class)?"): "window class, never shown",
+    ("src/server/connection.rs", r"RustDesk://FsJob//Printer/\{\}"): "printer job path",
+    ("src/virtual_display_manager.rs", r"RustDeskIddDriver Device\\0"): "driver device id",
+    ("flutter/macos/Runner/MainFlutterWindow.swift", r"RustDeskPlugin"): "Flutter plugin registrar name",
+    ("flutter/windows/runner/main.cpp", r"RustDesk"): "fallback window name for FindWindow",
+}
+LOG_CALL = re.compile(r"\b(?:debugPrint|print|NSLog|log::\w+|(?:log|debug|info|warn|error|trace)!)\s*\(|std::cout")
+DART_TOKENS = re.compile(r"//[^\n]*|/\*.*?\*/|'''.*?'''|\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'", re.S)
+C_TOKENS = re.compile(r'//[^\n]*|/\*.*?\*/|r#*"(?:.|\n)*?"#*|"(?:[^"\\\n]|\\.)*"', re.S)
+LOGOS = pathlib.Path(__file__).resolve().parent / "upstream-logos.sha256"
+LOGO_SKIP = (".git/", "target/", "boring/", "flutter/build/", "flutter/android/", "flutter/ios/")
+
+
+def string_literals(text, tokens):
+    """(literal without quotes, its source line) for every string literal, comments skipped."""
+    for m in tokens.finditer(text):
+        s = m.group(0)
+        if s.startswith(("//", "/*")):
+            continue
+        line = text[text.rfind("\n", 0, m.start()) + 1:text.find("\n", m.end())]
+        yield re.sub(r'^r?#*["\']+|["\']+#*$', "", s), line
+
+
+def ui_brand_hits(root):
+    """(hits, files with the legal line): RustDesk names and links a person could see in the app."""
+    hits, legal = [], []
+    for base, exts in UI_SOURCES:
+        for p in sorted((root / base).rglob("*")) if (root / base).is_dir() else []:
+            rel = p.relative_to(root).as_posix()
+            if p.suffix not in exts or not p.is_file() or rel.startswith(NOT_SHIPPED) or rel in LINUX_ONLY:
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+            if p.suffix == ".rs":
+                text = strip_tests_and_comments(text)
+            for s, line in string_literals(text, DART_TOKENS if p.suffix == ".dart" else C_TOKENS):
+                if not BRAND.search(s) or LOG_CALL.search(line):
+                    continue
+                if s == rebrand.LEGAL_LINE:
+                    legal.append(rel)
+                elif not any(f == rel and re.fullmatch(pat, s) for f, pat in INTERNAL):
+                    hits.append(f"{rel}: {s[:80]}")
+    return hits, legal
+
+
+LANG_VALUE = re.compile(r'\(\s*"((?:[^"\\]|\\.)*)",\s*"((?:[^"\\]|\\.)*)"\s*\)')
+
+
+def lang_hits(root):
+    """Translation values that name RustDesk or link to it, in any language."""
+    out = []
+    for p in sorted((root / "src/lang").glob("*.rs")):
+        for key, value in LANG_VALUE.findall(p.read_text(encoding="utf-8", errors="replace")):
+            if BRAND.search(value):
+                out.append(f"{p.name}: {key}")
+    return out
+
+
+def native_brand_hits(c):
+    """App metadata the OS shows: Finder, Get Info, the Mac menu, exe Properties."""
+    out = []
+    try:
+        info = plistlib.loads((c.root / "flutter/macos/Runner/Info.plist").read_bytes())
+    except Exception:
+        info = {}
+    out += [f"Info.plist {k}" for k, v in info.items() if isinstance(v, str) and re.search(r"RustDesk|Purslane", v)]
+    if info.get("CFBundleName") != SHOWN:
+        out.append(f"Info.plist CFBundleName {info.get('CFBundleName')}")
+    xc = c.read("flutter/macos/Runner/Configs/AppInfo.xcconfig")
+    out += [f"AppInfo.xcconfig: {l}" for l in xc.splitlines() if re.search(r"RustDesk|Purslane", l)]
+    xib = c.read("flutter/macos/Runner/Base.lproj/MainMenu.xib")
+    out += [f"MainMenu.xib: {t}" for t in re.findall(r'\btitle="([^"]*)"', xib) if re.search(r"RustDesk|APP_NAME", t)]
+    rc = c.read("flutter/windows/runner/Runner.rc")
+    out += [f"Runner.rc: {k}" for k, v in re.findall(r'VALUE "(\w+)", "([^"]*)"', rc)
+            if re.search(r"RustDesk|Purslane", v)]
+    cargo = c.read("Cargo.toml")
+    for section in ("package.metadata.winres", "package.metadata.bundle"):
+        m = re.search(rf"^\[{re.escape(section)}\]\n(.*?)(?=^\[)", cargo, re.S | re.M)
+        if m is None or re.search(r"RustDesk|Purslane", m.group(1)):
+            out.append(f"Cargo.toml [{section}]")
+    return out
+
+
+def png_pixels(path):
+    """(width, height, [(r, g, b, a)]) of an 8-bit RGBA non-interlaced PNG, else None. Stdlib only."""
+    import struct
+    import zlib
+    try:
+        b = path.read_bytes()
+    except OSError:
+        return None
+    if b[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    i, idat, hdr = 8, b"", None
+    while i + 8 <= len(b):
+        n, kind = struct.unpack(">I4s", b[i:i + 8])
+        data = b[i + 8:i + 8 + n]
+        if kind == b"IHDR":
+            hdr = struct.unpack(">IIBBBBB", data)
+        elif kind == b"IDAT":
+            idat += data
+        i += 12 + n
+    if not hdr or hdr[2:5] != (8, 6, 0) or hdr[6] != 0:
+        return None
+    w, h = hdr[:2]
+    raw, stride, prev, px = zlib.decompress(idat), w * 4, bytearray(w * 4), []
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for x in range(stride):
+            a = line[x - 4] if x >= 4 else 0
+            up, ul = prev[x], (prev[x - 4] if x >= 4 else 0)
+            if f == 1:
+                line[x] = (line[x] + a) & 255
+            elif f == 2:
+                line[x] = (line[x] + up) & 255
+            elif f == 3:
+                line[x] = (line[x] + (a + up) // 2) & 255
+            elif f == 4:
+                p = a + up - ul
+                pa, pb, pc = abs(p - a), abs(p - up), abs(p - ul)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc else up if pb <= pc else ul)) & 255
+        px += [tuple(line[x:x + 4]) for x in range(0, stride, 4)]
+        prev = line
+    return w, h, px
+
+
+def branding_checks(c):
+    """Ticket 17: no RustDesk name, link or logo a person sees in the Mac and Windows app."""
+    hits, legal = ui_brand_hits(c.root)
+    c.fact("no RustDesk name or link in the Mac and Windows app's strings", not hits, "; ".join(hits[:12]))
+    c.fact("About page has the one plain AGPL legal line, crediting RustDesk with our source URL",
+           legal == ["flutter/lib/desktop/pages/desktop_setting_page.dart"]
+           and rebrand.FORK_URL in rebrand.LEGAL_LINE and "Purslane" in rebrand.LEGAL_LINE,
+           f"legal line found in {legal}")
+    lang = lang_hits(c.root)
+    c.fact("no RustDesk name or link in any translation", (c.root / "src/lang").is_dir() and not lang,
+           f"{len(lang)} values: " + "; ".join(lang[:8]))
+    lookup = fn_body(c.read("src/lang.rs"), "pub fn translate_locale(name: String, locale: &str) -> String {") or ""
+    c.fact(f"translated text shows {SHOWN}, also when a key falls back to itself",
+           f'let mut s = s.replace("RustDesk", "{SHOWN}");' in lookup)
+    native = native_brand_hits(c)
+    c.fact("no RustDesk in app metadata (Info.plist, Mac menu, exe properties)", not native, "; ".join(native))
+    win = fn_body(c.read("flutter/lib/common.dart"), "String getWindowName({WindowType? overrideType}) {") or ""
+    tray = fn_body(c.read("src/tray.rs"), "fn make_tray() -> hbb_common::ResultType<()> {") or "crate::get_app_name()"
+    c.fact(f"window titles and tray tooltip say {SHOWN}",
+           f"final name = '{SHOWN}';" in win and f": '{SHOWN}'," in c.read("flutter/lib/main.dart")
+           and "crate::get_app_name()," not in tray)
+    c.fact("app accent is Boring Labs coral",
+           "static const Color accent = Color(0xFFFF5949);" in c.read("flutter/lib/common.dart"))
+
+    upstream = dict(reversed(l.split(maxsplit=1)) for l in LOGOS.read_text().splitlines() if l.strip())
+    bad_hash = set(upstream.values())
+    still = sorted(p.relative_to(c.root).as_posix() for p in c.root.rglob("*")
+                   if p.is_file() and not p.relative_to(c.root).as_posix().startswith(LOGO_SKIP)
+                   and hashlib.sha256(p.read_bytes()).hexdigest() in bad_hash)
+    c.fact("no upstream RustDesk logo or icon ships (boring/upstream-logos.sha256)", not still, ", ".join(still))
+    ours = {dest: src for src, dest, _ in rebrand.COPIES}
+    missing = [slot for slot in upstream if slot not in ours or not (c.root / slot).is_file()
+               or (c.root / slot).read_bytes() != (rebrand.HERE / ours[slot]).read_bytes()]
+    c.fact(f"every logo slot holds {SHOWN} art", not missing, ", ".join(missing))
+    for slot in ("res/mac-tray-dark-x2.png", "res/mac-tray-light-x2.png"):
+        img = png_pixels(c.root / slot)
+        ink = [p for p in img[2] if p[3] > 0] if img else []
+        c.fact(f"Mac menu-bar icon {slot} is a template glyph (black, alpha only, not blank)",
+               img is not None and img[0] == img[1] and img[0] >= 36 and {p[:3] for p in ink} == {(0, 0, 0)}
+               and 0.08 < len(ink) / len(img[2]) < 0.7, img and f"{img[0]}x{img[1]}")
+
+
 def run_checks(root):
     c = Check(root)
     cfg = c.read(HBB)
@@ -380,6 +568,7 @@ def run_checks(root):
            f"workflow {wfv and wfv.group(1)}, Cargo.toml {app and app.group(1)}; run boring/pins.py --fix")
 
     msi_checks(c, workflows)
+    branding_checks(c)
 
     # protocol untouched: every .proto in the tree is upstream's, byte for byte
     c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))

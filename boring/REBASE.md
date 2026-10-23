@@ -68,3 +68,14 @@ It checks every target before it changes any file. It prints `ERROR <file>: patc
 4. If the behaviour changed, add or adjust a test in `boring/test_rebrand.py` first. Then run the tests, `rebrand.py` and `check.py` again.
 
 `pins.py` exits 2 the same way (`pin source moved: <NAME>`) when upstream renames or drops a pin. Fix that entry in `PINS` in `boring/pins.py`. Exit 3 (`bad ref <ref>`) means the ref isn't a commit in your clone: a typo, or `git fetch upstream --tags` hasn't run. Nothing is compared.
+
+## When the branding check fails after a rebase
+
+`check.py` scans every string a person can see in the Mac and Windows app (Flutter `lib/` minus mobile and web, `src/` minus translations and Linux-only files, the Mac and Windows runners), every translation value, and the app metadata (Info.plist, the Mac menu, exe properties). A new RustDesk name or `rustdesk.com` / `github.com/rustdesk` link fails it. Triage each one:
+
+- A person sees it: add a patch in the ticket 17 block of `boring/rebrand.py` (our name, or no link, or `FORK_URL`).
+- Never shown (a code name, path, window class, log line): add it to `INTERNAL` in `boring/check.py` with the reason.
+
+RustDesk is named once, on purpose: `LEGAL_LINE`, plain text on the About page. Translations are rewritten by the script (`RustDesk` becomes the display name in every language) and `lang.rs` does the same at run time for keys that fall back to themselves, so a new translation needs no work.
+
+Logos: `boring/upstream-logos.sha256` lists upstream's logo files. If any of those bytes ship anywhere, or a slot doesn't hold our copy, the check fails. If upstream redraws its icon, add the new file's hash there and a `COPIES` entry for its slot. Our art comes from `python3 boring/art/make_app_art.py` (needs Pillow and the Mac kit's `AppIcon.icns`). Re-run it, never edit the outputs, and look at `boring/art/preview/` before committing.

@@ -24,6 +24,9 @@ DISPLAY_NAME = "Boring Remote"   # what people read
 AGENT_ID = "io.boringlabs.remote.agent"   # app bundle + LaunchAgent (TCC holder)
 HOSTD_ID = "io.boringlabs.remote.hostd"   # root LaunchDaemon
 ORG = "io.boringlabs"                      # Mac config dir: ~/Library/Preferences/io.boringlabs.BoringRemote
+FORK_URL = "https://github.com/Monolith3-studio/boring-remote-desk"  # our source; the only link we ship
+# The one place RustDesk is named (AGPL attribution), as plain text on the About page.
+LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Source: {FORK_URL}"
 # Tailscale's address ranges, both tailnet-only: IPv4 CGNAT and the IPv6 ULA a
 # MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
@@ -81,9 +84,9 @@ PATCHES = [
      'BuildableName = "RustDesk.app"', f'BuildableName = "{APP_NAME}.app"', "Mac scheme"),
     ("flutter/macos/Runner/Info.plist",
      "<key>CFBundleName</key>\n\t<string>$(PRODUCT_NAME)</string>",
-     "<key>CFBundleName</key>\n\t<string>$(PRODUCT_NAME)</string>\n"
+     f"<key>CFBundleName</key>\n\t<string>{DISPLAY_NAME}</string>\n"
      f"\t<key>CFBundleDisplayName</key>\n\t<string>{DISPLAY_NAME}</string>",
-     "Mac display name"),
+     "Mac display name (menu bar, About panel, Finder)"),
     ("flutter/macos/Runner/Info.plist", "<string>com.carriez.rustdesk</string>",
      f"<string>{AGENT_ID}</string>", "Mac URL type name"),
     ("flutter/macos/Runner/Info.plist", "<string>rustdesk</string>\n\t\t\t</array>",
@@ -265,6 +268,90 @@ PATCHES += [
     )
 ]
 
+# --- ticket 17: no RustDesk name, link or logo a person sees on Mac or Windows --
+# Code names, crate names, IPC and config keys stay (boring/check.py INTERNAL says
+# which and why). Every rustdesk.com / github.com/rustdesk link goes, or points at
+# our fork. RustDesk is named once, as plain text: LEGAL_LINE on the About page.
+SETTINGS = "flutter/lib/desktop/pages/desktop_setting_page.dart"
+HOME = "flutter/lib/desktop/pages/desktop_home_page.dart"
+CORAL = "FF5949"
+ABOUT_OLD = "              InkWell(\n                  onTap: () {\n                    launchUrlString('https://rustdesk.com/privacy.html');\n                  },\n                  child: Text(\n                    translate('Privacy Statement'),\n                    style: linkStyle,\n                  ).marginSymmetric(vertical: 4.0)),\n              InkWell(\n                  onTap: () {\n                    launchUrlString('https://rustdesk.com');\n                  },\n                  child: Text(\n                    translate('Website'),\n                    style: linkStyle,\n                  ).marginSymmetric(vertical: 4.0)),\n              Container(\n                decoration: const BoxDecoration(color: Color(0xFF2c8cff)),\n                padding:\n                    const EdgeInsets.symmetric(vertical: 24, horizontal: 8),\n                child: SelectionArea(\n                    child: Row(\n                  children: [\n                    Expanded(\n                      child: Column(\n                        crossAxisAlignment: CrossAxisAlignment.start,\n                        children: [\n                          Text(\n                            'Copyright © ${DateTime.now().toString().substring(0, 4)} Purslane Tech Pte. Ltd.\\n$license',\n                            style: const TextStyle(color: Colors.white),\n                          ),\n                          Text(\n                            translate('Slogan_tip'),\n                            style: TextStyle(\n                                fontWeight: FontWeight.w800,\n                                color: Colors.white),\n                          )\n                        ],\n                      ),\n                    ),\n                  ],\n                )),\n              ).marginSymmetric(vertical: 4.0)\n"
+ABOUT_NEW = ("              SelectionArea(\n"  # plain text, selectable, no link
+             f"                  child: Text('{LEGAL_LINE}')\n"
+             "                      .marginSymmetric(vertical: 4.0)),\n")
+PATCHES += [
+    # About page: one plain legal line, no logo, no links, no RustDesk blue
+    (SETTINGS, "translate('About RustDesk')", f"'About {DISPLAY_NAME}'", "About title"),
+    (SETTINGS, ABOUT_OLD, ABOUT_NEW, "About: privacy/website links and copyright block become the legal line"),
+    # links: none to RustDesk; the few that need a target point at our fork
+    ("flutter/lib/common.dart", "  if (bind.mainGetBuildinOption(key: \"hide-powered-by-me\") == 'Y') {\n",
+     "  if (true) {  // boring-remote: no powered-by line\n", "no 'Powered by' line"),
+    ("flutter/lib/common.dart", "        launchUrl(Uri.parse('https://rustdesk.com'));\n",
+     f"        launchUrl(Uri.parse('{FORK_URL}'));\n", "powered-by link"),
+    ("flutter/lib/common/widgets/toolbar.dart", "'https://github.com/rustdesk/rustdesk/issues/14586'",
+     f"'{FORK_URL}'", "Wayland keyboard help link"),
+    ("flutter/lib/desktop/pages/connection_page.dart", '"https://rustdesk.com/pricing"', f'"{FORK_URL}"',
+     "public-server guide link"),
+    (HOME, "'https://rustdesk.com/download'", f"'{FORK_URL}/releases'", "download link"),
+    (HOME, "'https://github.com/rustdesk/rustdesk/releases/tag/${bind.mainGetNewVersion()}'",
+     f"'{FORK_URL}/releases'", "changelog link"),
+    (HOME, re.compile(r"'https://rustdesk\.com/docs/en/client/linux/#[a-z0-9-]+'"), f"'{FORK_URL}'",
+     "Linux help links"),
+    (HOME, ", help: 'Help', link: translate(\"doc_mac_permission\"));", ");",
+     "Mac permission cards: no rustdesk.com help link"),
+    ("flutter/lib/desktop/pages/install_page.dart", "'https://rustdesk.com/privacy.html'", f"'{FORK_URL}'",
+     "installer licence link"),
+    ("src/client.rs", '"https://rustdesk.com/docs/en/manual/linux/#x11-required"', '""', "X11 help link"),
+    ("src/client.rs", '"https://rustdesk.com/docs/en/manual/linux/#login-screen"', '""', "login-screen help link"),
+    # names a person reads
+    ("flutter/lib/desktop/widgets/tabbar_widget.dart", '"RustDesk",', f"'{DISPLAY_NAME}',", "Windows title bar"),
+    ("flutter/lib/common.dart", "  final name = bind.mainGetAppNameSync();\n",
+     f"  final name = '{DISPLAY_NAME}';  // boring-remote: display name\n", "window titles"),
+    ("flutter/lib/main.dart", "              : bind.mainGetAppNameSync(),\n", f"              : '{DISPLAY_NAME}',\n",
+     "app title"),
+    ("src/tray.rs", 'crate::get_app_name(),\n                translate("Service is running"',
+     f'"{DISPLAY_NAME}",\n                translate("Service is running"', "tray tooltip"),
+    ("src/tray.rs", 'crate::get_app_name(),\n                translate("Ready"',
+     f'"{DISPLAY_NAME}",\n                translate("Ready"', "tray tooltip (sessions)"),
+    ("src/whiteboard/macos.rs", '"RustDesk whiteboard"', f'"{DISPLAY_NAME} whiteboard"', "whiteboard title"),
+    ("src/whiteboard/windows.rs", '"RustDesk whiteboard"', f'"{DISPLAY_NAME} whiteboard"', "whiteboard title"),
+    ("src/platform/windows.rs", 'let caption = "RustDesk Output"', f'let caption = "{DISPLAY_NAME}"',
+     "message box caption"),
+    # translations: the lookup shows our name for any RustDesk left, keys included
+    ("src/lang.rs", "        let mut s = s.to_string();\n",
+     f'        let mut s = s.replace("RustDesk", "{DISPLAY_NAME}");  // boring-remote: every language\n',
+     "translated text says Boring Remote"),
+    # app metadata the OS shows
+    ("flutter/macos/Runner/Configs/AppInfo.xcconfig",
+     re.compile(r"PRODUCT_COPYRIGHT = Copyright © \d+ Purslane Tech Pte\. Ltd\. All rights reserved\."),
+     f"PRODUCT_COPYRIGHT = {DISPLAY_NAME}, AGPL-3.0", "Get Info / About panel copyright"),
+] + [
+    ("flutter/macos/Runner/Base.lproj/MainMenu.xib", f'title="{verb}APP_NAME"', f'title="{verb}{DISPLAY_NAME}"',
+     "Mac app menu and window title") for verb in ("", "About ", "Hide ", "Quit ")
+] + [
+    ("flutter/windows/runner/Runner.rc", 'VALUE "CompanyName", "Purslane Tech Pte. Ltd."',
+     f'VALUE "CompanyName", "{MANUFACTURER}"', "exe properties: company"),
+    ("flutter/windows/runner/Runner.rc",
+     re.compile(r'VALUE "LegalCopyright", "Copyright © \d+ Purslane Tech Pte\. Ltd\. All rights reserved\."'),
+     f'VALUE "LegalCopyright", "{DISPLAY_NAME}, AGPL-3.0"', "exe properties: copyright"),
+    ("Cargo.toml", re.compile(r'LegalCopyright = "Copyright © \d+ Purslane Tech Pte\. Ltd\. All rights reserved\."\n'
+                              r'ProductName = "RustDesk"\nFileDescription = "RustDesk Remote Desktop"\n'
+                              r'OriginalFilename = "rustdesk\.exe"'),
+     f'LegalCopyright = "{DISPLAY_NAME}, AGPL-3.0"\nProductName = "{DISPLAY_NAME}"\n'
+     f'FileDescription = "{DISPLAY_NAME}"\nOriginalFilename = "{APP_NAME}.exe"', "dll properties"),
+    # Boring Labs palette: RustDesk's blue accent becomes coral
+    ("flutter/lib/common.dart", "static const Color accent = Color(0xFF0071FF);",
+     f"static const Color accent = Color(0xFF{CORAL});", "accent"),
+    ("flutter/lib/common.dart", "static const Color accent50 = Color(0x770071FF);",
+     f"static const Color accent50 = Color(0x77{CORAL});", "accent 50%"),
+    ("flutter/lib/common.dart", "static const Color accent80 = Color(0xAA0071FF);",
+     f"static const Color accent80 = Color(0xAA{CORAL});", "accent 80%"),
+    ("flutter/lib/common.dart", "static const Color button = Color(0xFF2C8CFF);",
+     f"static const Color button = Color(0xFF{CORAL});", "buttons"),
+    ("flutter/lib/common.dart", "static const Color idColor = Color(0xFF00B6F0);",
+     f"static const Color idColor = Color(0xFF{CORAL});", "ID colour"),
+]
+
 # (file under boring/, destination in the tree, why), copied byte for byte.
 # The art comes from boring/msi/make_art.py: re-run it, never edit the outputs.
 HERE = pathlib.Path(__file__).resolve().parent
@@ -274,9 +361,33 @@ COPIES = [
     ("msi/License.rtf", f"{MSI}/License.rtf", "installer license: AGPL notice, not upstream's privacy policy"),
     ("msi/icon.ico", "res/icon.ico", "product icon (MSI, shortcuts, Apps list)"),
     ("msi/icon.ico", "flutter/windows/runner/resources/app_icon.ico", "exe icon"),
+] + [  # ticket 17, from boring/art/make_app_art.py: every upstream logo slot (boring/upstream-logos.sha256)
+    ("art/AppIcon.icns", "flutter/macos/Runner/AppIcon.icns", "Mac app and Dock icon (the Mac kit's, as-is)"),
+    ("art/icon-1024.png", "res/icon.png", "app icon master"),
+    ("art/icon-1024.png", "res/mac-icon.png", "Mac icon master"),
+    ("art/icon-32.png", "res/32x32.png", "bundle icon"),
+    ("art/icon-64.png", "res/64x64.png", "bundle icon"),
+    ("art/icon-128.png", "res/128x128.png", "bundle icon"),
+    ("art/icon-256.png", "res/128x128@2x.png", "bundle icon"),
+    ("art/tray.ico", "res/tray-icon.ico", "Windows tray icon"),
+    ("art/menubar-60.png", "res/mac-tray-dark-x2.png", "Mac menu-bar template glyph"),
+    ("art/menubar-48.png", "res/mac-tray-light-x2.png", "Mac menu-bar template glyph"),
+    ("art/icon.svg", "flutter/assets/icon.svg", "in-app icon: tab bar, connection window"),
+    ("art/icon.svg", "res/logo.svg", "logo"),
 ]
 
 OUR_WORKFLOW_PREFIX = "boring-"
+
+# Translations: every value in src/lang/*.rs, every language. RustDesk becomes the
+# display name; a value that is a RustDesk link becomes "" (the UI no longer shows those).
+LANG_DIR = "src/lang"
+LANG_VALUE = re.compile(r'(\(\s*"(?:[^"\\]|\\.)*",\s*")((?:[^"\\]|\\.)*)("\s*\))')
+RUSTDESK_LINK = re.compile(r"rustdesk\.com|github\.com/rustdesk")
+
+
+def _lang_value(m):
+    value = "" if RUSTDESK_LINK.search(m.group(2)) else m.group(2).replace("RustDesk", DISPLAY_NAME)
+    return m.group(1) + value + m.group(3)
 
 
 def _read(path):
@@ -318,6 +429,18 @@ def plan(root):
             changed.append(f"{rel}: {why}")
         elif new not in text:
             moved.append(f"{rel}: patch target moved ({why})")
+    langs = sorted((root / LANG_DIR).glob("*.rs")) if (root / LANG_DIR).is_dir() else []
+    if not langs:
+        moved.append(f"{LANG_DIR}: no translation files (translations)")
+    for p in langs:
+        rel = p.relative_to(root).as_posix()
+        if rel not in texts:
+            texts[rel] = _read(p)
+        text, crlf = texts[rel]
+        text2 = LANG_VALUE.sub(_lang_value, text)
+        if text2 != text:
+            texts[rel] = (text2, crlf)
+            changed.append(f"{rel}: translations say {DISPLAY_NAME}")
     writes, deletes = {}, []
     for rel, (text, crlf) in texts.items():
         if text is not None:

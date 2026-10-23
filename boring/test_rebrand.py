@@ -17,6 +17,7 @@ import unittest
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check  # noqa: E402  (shares the installer-string reader with check.py)
+import rebrand  # noqa: E402
 
 REPO = HERE.parent
 REBRAND = HERE / "rebrand.py"
@@ -71,6 +72,13 @@ class RebrandSeam(unittest.TestCase):
         for fact in ("rendezvous servers empty", "whitelist", "app name", "hwcodec",
                      "MSI product name", "MSI banner art"):
             self.assertIn(fact, r.stdout)
+        for fact in ("no RustDesk name or link in the Mac and Windows app's strings",
+                     "About page has the one plain AGPL legal line",
+                     "no RustDesk name or link in any translation",
+                     "no RustDesk in app metadata", "window titles and tray tooltip say Boring Remote",
+                     "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
+                     "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph"):
+            self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
         self.rebrand()
@@ -222,6 +230,43 @@ class RebrandSeam(unittest.TestCase):
         self.edit("res/msi/preprocess.py", self.LICENSE_SKIP, "    if app_name:  # reworded, same effect\n")
         r = run(CHECK, self.root)
         self.assertIn("PASS installer license is the Boring Remote AGPL notice", r.stdout)
+
+    # --- ticket 17: branding ------------------------------------------------
+    def test_upstream_logo_copied_anywhere_fails_check(self):
+        upstream_icon = subprocess.run(["git", "-C", str(REPO), "show", "HEAD:res/icon.png"],
+                                       check=True, capture_output=True).stdout
+        self.rebrand()
+        (self.root / "flutter/assets/logo.png").write_bytes(upstream_icon)
+        r = run(CHECK, self.root)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertRegex(r.stdout, r"FAIL no upstream RustDesk logo or icon ships.*flutter/assets/logo.png")
+
+    def test_rustdesk_link_on_the_about_page_fails_check(self):
+        self.rebrand()
+        page = "flutter/lib/desktop/pages/desktop_setting_page.dart"
+        self.edit(page, rebrand.ABOUT_NEW, rebrand.ABOUT_OLD)  # upstream's links and copyright block back
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL no RustDesk name or link in the Mac and Windows app's strings: "
+                                   r".*desktop_setting_page.dart: .*rustdesk.com/privacy")
+
+    def test_second_legal_line_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/widgets/tabbar_widget.dart", "'Boring Remote'",
+                  "'" + rebrand.LEGAL_LINE + "'")
+        self.assert_check_fails("About page has the one plain AGPL legal line")
+
+    def test_rustdesk_back_in_a_translation_fails_check(self):
+        self.rebrand()
+        de = self.root / "src/lang/de.rs"
+        de.write_text(de.read_text().replace('("Close", "', '("Close", "RustDesk ', 1))
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL no RustDesk name or link in any translation: 1 values: de.rs: Close")
+
+    def test_coloured_menu_bar_icon_fails_check(self):
+        self.rebrand()
+        tray = self.root / "res/mac-tray-dark-x2.png"
+        tray.write_bytes((HERE / "art/icon-32.png").read_bytes())  # the colour icon, not a template
+        self.assert_check_fails("Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph")
 
     def test_moved_patch_target_stops_the_script_and_writes_nothing(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
