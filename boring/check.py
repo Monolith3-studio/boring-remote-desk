@@ -75,6 +75,24 @@ def fn_body(text, signature):
     return text[start:j - 1]
 
 
+def whitelist_enforced(conn, hbb_lib):
+    """(ok, why): every incoming connection is v4-normalised, then whitelist-checked first."""
+    opens = re.findall(r"(.*)\n\s*if !conn\.on_open\(addr\)\.await \{", conn)
+    if len(opens) != 1 or opens[0].strip() != "let addr = hbb_common::try_into_v4(addr);":
+        return False, f"on_open must come right after try_into_v4: {opens}"
+    v4 = fn_body(hbb_lib, "pub fn try_into_v4(addr: SocketAddr) -> SocketAddr {") or ""
+    if ".to_ipv4" not in v4 or "IpAddr::V4(" not in v4:
+        return False, "try_into_v4 no longer maps ::ffff:a.b.c.d to IPv4"
+    body = fn_body(conn, "async fn on_open(&mut self, addr: SocketAddr) -> bool {") or ""
+    stmts = [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith(("log::", "//"))]
+    if stmts[:3] != ["if !self.check_whitelist(&addr).await {", "return false;", "}"]:
+        return False, f"on_open does not start with the whitelist check: {stmts[:3]}"
+    check = fn_body(conn, "async fn check_whitelist(&mut self, addr: &SocketAddr) -> bool {") or ""
+    if 'Config::get_option("whitelist")' not in check or "contains(addr.ip())" not in check:
+        return False, "check_whitelist no longer matches the peer against the whitelist option"
+    return True, ""
+
+
 def strip_tests_and_comments(text):
     """Drop #[cfg(test)] modules and // comment lines, keep shipped code."""
     out, i = [], 0
@@ -202,12 +220,13 @@ def run_checks(root, rerun=True):
     locked = rust_map(cfg, "OVERWRITE_SETTINGS")
     for key in ("custom-rendezvous-server", "relay-server", "api-server"):
         c.fact(f"{key} locked empty", key in locked and locked[key] == "", locked.get(key))
-    c.fact("whitelist locked to 100.64.0.0/10", locked.get("whitelist") == "100.64.0.0/10",
+    c.fact("whitelist locked to the tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48)",
+           sorted(locked.get("whitelist", "").split(",")) == ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
            locked.get("whitelist"))
     c.fact("Direct IP locked on", locked.get("direct-server") == "Y")
     conn = c.read("src/server/connection.rs")
-    c.fact("whitelist is enforced on incoming connections",
-           'Config::get_option("whitelist")' in conn and "check_whitelist(&addr)" in conn)
+    ok, why = whitelist_enforced(conn, c.read("libs/hbb_common/src/lib.rs"))
+    c.fact("whitelist is enforced on incoming connections", ok, why)
     med, tcp = c.read("src/rendezvous_mediator.rs"), c.read("libs/hbb_common/src/tcp.rs")
     c.fact("Direct IP listener on all interfaces",
            "hbb_common::tcp::listen_any(" in med and "Ipv6Addr::UNSPECIFIED), port)" in tcp

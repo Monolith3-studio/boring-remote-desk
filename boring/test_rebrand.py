@@ -169,6 +169,33 @@ class RebrandSeam(unittest.TestCase):
         self.assertIn("FAIL workflow VERSION matches Cargo.toml version", r.stdout)
         self.assertIn("9.9.9", r.stdout)
 
+    def edit(self, rel, old, new):
+        path = self.root / rel
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(old, text, rel)
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def assert_check_fails(self, fact):
+        r = run(CHECK, self.root, "--no-rerun")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(f"FAIL {fact}", r.stdout)
+
+    WHITELIST_CALL = ("        if !self.check_whitelist(&addr).await {\n"
+                      "            return false;\n"
+                      "        }\n")
+
+    def test_whitelist_check_moved_later_in_on_open_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", self.WHITELIST_CALL, "")
+        self.edit("src/server/connection.rs", "        self.ip = addr.ip().to_string();\n",
+                  "        self.ip = addr.ip().to_string();\n" + self.WHITELIST_CALL)
+        self.assert_check_fails("whitelist is enforced on incoming connections")
+
+    def test_dropping_v4_mapped_normalisation_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "        let addr = hbb_common::try_into_v4(addr);\n", "")
+        self.assert_check_fails("whitelist is enforced on incoming connections")
+
     def test_moved_patch_target_stops_the_script(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
         cfg.write_text(cfg.read_text().replace('&["rs-ny.rustdesk.com"]', '&["rs-sg.rustdesk.com"]'))

@@ -23,7 +23,10 @@ DISPLAY_NAME = "Boring Remote"   # what people read
 AGENT_ID = "io.boringlabs.remote.agent"   # app bundle + LaunchAgent (TCC holder)
 HOSTD_ID = "io.boringlabs.remote.hostd"   # root LaunchDaemon
 ORG = "io.boringlabs"                      # Mac config dir: ~/Library/Preferences/io.boringlabs.BoringRemote
-TAILNET = "100.64.0.0/10"
+# Tailscale's address ranges, both tailnet-only: IPv4 CGNAT and the IPv6 ULA a
+# MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
+# as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
+TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 
 GUARD = "if true { return; } // boring-remote: stripped"
 GUARD_OK = "if true { return Ok(()); } // boring-remote: stripped"
