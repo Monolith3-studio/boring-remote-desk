@@ -433,7 +433,7 @@ jobs:
           cd msi-out
           sha256sum -c ./*.msi.sha256
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Boring Remote $TAG" \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false --title "Boring Remote $TAG" \
               --notes "$RELEASE_NOTES" \
               || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
@@ -464,7 +464,7 @@ jobs:
           ls ./BoringRemote-*-macos-arm64.dmg >/dev/null
           sha256sum -c ./*.dmg.sha256
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Boring Remote $TAG" \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false --title "Boring Remote $TAG" \
               --notes "$RELEASE_NOTES" \
               || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi

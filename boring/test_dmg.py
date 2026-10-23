@@ -167,6 +167,14 @@ def step(job_text, name):
 
 
 class Workflow(unittest.TestCase):
+    def test_ci_never_publishes_an_approved_release(self):
+        # The Engine installs GitHub's Latest release (the approved release); only Jason sets it.
+        creates = [l for l in WORKFLOW.read_text().splitlines() if "gh release create" in l]
+        self.assertEqual(len(creates), 2)
+        for l in creates:
+            self.assertIn("--prerelease", l)
+            self.assertIn("--latest=false", l)
+
     def test_secrets_reach_only_the_sign_step(self):
         text = WORKFLOW.read_text()
         self.assertEqual(sorted(re.findall(r"secrets\.\w+", text)),
