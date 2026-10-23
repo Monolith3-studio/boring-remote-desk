@@ -7,6 +7,7 @@ fresh tree (committed HEAD of the repo and of the submodule) into a temp dir,
 so your working tree is never touched.
 """
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -64,7 +65,8 @@ class RebrandSeam(unittest.TestCase):
     def test_check_fails_on_clean_upstream_tree(self):
         r = run(CHECK, self.root, "--no-rerun")
         self.assertNotEqual(r.returncode, 0)
-        for fact in ("rendezvous servers empty", "whitelist", "app name", "hwcodec"):
+        for fact in ("rendezvous servers empty", "whitelist", "app name", "hwcodec",
+                     "MSI product name", "MSI banner art"):
             self.assertIn(fact, r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -95,6 +97,68 @@ class RebrandSeam(unittest.TestCase):
                                cwd=self.root, capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0, flag)
             self.assertIn("banned", r.stdout + r.stderr)
+
+    def preprocess_msi(self):
+        """Run upstream's own res/msi/preprocess.py the way CI does, on a fake dist."""
+        dist = self.tmp / "dist"
+        (dist / "data").mkdir(parents=True)
+        (dist / "data/app.so").write_bytes(b"x")
+        exe = dist / "BoringRemote.exe"  # preprocess asks the exe for its version and build date
+        exe.write_text('#!/bin/sh\ncase "$1" in --version) echo 1.5.0;; '
+                       '--build-date) echo "2026-10-22 12:00";; esac\n')
+        exe.chmod(0o755)
+        r = subprocess.run([sys.executable, "preprocess.py", "-d", str(dist)],
+                           cwd=self.root / "res/msi", capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return self.root / "res/msi/Package"
+
+    def test_msi_sources_are_boring_remote_after_preprocess(self):
+        self.rebrand()
+        pkg = self.preprocess_msi()
+        inc = (pkg / "Includes.wxi").read_text()
+        self.assertIn('<?define Product="BoringRemote" ?>', inc)        # installs BoringRemote.exe
+        self.assertIn('<?define Manufacturer="Boring Labs" ?>', inc)
+        wxs = (pkg / "Package.wxs").read_text()
+        self.assertIn('<Package Name="Boring Remote"', wxs)              # Apps list name
+        self.assertIn('<WixVariable Id="WixUIBannerBmp" Value="Resources\\WixUIBannerBmp.bmp" />', wxs)
+        self.assertIn('<WixVariable Id="WixUIDialogBmp" Value="Resources\\WixUIDialogBmp.bmp" />', wxs)
+        for name, size in (("WixUIBannerBmp", (493, 58)), ("WixUIDialogBmp", (493, 312))):
+            head = (pkg / f"Resources/{name}.bmp").read_bytes()[:30]
+            self.assertEqual(head[:2], b"BM", name)
+            self.assertEqual((int.from_bytes(head[18:22], "little"),
+                              int.from_bytes(head[22:26], "little", signed=True)), size, name)
+        # Every string a person can read in the installer: localisation values,
+        # dialog text, shortcut and folder names, support links.
+        seen = []
+        for f in sorted(pkg.rglob("*.wx[sl]")):
+            t = re.sub(r"<!--.*?-->", "", f.read_text(encoding="utf-8-sig"), flags=re.S)
+            seen += [f"{f.name}: {v}" for v in re.findall(
+                r'\b(?:Value|Text|Title|Name|Description)="([^"]*)"', t)
+                if not v.startswith("RuntimeBroker_")]  # internal helper process, never shown
+        self.assertEqual([s for s in seen if "rustdesk" in s.split(": ", 1)[1].lower()], [])
+        self.assertIn("Package.en-us.wxl: Boring Remote", seen)           # Start menu shortcut
+        lic = (pkg / "License.rtf").read_text()
+        self.assertIn("Boring Remote", lic)
+        self.assertIn("GNU Affero General Public License", lic)
+        self.assertNotIn("personal data", lic)                           # not upstream's privacy policy
+
+    def test_rustdesk_text_back_in_the_installer_fails_check(self):
+        self.rebrand()
+        wxl = self.root / "res/msi/Package/Language/Package.en-us.wxl"
+        wxl.write_text(wxl.read_text(encoding="utf-8-sig").replace(
+            'Value="Uninstall Boring Remote"', 'Value="Uninstall RustDesk"'), encoding="utf-8")
+        r = run(CHECK, self.root, "--no-rerun")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertRegex(r.stdout, r"FAIL no RustDesk in installer text: .*Uninstall RustDesk")
+
+    def test_blank_installer_art_fails_check(self):
+        self.rebrand()
+        bmp = self.root / "res/msi/Package/Resources/WixUIDialogBmp.bmp"
+        data = bmp.read_bytes()
+        bmp.write_bytes(data[:54] + bytes(len(data) - 54))  # same size, all black
+        r = run(CHECK, self.root, "--no-rerun")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("FAIL MSI dialog art", r.stdout)
 
     def test_moved_patch_target_stops_the_script(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"

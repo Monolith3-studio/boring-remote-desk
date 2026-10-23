@@ -306,3 +306,81 @@ jobs:
         with:
           name: boring-remote-windows-x64-unsigned
           path: BoringRemote-*-windows-x64-unsigned.zip
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce # v2
+
+      # Upstream's WiX v4 project in res/msi, rebranded by boring/rebrand.py (name,
+      # art, license, icon, texts). preprocess.py's defaults carry the branding, so
+      # it only gets the dist dir. No printer driver and no Amyuni driver are added.
+      - name: Build MSI (unsigned)
+        run: |
+          Copy-Item -Recurse .\flutter\build\windows\x64\runner\Release .\BoringRemote
+          pushd .\res\msi
+          python preprocess.py -d ..\..\BoringRemote
+          if ($LASTEXITCODE -ne 0) { throw "preprocess.py exited $LASTEXITCODE" }
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          if ($LASTEXITCODE -ne 0) { throw "msbuild exited $LASTEXITCODE" }
+          $built = Get-ChildItem .\Package\bin\*\Release\en-us\Package.msi | Select-Object -First 1
+          popd
+          New-Item -ItemType Directory -Force msi-out | Out-Null
+          $name = "BoringRemote-$env:VERSION-windows-x64-unsigned.msi"
+          Move-Item $built.FullName "msi-out\$name"
+          $hash = (Get-FileHash "msi-out\$name" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "msi-out\$name.sha256" -Value "$hash  $name" -Encoding ascii
+          Get-Content "msi-out\$name.sha256"
+
+      # The Engine installs with msiexec /qn, so prove exactly that: silent install,
+      # the names people see, the exe and service the app expects, silent uninstall.
+      - name: Smoke test MSI (silent install and uninstall)
+        run: |
+          $msi = (Resolve-Path .\msi-out\*.msi).Path
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /l*v msi-install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content msi-install.log -Tail 80; throw "silent install exited $($p.ExitCode)" }
+          $exe = "$env:ProgramFiles\BoringRemote\BoringRemote.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $uninstall = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          $arp = Get-ItemProperty $uninstall | Where-Object { $_.DisplayName -eq 'Boring Remote' }
+          if (-not $arp) { throw "Apps list has no 'Boring Remote' entry" }
+          if ($arp.Publisher -ne 'Boring Labs') { throw "Apps list publisher is '$($arp.Publisher)'" }
+          if (Get-ItemProperty $uninstall | Where-Object { $_.DisplayName -like '*RustDesk*' }) { throw "RustDesk in the Apps list" }
+          $lnk = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Boring Remote\Boring Remote.lnk"
+          if (-not (Test-Path $lnk)) { throw "missing Start menu shortcut $lnk" }
+          Get-Service -Name BoringRemote -ErrorAction Stop | Format-List Name, DisplayName, Status
+          $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /l*v msi-uninstall.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content msi-uninstall.log -Tail 80; throw "silent uninstall exited $($p.ExitCode)" }
+          if (Test-Path $exe) { throw "$exe still there after uninstall" }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boring-remote-windows-x64-msi
+          path: msi-out/*
+
+  # A tag publishes the unsigned MSI and its checksum on that tag's GitHub release
+  # (created here if it isn't there yet, so the Mac job can add to the same one).
+  release-windows:
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: boring-remote-windows-x64-msi
+          path: msi-out
+
+      - name: Publish MSI and sha256 to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd msi-out
+          sha256sum -c ./*.msi.sha256
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Boring Remote $TAG" \
+              --notes "Unsigned build. On Windows, SmartScreen will warn: choose More info, then Run anyway. Check the download against its .sha256 file." \
+              || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*.msi ./*.msi.sha256

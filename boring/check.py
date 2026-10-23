@@ -7,8 +7,9 @@ Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
 test / updater unreachable, no RustDesk public server named in shipped code,
-no hwcodec/vram in any build invocation, Mac build with file copy-paste, and
-(unless --no-rerun) that a second rebrand run changes nothing.
+no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
+Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
+tags), and (unless --no-rerun) that a second rebrand run changes nothing.
 
 Prints one PASS/FAIL line per fact, then
     rebrand check: <n> passed, <m> failed
@@ -81,6 +82,75 @@ def plist_label(c, rel):
         return plistlib.loads((c.root / rel).read_bytes()).get("Label")
     except Exception as e:  # missing or unparsable
         return f"<{e}>"
+
+
+MSI_DIR = "res/msi/Package"
+VISIBLE_ATTR = re.compile(r'\b(?:Value|Text|Title|Name|Description)="([^"]*)"')
+ART = {"banner": ("WixUIBannerBmp", (493, 58)), "dialog": ("WixUIDialogBmp", (493, 312))}
+
+
+def bmp_facts(path):
+    """(width, height, bits per pixel, distinct colours sampled) of a BMP, or None."""
+    try:
+        b = path.read_bytes()
+    except OSError:
+        return None
+    if b[:2] != b"BM":
+        return None
+    off, w, h, bpp = (int.from_bytes(b[10:14], "little"), int.from_bytes(b[18:22], "little"),
+                      abs(int.from_bytes(b[22:26], "little", signed=True)), int.from_bytes(b[28:30], "little"))
+    px = b[off:]
+    colours = {px[i:i + 3] for i in range(0, len(px) - 2, 3 * 7)} if bpp == 24 else set()
+    return w, h, bpp, len(colours)
+
+
+def msi_checks(c, workflows):
+    """Windows installer: name, exe, art, license, no RustDesk text, release on tags."""
+    pkg = c.root / MSI_DIR
+    wxs = c.read(f"{MSI_DIR}/Package.wxs")
+    pre = c.read("res/msi/preprocess.py")
+    c.fact("MSI product name is Boring Remote (installer, Apps list)",
+           f'<Package Name="{rebrand.DISPLAY_NAME}"' in wxs)
+    m = re.search(r'"--app-name", type=str, default="([^"]*)"', pre)
+    c.fact("MSI installs BoringRemote.exe", m and m.group(1) == rebrand.APP_NAME
+           and 'Name="$(var.Product).exe"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"), m and m.group(1))
+    m = re.search(r'"--manufacturer",\s*type=str,\s*default="([^"]*)"', pre)
+    c.fact("MSI manufacturer is Boring Labs", m and m.group(1) == rebrand.MANUFACTURER, m and m.group(1))
+    shortcut = re.search(r'<String Id="SC_Client" Value="([^"]*)"', c.read(rebrand.WXL))
+    c.fact("Start menu shortcut is Boring Remote", shortcut and shortcut.group(1) == rebrand.DISPLAY_NAME)
+
+    hits = []
+    for f in sorted(pkg.rglob("*.wx[sli]")) if pkg.is_dir() else []:
+        text = re.sub(r"<!--.*?-->", "", f.read_text(encoding="utf-8-sig", errors="replace"), flags=re.S)
+        hits += [f"{f.name}: {v}" for v in VISIBLE_ATTR.findall(text)
+                 if "rustdesk" in v.lower() and not v.startswith("RuntimeBroker_")]  # helper exe, never shown
+    arp = re.search(r"g_arpsystemcomponent = \{(.*?)\n\}", pre, re.S)
+    if arp is None or "rustdesk" in arp.group(1).lower():
+        hits.append("preprocess.py: Apps list support links")
+    c.fact("no RustDesk in installer text", pkg.is_dir() and not hits, "; ".join(hits[:10]))
+
+    for what, (name, size) in ART.items():
+        facts = bmp_facts(pkg / f"Resources/{name}.bmp")
+        c.fact(f"MSI {what} art is {size[0]}x{size[1]}, 24-bit, designed (not blank)",
+               facts is not None and facts[:3] == (*size, 24) and facts[3] >= 8
+               and f'"{name}"' in pre and "Package/Resources/{var}.bmp" in pre, str(facts))
+    lic = c.read(f"{MSI_DIR}/License.rtf")
+    c.fact("installer license is the Boring Remote AGPL notice",
+           "GNU Affero General Public License" in lic and "personal data" not in lic
+           and "if True:  # boring-remote: License.rtf comes from boring/msi" in pre)
+    icon = (rebrand.HERE / "msi/icon.ico").read_bytes()
+    c.fact("product icon is Boring Remote's", all(
+        (c.root / p).is_file() and (c.root / p).read_bytes() == icon
+        for p in ("res/icon.ico", "flutter/windows/runner/resources/app_icon.ico")))
+    amyuni = [w.name for w in workflows if "usbmmidd" in w.read_text()]
+    if 'Custom Action="RemoveAmyuniIdd"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"):
+        amyuni.append("RustDesk.wxs")
+    c.fact("no Amyuni driver in the build or the installer", not amyuni, ", ".join(amyuni))
+
+    ours = "".join(w.read_text() for w in workflows if w.name.startswith(rebrand.OUR_WORKFLOW_PREFIX))
+    c.fact("tags publish a GitHub release with the MSI and its sha256",
+           "startsWith(github.ref, 'refs/tags/')" in ours and "preprocess.py" in ours
+           and ".msi.sha256" in ours and "contents: write" in ours)
 
 
 def run_checks(root, rerun=True):
@@ -189,13 +259,15 @@ def run_checks(root, rerun=True):
     c.fact("Mac build has --unix-file-copy-paste",
            mac_builds and all("--unix-file-copy-paste" in l for l in mac_builds), str(mac_builds))
 
+    msi_checks(c, workflows)
+
     # protocol untouched
     c.fact("protocol files untouched by the script",
            not any("protos/" in rel or rel.endswith(".proto") for rel, *_ in rebrand.PATCHES))
 
     if rerun:
         def snap():
-            files = {rel for rel, *_ in rebrand.PATCHES} | {
+            files = {rel for rel, *_ in rebrand.PATCHES} | {rel for _, rel, _ in rebrand.COPIES} | {
                 f".github/workflows/{w.name}" for w in workflows}
             return {f: hashlib.sha256((c.root / f).read_bytes()).hexdigest()
                     for f in files if (c.root / f).is_file()}
