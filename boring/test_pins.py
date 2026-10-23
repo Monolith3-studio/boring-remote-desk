@@ -127,5 +127,13 @@ class PinStep(unittest.TestCase):
         self.assertIn("pin source moved: LLVM_VERSION", r.stderr)
 
 
+    def test_unknown_ref_is_a_bad_ref_not_moved_pins(self):
+        r = self.pins("v9.9.9-not-fetched")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn("bad ref v9.9.9-not-fetched", r.stderr)
+        self.assertNotIn("pin source moved", r.stderr)
+        self.assertNotIn("STALE", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

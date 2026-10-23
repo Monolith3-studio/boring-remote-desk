@@ -17,7 +17,7 @@ The only conflicts you should see are `deleted by us` on upstream workflows upst
 
 ```
 git submodule update --init libs/hbb_common   # NEW's hbb_common
-python3 boring/pins.py NEW                     # exit 1 = stale pins
+python3 boring/pins.py NEW                     # exit 1 = stale pins, 3 = bad ref
 python3 boring/pins.py --fix NEW               # copies upstream's values into boring-build.yml
 git diff .github/workflows/boring-build.yml    # read it, then commit: "ci: pins from upstream NEW"
 python3 -m unittest boring/test_rebrand.py boring/test_pins.py -v
@@ -59,4 +59,4 @@ It checks every target before it changes any file. It prints `ERROR <file>: patc
 3. If the feature is gone upstream, delete the entry only if `check.py` still proves the spec fact some other way. Otherwise rewrite the check fact as well.
 4. If the behaviour changed, add or adjust a test in `boring/test_rebrand.py` first. Then run the tests, `rebrand.py` and `check.py` again.
 
-`pins.py` exits 2 the same way (`pin source moved: <NAME>`) when upstream renames or drops a pin. Fix that entry in `PINS` in `boring/pins.py`.
+`pins.py` exits 2 the same way (`pin source moved: <NAME>`) when upstream renames or drops a pin. Fix that entry in `PINS` in `boring/pins.py`. Exit 3 (`bad ref <ref>`) means the ref isn't a commit in your clone: a typo, or `git fetch upstream --tags` hasn't run. Nothing is compared.

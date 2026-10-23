@@ -7,7 +7,8 @@ Our tree deletes upstream's workflows, so their pins are read from the ref
 with `git show`. The pins come from upstream's own build so ours build the
 same way. Exit 0 = all match, 1 = some stale (--fix copies upstream's values
 into boring-build.yml and exits 0), 2 = a pin's source moved upstream (fix the
-entry in PINS below). Run it on every rebase (boring/REBASE.md).
+entry in PINS below), 3 = bad ref (not a commit in this repo: fetch it first).
+Run it on every rebase (boring/REBASE.md).
 
 Stdlib only.
 """
@@ -54,6 +55,11 @@ def main(argv):
     ap.add_argument("--root", default=pathlib.Path(__file__).resolve().parent.parent)
     a = ap.parse_args(argv[1:])
     root = pathlib.Path(a.root)
+    known = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{a.ref}^{{commit}}"],
+                           capture_output=True, text=True)
+    if known.returncode != 0:
+        print(f"ERROR bad ref {a.ref} (not a commit here: git fetch upstream --tags?)", file=sys.stderr)
+        return 3
     ours_path = root / OURS
     ours = ours_path.read_text(encoding="utf-8")
     files, ok, stale, moved = {}, 0, [], []
