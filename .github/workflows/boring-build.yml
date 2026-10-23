@@ -31,6 +31,11 @@ env:
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VERSION: "1.5.0"
+  DMGBUILD_VERSION: "1.6.7"
+  RELEASE_NOTES: >-
+    Windows: the installer is unsigned, so SmartScreen warns. Choose More info, then Run anyway.
+    Mac: first open, right-click the app, then Open.
+    Check each download against its .sha256 file.
 
 jobs:
   rebrand-check:
@@ -40,8 +45,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Rebrand and pin tests (clean tree, idempotency, moved targets, stale pins)
-        run: python3 -m unittest boring/test_rebrand.py boring/test_pins.py -v
+      - name: Rebrand, pin and DMG tests (clean tree, idempotency, moved targets, stale pins, workflow)
+        run: python3 -m unittest boring/test_rebrand.py boring/test_pins.py boring/test_dmg.py -v
 
       - name: Rebrand this checkout
         run: python3 boring/rebrand.py
@@ -219,6 +224,43 @@ jobs:
           name: boring-remote-macos-arm64-unsigned
           path: BoringRemote-*-macos-arm64-unsigned.zip
 
+      - name: Install dmgbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dmgbuild"
+          "$RUNNER_TEMP/dmgbuild/bin/pip" install --quiet "dmgbuild==${{ env.DMGBUILD_VERSION }}"
+          echo "$RUNNER_TEMP/dmgbuild/bin" >> "$GITHUB_PATH"
+
+      # The DMG suite's Mac half: a throwaway self-signed identity through the same
+      # temp-keychain path, dmgbuild and verify, before the real identity is used.
+      - name: DMG tests (throwaway identity)
+        run: python3 -m unittest boring/test_dmg.py -v
+
+      # Signs with the self-signed "Boring Remote Code Signing" cert (ticket 01) from the
+      # MAC_SIGN_P12 secrets via a temp keychain, so TCC grants survive updates. No secrets
+      # (forks, PRs from forks) = ad-hoc signed and the log says so; a tag without them fails.
+      # Then dmgbuild, mount and verify (layout, art, volume icon, signature, designated
+      # requirement), sha256. Put the secrets in with boring/dmg/export-signing-secret.sh.
+      - name: Sign, build DMG, mount and verify
+        env:
+          MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
+          MAC_SIGN_P12_PASSWORD: ${{ secrets.MAC_SIGN_P12_PASSWORD }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: boring/dmg/release-mac.sh flutter/build/macos/Build/Products/Release/BoringRemote.app "$VERSION" dmg-out
+
+      # release-mac.sh deletes its keychain on exit; this covers a killed or cancelled step.
+      - name: Delete temp signing keychain
+        if: always()
+        run: |
+          for kc in "$RUNNER_TEMP"/boring-sign-*.keychain-db; do
+            [ -e "$kc" ] || continue
+            security delete-keychain "$kc" || rm -f "$kc"
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boring-remote-macos-arm64-dmg
+          path: dmg-out/*
+
   build-windows:
     needs: bridge
     # Same image as upstream: Flutter 3.24.5 looks for Visual Studio 2019/2022, which windows-latest no longer has.
@@ -370,7 +412,7 @@ jobs:
           path: msi-out/*
 
   # A tag publishes the unsigned MSI and its checksum on that tag's GitHub release
-  # (created here if it isn't there yet, so the Mac job can add to the same one).
+  # (created by whichever release job gets there first; the other adds to it).
   release-windows:
     needs: build-windows
     if: startsWith(github.ref, 'refs/tags/')
@@ -392,7 +434,38 @@ jobs:
           sha256sum -c ./*.msi.sha256
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Boring Remote $TAG" \
-              --notes "Unsigned build. On Windows, SmartScreen will warn: choose More info, then Run anyway. Check the download against its .sha256 file." \
+              --notes "$RELEASE_NOTES" \
               || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*.msi ./*.msi.sha256
+
+  # A tag publishes the signed DMG and its checksum on the same release as the MSI.
+  # build-macos already refuses a tag without the signing secrets; this refuses an
+  # ad-hoc DMG again, so nothing ad-hoc can reach a release.
+  release-macos:
+    needs: build-macos
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: boring-remote-macos-arm64-dmg
+          path: dmg-out
+
+      - name: Publish DMG and sha256 to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dmg-out
+          if ls ./*-adhoc.dmg >/dev/null 2>&1; then echo "ad-hoc DMG on a tag: refusing to publish" >&2; exit 1; fi
+          ls ./BoringRemote-*-macos-arm64.dmg >/dev/null
+          sha256sum -c ./*.dmg.sha256
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Boring Remote $TAG" \
+              --notes "$RELEASE_NOTES" \
+              || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*.dmg ./*.dmg.sha256
