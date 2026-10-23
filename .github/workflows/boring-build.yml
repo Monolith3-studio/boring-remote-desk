@@ -40,8 +40,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Rebrand script tests (clean tree, idempotency, moved targets)
-        run: python3 -m unittest boring/test_rebrand.py -v
+      - name: Rebrand and pin tests (clean tree, idempotency, moved targets, stale pins)
+        run: python3 -m unittest boring/test_rebrand.py boring/test_pins.py -v
 
       - name: Rebrand this checkout
         run: python3 boring/rebrand.py

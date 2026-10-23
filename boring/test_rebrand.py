@@ -160,6 +160,15 @@ class RebrandSeam(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("FAIL MSI dialog art", r.stdout)
 
+    def test_stale_app_version_pin_fails_check(self):
+        cargo = self.root / "Cargo.toml"
+        cargo.write_text(re.sub(r'(?m)^version = "[^"]*"', 'version = "9.9.9"', cargo.read_text(), 1))
+        self.rebrand()
+        r = run(CHECK, self.root, "--no-rerun")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("FAIL workflow VERSION matches Cargo.toml version", r.stdout)
+        self.assertIn("9.9.9", r.stdout)
+
     def test_moved_patch_target_stops_the_script(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
         cfg.write_text(cfg.read_text().replace('&["rs-ny.rustdesk.com"]', '&["rs-sg.rustdesk.com"]'))
