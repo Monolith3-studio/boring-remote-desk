@@ -1,0 +1,3 @@
+# Our art is committed: upstream ignores *png / *svg repo-wide.
+!art/**/*.png
+!art/*.svg
