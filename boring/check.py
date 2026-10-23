@@ -188,6 +188,12 @@ def run_checks(root, rerun=True):
                   if "build.py" in l and "--flutter" in l and "--portable" not in l]
     c.fact("Mac build has --unix-file-copy-paste",
            mac_builds and all("--unix-file-copy-paste" in l for l in mac_builds), str(mac_builds))
+    # the other pins can only be checked against upstream's workflows: boring/pins.py
+    app = re.search(r'(?m)^version = "([^"]*)"', c.read("Cargo.toml"))
+    wfv = re.search(r'(?m)^  VERSION: "([^"]*)"', c.read(".github/workflows/boring-build.yml"))
+    c.fact("workflow VERSION matches Cargo.toml version",
+           app and wfv and app.group(1) == wfv.group(1),
+           f"workflow {wfv and wfv.group(1)}, Cargo.toml {app and app.group(1)}; run boring/pins.py --fix")
 
     # protocol untouched
     c.fact("protocol files untouched by the script",

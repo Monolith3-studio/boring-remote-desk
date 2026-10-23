@@ -7,6 +7,7 @@ fresh tree (committed HEAD of the repo and of the submodule) into a temp dir,
 so your working tree is never touched.
 """
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -95,6 +96,15 @@ class RebrandSeam(unittest.TestCase):
                                cwd=self.root, capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0, flag)
             self.assertIn("banned", r.stdout + r.stderr)
+
+    def test_stale_app_version_pin_fails_check(self):
+        cargo = self.root / "Cargo.toml"
+        cargo.write_text(re.sub(r'(?m)^version = "[^"]*"', 'version = "9.9.9"', cargo.read_text(), 1))
+        self.rebrand()
+        r = run(CHECK, self.root, "--no-rerun")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("FAIL workflow VERSION matches Cargo.toml version", r.stdout)
+        self.assertIn("9.9.9", r.stdout)
 
     def test_moved_patch_target_stops_the_script(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
