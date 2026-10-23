@@ -28,6 +28,7 @@ AGENT, HOSTD = "io.boringlabs.remote.agent", "io.boringlabs.remote.hostd"
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
 BANNED = re.compile(r"hwcodec|vram")
 BUILD_CALL = re.compile(r"build\.py|cargo\b|FEATURES")
+HBB = rebrand.HBB
 
 
 class Check:
@@ -59,6 +60,19 @@ def first_statement(text, signature):
         return None
     body = text[text.index("{", i + len(signature) - 1) + 1:]
     return body.lstrip().split("\n", 1)[0]
+
+
+def fn_body(text, signature):
+    """The brace-matched body of the first function with this signature, or None."""
+    i = text.find(signature)
+    if i < 0:
+        return None
+    start = text.index("{", i + len(signature) - 1) + 1
+    depth, j = 1, start
+    while j < len(text) and depth:
+        depth += {"{": 1, "}": -1}.get(text[j], 0)
+        j += 1
+    return text[start:j - 1]
 
 
 def strip_tests_and_comments(text):
@@ -155,7 +169,7 @@ def msi_checks(c, workflows):
 
 def run_checks(root, rerun=True):
     c = Check(root)
-    cfg = c.read("libs/hbb_common/src/config.rs")
+    cfg = c.read(HBB)
 
     # identity
     m = re.search(r'static ref APP_NAME: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
@@ -215,10 +229,22 @@ def run_checks(root, rerun=True):
         ("src/updater.rs", "fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {", "Windows updater"),
         ("src/updater.rs", "pub fn start_auto_update_macos() {", "Mac updater"),
         ("src/lan.rs", "pub(super) fn start_listening() -> ResultType<()> {", "LAN discovery listener"),
+        # lock bypasses: each of these writes past OVERWRITE_SETTINGS
+        ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {",
+         "Windows exe-name license (sets rendezvous and API server)"),
+        ("src/common.rs", "pub fn read_custom_client(config: &str) {",
+         "custom.txt reader (writes OVERWRITE_SETTINGS)"),
+        (HBB, "pub fn get_rendezvous_servers() -> Vec<String> {",
+         "rendezvous server list (rendezvous-servers option, serial path)"),
     ):
         first = first_statement(c.read(rel), sig)
         c.fact(f"{what} returns before doing anything",
-               first is not None and re.match(r"(if true \{ )?return\b", first), f"{rel}: {first!r}")
+               first is not None and re.match(r"(if true \{ )?(return\b|bail!)", first), f"{rel}: {first!r}")
+    c.fact("rendezvous-servers locked empty", locked.get("rendezvous-servers") == "",
+           locked.get("rendezvous-servers"))
+    body = fn_body(cfg, "pub fn get_rendezvous_server() -> String {") or ""
+    c.fact("no rendezvous server read from the config file",
+           body and "rendezvous_server = CONFIG2" not in body and "get_rendezvous_servers()" in body)
     c.fact("auto update locked off", locked.get("allow-auto-update") == "N")
     c.fact("LAN discovery locked off", locked.get("enable-lan-discovery") == "N",
            locked.get("enable-lan-discovery"))

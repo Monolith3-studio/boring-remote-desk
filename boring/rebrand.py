@@ -36,6 +36,7 @@ LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows the
     "api-server": "",
     "allow-auto-update": "N",
     "enable-lan-discovery": "N",  # no answering LAN pings with ID, hostname, user, MAC
+    "rendezvous-servers": "",     # a server list the config file could otherwise carry
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
     "allow-only-conn-window-open": "N",
@@ -130,6 +131,21 @@ PATCHES = [
      'const URL: &str = "";', "no version check endpoint"),
     ("src/common.rs", '    "https://admin.rustdesk.com".to_owned()\n',
      '    "".to_owned()\n', "no default API server"),
+    (HBB, "    pub fn get_rendezvous_servers() -> Vec<String> {\n",
+     "    pub fn get_rendezvous_servers() -> Vec<String> {\n"
+     "        if true { return Vec::new(); } // boring-remote: stripped\n",
+     "no server list from the exe name, rendezvous-servers or the serial path"),
+    (HBB, "            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();\n",
+     "            // boring-remote: no rendezvous server from the config file\n",
+     "no rendezvous server from the config file"),
+    # --- lock bypasses: these write past OVERWRITE_SETTINGS ------------------
+    ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n",
+     "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n"
+     '    if true { bail!("no license in the exe name"); } // boring-remote: stripped\n',
+     "exe name cannot set the rendezvous, API or relay server"),
+    ("src/common.rs", "pub fn read_custom_client(config: &str) {\n",
+     f"pub fn read_custom_client(config: &str) {{\n    {GUARD}\n",
+     "custom.txt cannot rewrite OVERWRITE_SETTINGS (whitelist, servers)"),
     # --- locked settings ----------------------------------------------------
     (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(LOCKED) + ";",
