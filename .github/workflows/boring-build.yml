@@ -117,7 +117,8 @@ jobs:
 
   build-macos:
     needs: bridge
-    runs-on: macos-latest # arm64
+    # Same image as upstream's arm64 job: macos-latest moved on, and the toolchain pins assume 14.
+    runs-on: macos-14 # arm64
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
@@ -139,6 +140,15 @@ jobs:
         run: |
           brew install llvm
           command -v pkg-config >/dev/null || brew install pkg-config
+
+      # Same as upstream: the aom overlay needs NASM even on arm64, and it must be 2.x
+      # (brew's nasm is 3.x, which aom rejects).
+      - name: Install NASM
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
 
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
@@ -211,7 +221,8 @@ jobs:
 
   build-windows:
     needs: bridge
-    runs-on: windows-latest
+    # Same image as upstream: Flutter 3.24.5 looks for Visual Studio 2019/2022, which windows-latest no longer has.
+    runs-on: windows-2022
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
