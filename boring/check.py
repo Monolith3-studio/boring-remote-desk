@@ -6,7 +6,7 @@ Usage:  python3 boring/check.py [ROOT] [--no-rerun]
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
-test / updater unreachable, no RustDesk public server named in shipped code,
+test / updater / LAN discovery unreachable, no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), and (unless --no-rerun) that a second rebrand run changes nothing.
@@ -214,11 +214,14 @@ def run_checks(root, rerun=True):
         ("src/hbbs_http/sync.rs", "async fn start_hbbs_sync_async() {", "stats sync"),
         ("src/updater.rs", "fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {", "Windows updater"),
         ("src/updater.rs", "pub fn start_auto_update_macos() {", "Mac updater"),
+        ("src/lan.rs", "pub(super) fn start_listening() -> ResultType<()> {", "LAN discovery listener"),
     ):
         first = first_statement(c.read(rel), sig)
         c.fact(f"{what} returns before doing anything",
                first is not None and re.match(r"(if true \{ )?return\b", first), f"{rel}: {first!r}")
     c.fact("auto update locked off", locked.get("allow-auto-update") == "N")
+    c.fact("LAN discovery locked off", locked.get("enable-lan-discovery") == "N",
+           locked.get("enable-lan-discovery"))
     c.fact("update check locked off", rust_map(cfg, "OVERWRITE_LOCAL_SETTINGS").get("enable-check-update") == "N")
     lib = c.read("libs/hbb_common/src/lib.rs")
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)

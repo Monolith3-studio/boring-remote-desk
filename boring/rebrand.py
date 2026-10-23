@@ -35,6 +35,7 @@ LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows the
     "relay-server": "",
     "api-server": "",
     "allow-auto-update": "N",
+    "enable-lan-discovery": "N",  # no answering LAN pings with ID, hostname, user, MAC
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
     "allow-only-conn-window-open": "N",
@@ -132,7 +133,7 @@ PATCHES = [
     # --- locked settings ----------------------------------------------------
     (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(LOCKED) + ";",
-     "whitelist, Direct IP, empty servers, no auto update"),
+     "whitelist, Direct IP, empty servers, no auto update, no LAN discovery"),
     (HBB, "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(DEFAULTS) + ";",
      "allow-only-conn-window-open off by default"),
@@ -153,6 +154,9 @@ PATCHES = [
      f"fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {{\n    {GUARD}\n", "Windows auto-updater"),
     ("src/updater.rs", "pub fn start_auto_update_macos() {\n",
      f"pub fn start_auto_update_macos() {{\n    {GUARD}\n", "Mac auto-updater"),
+    ("src/lan.rs", "pub(super) fn start_listening() -> ResultType<()> {\n",
+     f"pub(super) fn start_listening() -> ResultType<()> {{\n    {GUARD_OK}\n",
+     "LAN discovery listener: never binds UDP 21119"),
     # --- banned codecs: hwcodec / vram --------------------------------------
     ("build.py", "    if args.hwcodec:\n        features.append('hwcodec')\n"
                  "    if args.vram:\n        features.append('vram')\n",
