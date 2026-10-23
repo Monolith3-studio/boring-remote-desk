@@ -274,7 +274,14 @@ PATCHES += [
 # our fork. RustDesk is named once, as plain text: LEGAL_LINE on the About page.
 SETTINGS = "flutter/lib/desktop/pages/desktop_setting_page.dart"
 HOME = "flutter/lib/desktop/pages/desktop_home_page.dart"
-CORAL = "FF5949"
+CORAL, INK, PAPER = "FF5949", "0C0B11", "F0EFEB"  # Boring Labs kit
+DART_COMMON = "flutter/lib/common.dart"
+# (text, fill, where): every text-on-fill pair the patches below set; check.py wants >= 4.5:1.
+TEXT_PAIRS = [
+    ("FFFFFF", INK, "filled buttons, chat bubble, connection window buttons (light and dark)"),
+    (INK, "FFFFFF", "accent text, light theme page"), (INK, "EFEFF2", "accent text, light theme card"),
+    (PAPER, "18191E", "accent text, dark theme page"), (PAPER, "24252B", "accent text, dark theme card"),
+]
 ABOUT_OLD = "              InkWell(\n                  onTap: () {\n                    launchUrlString('https://rustdesk.com/privacy.html');\n                  },\n                  child: Text(\n                    translate('Privacy Statement'),\n                    style: linkStyle,\n                  ).marginSymmetric(vertical: 4.0)),\n              InkWell(\n                  onTap: () {\n                    launchUrlString('https://rustdesk.com');\n                  },\n                  child: Text(\n                    translate('Website'),\n                    style: linkStyle,\n                  ).marginSymmetric(vertical: 4.0)),\n              Container(\n                decoration: const BoxDecoration(color: Color(0xFF2c8cff)),\n                padding:\n                    const EdgeInsets.symmetric(vertical: 24, horizontal: 8),\n                child: SelectionArea(\n                    child: Row(\n                  children: [\n                    Expanded(\n                      child: Column(\n                        crossAxisAlignment: CrossAxisAlignment.start,\n                        children: [\n                          Text(\n                            'Copyright © ${DateTime.now().toString().substring(0, 4)} Purslane Tech Pte. Ltd.\\n$license',\n                            style: const TextStyle(color: Colors.white),\n                          ),\n                          Text(\n                            translate('Slogan_tip'),\n                            style: TextStyle(\n                                fontWeight: FontWeight.w800,\n                                color: Colors.white),\n                          )\n                        ],\n                      ),\n                    ),\n                  ],\n                )),\n              ).marginSymmetric(vertical: 4.0)\n"
 ABOUT_NEW = ("              SelectionArea(\n"  # plain text, selectable, no link
              f"                  child: Text('{LEGAL_LINE}')\n"
@@ -339,17 +346,58 @@ PATCHES += [
                               r'OriginalFilename = "rustdesk\.exe"'),
      f'LegalCopyright = "{DISPLAY_NAME}, AGPL-3.0"\nProductName = "{DISPLAY_NAME}"\n'
      f'FileDescription = "{DISPLAY_NAME}"\nOriginalFilename = "{APP_NAME}.exe"', "dll properties"),
-    # Boring Labs palette: RustDesk's blue accent becomes coral
-    ("flutter/lib/common.dart", "static const Color accent = Color(0xFF0071FF);",
-     f"static const Color accent = Color(0xFF{CORAL});", "accent"),
-    ("flutter/lib/common.dart", "static const Color accent50 = Color(0x770071FF);",
+    # Boring Labs palette. Coral only where no text sits on it or in it: icons, borders,
+    # selection, progress, the pointer. Text and filled buttons are ink and paper, so
+    # every text pair clears 4.5:1 (TEXT_PAIRS, checked by check.py).
+    (DART_COMMON, "static const Color accent = Color(0xFF0071FF);",
+     f"static const Color accent = Color(0xFF{CORAL});", "accent: non-text only"),
+    (DART_COMMON, "static const Color accent50 = Color(0x770071FF);",
      f"static const Color accent50 = Color(0x77{CORAL});", "accent 50%"),
-    ("flutter/lib/common.dart", "static const Color accent80 = Color(0xAA0071FF);",
+    (DART_COMMON, "static const Color accent80 = Color(0xAA0071FF);",
      f"static const Color accent80 = Color(0xAA{CORAL});", "accent 80%"),
-    ("flutter/lib/common.dart", "static const Color button = Color(0xFF2C8CFF);",
-     f"static const Color button = Color(0xFF{CORAL});", "buttons"),
-    ("flutter/lib/common.dart", "static const Color idColor = Color(0xFF00B6F0);",
-     f"static const Color idColor = Color(0xFF{CORAL});", "ID colour"),
+    (DART_COMMON, "static const Color button = Color(0xFF2C8CFF);\n",
+     f"static const Color button = Color(0xFF{INK});\n"
+     f"  static const Color ink = Color(0xFF{INK});  // boring-remote: text and filled buttons\n"
+     f"  static const Color paper = Color(0xFF{PAPER});\n"
+     "  static Color get accentText => currentThemeMode() == ThemeMode.dark ? paper : ink;\n",
+     "filled buttons ink; accent text ink (light) or paper (dark)"),
+    (DART_COMMON, "static const Color idColor = Color(0xFF00B6F0);",
+     f"static const Color idColor = Color(0xFF{INK});", "ID text colour"),
+    (DART_COMMON, "labelLarge: TextStyle(fontSize: 16.0, color: MyTheme.accent80)",
+     "labelLarge: TextStyle(fontSize: 16.0, color: MyTheme.ink)", "light theme label text"),
+    (DART_COMMON, "backgroundColor: MyTheme.accent,\n        shape:",
+     "backgroundColor: MyTheme.ink,\n        foregroundColor: Colors.white,\n        shape:",
+     "light theme filled buttons"),
+    (DART_COMMON, "backgroundColor: MyTheme.accent,\n        foregroundColor: Colors.white,",
+     "backgroundColor: MyTheme.ink,\n        foregroundColor: Colors.white,", "dark theme filled buttons"),
+    (DART_COMMON, "style: const TextStyle(\n                                          color: MyTheme.accent)",
+     "style: TextStyle(\n                                          color: MyTheme.accentText)", "dialog Cancel text"),
+    (DART_COMMON, "style: TextStyle(color: MyTheme.accent),", "style: TextStyle(color: MyTheme.accentText),",
+     "Retry text"),
+    (SETTINGS, "style: const TextStyle(\n        color: _accentColor,",
+     "style: TextStyle(\n        color: MyTheme.accentText,", "Settings title text"),
+    (SETTINGS, "style: TextStyle(\n                  color: selected ? _accentColor : null,\n                  fontWeight",
+     "style: TextStyle(\n                  color: selected ? MyTheme.accentText : null,\n                  fontWeight",
+     "selected settings tab text"),
+    ("flutter/lib/desktop/widgets/button.dart",
+     "color: pressed.value\n                      ? MyTheme.accent\n                      : (widget.isOutline",
+     "color: pressed.value\n                      ? MyTheme.button\n                      : (widget.isOutline",
+     "pressed text button fill"),
+    ("flutter/lib/desktop/widgets/button.dart",
+     "color: pressed.value\n                  ? MyTheme.accent\n                  : (widget.isOutline",
+     "color: pressed.value\n                  ? MyTheme.button\n                  : (widget.isOutline",
+     "pressed icon-and-text button fill"),
+    ("flutter/lib/desktop/pages/server_page.dart", " color: MyTheme.accent,\n", " color: MyTheme.button,\n",
+     "connection window text buttons (buildButton, white text)"),
+    ("flutter/lib/common/widgets/chat_page.dart", "isOwnMessage ? MyTheme.accent : Colors.blueGrey",
+     "isOwnMessage ? MyTheme.button : Colors.blueGrey", "own chat bubble (white text)"),
+] + [
+    ("flutter/lib/desktop/pages/file_manager_page.dart",
+     f"backgroundColor: MaterialStateProperty.all(\n{a}selectedItems.items.isEmpty\n{b}? MyTheme.accent80\n"
+     f"{b}: MyTheme.accent,",
+     f"backgroundColor: MaterialStateProperty.all(\n{a}selectedItems.items.isEmpty\n"
+     f"{b}? MyTheme.ink.withOpacity(0.6)\n{b}: MyTheme.ink,", "file transfer send button (white text)")
+    for a, b in ((" " * 26, " " * 30), (" " * 24, " " * 28))
 ]
 
 # (file under boring/, destination in the tree, why), copied byte for byte.

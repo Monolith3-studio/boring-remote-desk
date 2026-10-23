@@ -268,6 +268,26 @@ class RebrandSeam(unittest.TestCase):
         tray.write_bytes((HERE / "art/icon-32.png").read_bytes())  # the colour icon, not a template
         self.assert_check_fails("Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph")
 
+    def test_contrast_matches_wcag(self):
+        self.assertAlmostEqual(check.contrast("FFFFFF", "000000"), 21.0, places=2)  # WCAG's own extremes
+        self.assertAlmostEqual(check.contrast("767676", "FFFFFF"), 4.54, places=2)  # the known 4.5:1 grey
+        self.assertLess(check.contrast("FFFFFF", "FF5949"), 4.5)  # why coral can't carry text
+
+    def test_coral_filled_button_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/common.dart", "backgroundColor: MyTheme.ink,\n        foregroundColor: Colors.white,\n"
+                  "        shape:", "backgroundColor: MyTheme.accent,\n        shape:")
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*flutter/lib/common.dart:\d+")
+        self.assertIn("FAIL every text colour pair clears 4.5:1", r.stdout)
+
+    def test_coral_text_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/pages/desktop_setting_page.dart", "color: MyTheme.accentText,",
+                  "color: MyTheme.accent,")
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*desktop_setting_page.dart:\d+")
+
     def test_moved_patch_target_stops_the_script_and_writes_nothing(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
         cfg.write_text(cfg.read_text().replace('&["rs-ny.rustdesk.com"]', '&["rs-sg.rustdesk.com"]'))

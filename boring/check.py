@@ -382,6 +382,41 @@ def png_pixels(path):
     return w, h, px
 
 
+def contrast(fg, bg):
+    """WCAG 2 contrast ratio of two RRGGBB colours."""
+    def lum(h):
+        rgb = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        r, g, b = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in rgb]
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    a, b = sorted((lum(fg), lum(bg)), reverse=True)
+    return (a + 0.05) / (b + 0.05)
+
+
+ARGS = r"(?:[^()]|\((?:[^()]|\([^()]*\))*\))*?"  # call arguments, two levels of parentheses
+CORAL_UNDER_TEXT = [
+    re.compile(r"TextStyle\(" + ARGS + r"(?:MyTheme\.accent(?:50|80)?\b|_accentColor)"),  # coral text
+    re.compile(r"buildButton\(" + ARGS + r"color: MyTheme\.accent\b"),  # fill under white text
+    re.compile(r"(?:backgroundColor|foregroundColor): (?:MaterialStateProperty\.all\(\s*)?"
+               r"(?:[\w.]+\s*\?\s*)?(?:MyTheme\.accent(?:50|80)?\b)"),
+    re.compile(r"(?s)backgroundColor: MaterialStateProperty\.all\((?:(?!\)\s*,).)*?MyTheme\.accent"),
+    re.compile(r"isOwnMessage \? MyTheme\.accent\b"),
+    re.compile(r"BoxDecoration\(\s*color: pressed\.value\s*\? MyTheme\.accent\b"),  # button fill
+]
+
+
+def coral_text_hits(root):
+    """Places in the desktop Dart where coral is the colour of text, or the fill behind it."""
+    out = []
+    for p in sorted((root / "flutter/lib").rglob("*.dart")) if (root / "flutter/lib").is_dir() else []:
+        rel = p.relative_to(root).as_posix()
+        if rel.startswith(NOT_SHIPPED):
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for pat in CORAL_UNDER_TEXT:
+            out += [f"{rel}:{text.count(chr(10), 0, m.start()) + 1}" for m in pat.finditer(text)]
+    return sorted(set(out))
+
+
 def branding_checks(c):
     """Ticket 17: no RustDesk name, link or logo a person sees in the Mac and Windows app."""
     hits, legal = ui_brand_hits(c.root)
@@ -405,6 +440,19 @@ def branding_checks(c):
            and "crate::get_app_name()," not in tray)
     c.fact("app accent is Boring Labs coral",
            "static const Color accent = Color(0xFFFF5949);" in c.read("flutter/lib/common.dart"))
+    low = [f"{fg} on {bg} {contrast(fg, bg):.2f}:1 ({where})" for fg, bg, where in rebrand.TEXT_PAIRS
+           if contrast(fg, bg) < 4.5]
+    common = c.read("flutter/lib/common.dart")
+    ink, paper = rebrand.INK, rebrand.PAPER
+    uses = (f"static const Color button = Color(0xFF{ink});" in common
+            and "static Color get accentText => currentThemeMode() == ThemeMode.dark ? paper : ink;" in common
+            and f"static const Color ink = Color(0xFF{ink});" in common
+            and f"static const Color paper = Color(0xFF{paper});" in common
+            and common.count("backgroundColor: MyTheme.ink,\n        foregroundColor: Colors.white,") == 2)
+    c.fact("every text colour pair clears 4.5:1 (ink buttons with white text, ink or paper accent text)",
+           not low and uses, "; ".join(low) or "tree does not use the TEXT_PAIRS colours")
+    coral = coral_text_hits(c.root)
+    c.fact("coral is never text or a fill under text", not coral, "; ".join(coral[:10]))
 
     upstream = dict(reversed(l.split(maxsplit=1)) for l in LOGOS.read_text().splitlines() if l.strip())
     bad_hash = set(upstream.values())
