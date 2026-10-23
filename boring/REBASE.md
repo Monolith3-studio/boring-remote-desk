@@ -28,6 +28,14 @@ git reset --hard && git -C libs/hbb_common reset --hard   # drop the scripted ou
 
 `pins.py` covers Flutter, the bridge Flutter, Rust (Mac, Windows, bridge), LLVM, the vcpkg commit, flutter_rust_bridge, cargo-expand, the minimum macOS version and the app `VERSION`. `check.py` also fails in CI if `VERSION` doesn't match `Cargo.toml`. If upstream adds a toolchain pin we don't track, add it to `PINS`. To spot new pins, run `git diff OLD NEW -- .github/workflows/flutter-build.yml .github/workflows/bridge.yml`.
 
+If `check.py` fails `protocol files are upstream's`, upstream changed a `.proto`. Confirm the change is upstream's and read it (`git diff OLD NEW -- '*.proto'`, and `git -C libs/hbb_common diff <old-sha> <new-sha> -- protos`), then record the new hashes on an LF checkout:
+
+```
+sha256sum libs/base/protos/message.proto libs/hbb_common/protos/rendezvous.proto > boring/protocol.sha256
+```
+
+If upstream added or moved a `.proto`, list it there too. Commit it with the pin bump.
+
 Then look for new code that contacts RustDesk. `check.py` catches the known server names, but not new kinds of contact:
 
 ```

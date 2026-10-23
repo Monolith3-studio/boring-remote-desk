@@ -19,7 +19,10 @@ import hashlib
 import pathlib
 import plistlib
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rebrand  # noqa: E402
@@ -118,6 +121,18 @@ def plist_label(c, rel):
 
 MSI_DIR = "res/msi/Package"
 VISIBLE_ATTR = re.compile(r'\b(?:Value|Text|Title|Name|Description)="([^"]*)"')
+
+
+def installer_strings(pkg):
+    """Every string a person can read in the WiX sources, as "<file>: <value>".
+
+    Localisation values, dialog text, shortcut and folder names; XML comments
+    dropped. RuntimeBroker_* is an internal helper process name, never shown."""
+    out = []
+    for f in sorted(pkg.rglob("*.wx[sli]")) if pkg.is_dir() else []:
+        text = re.sub(r"<!--.*?-->", "", f.read_text(encoding="utf-8-sig", errors="replace"), flags=re.S)
+        out += [f"{f.name}: {v}" for v in VISIBLE_ATTR.findall(text) if not v.startswith("RuntimeBroker_")]
+    return out
 ART = {"banner": ("WixUIBannerBmp", (493, 58)), "dialog": ("WixUIDialogBmp", (493, 312))}
 
 
@@ -136,6 +151,38 @@ def bmp_facts(path):
     return w, h, bpp, len(colours)
 
 
+def license_after_preprocess(root, app_name):
+    """License.rtf as the MSI gets it: upstream's preprocess.py license step, run on a copy."""
+    src = root / "res/msi/preprocess.py"
+    if not src.is_file() or not (root / MSI_DIR / "License.rtf").is_file():
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        shutil.copy(src, tmp / "preprocess.py")
+        (tmp / "Package").mkdir()
+        shutil.copy(root / MSI_DIR / "License.rtf", tmp / "Package/License.rtf")
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); sys.argv[0] = sys.argv[1] + '/preprocess.py'; "
+                "import preprocess; preprocess.update_license_file(sys.argv[2])")
+        r = subprocess.run([sys.executable, "-I", "-c", code, str(tmp), app_name or ""], capture_output=True)
+        return (tmp / "Package/License.rtf").read_bytes() if r.returncode == 0 else None
+
+
+PROTOCOL_HASHES = pathlib.Path(__file__).resolve().parent / "protocol.sha256"
+
+
+def protocol_matches(root):
+    """(ok, why): the tree's .proto files are exactly those in protocol.sha256, unchanged.
+
+    The hashes are upstream's at our base, taken with LF endings so a CRLF
+    checkout matches; a rebase that changes a proto updates them (boring/REBASE.md)."""
+    want = dict(reversed(l.split(maxsplit=1)) for l in PROTOCOL_HASHES.read_text().splitlines() if l.strip())
+    have = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+            for p in root.rglob("*.proto") if p.is_file() and not p.relative_to(root).as_posix().startswith(
+                ("target/", ".git/"))}
+    bad = sorted(f for f in want.keys() | have.keys() if want.get(f) != have.get(f))
+    return not bad, ", ".join(bad)
+
+
 def msi_checks(c, workflows):
     """Windows installer: name, exe, art, license, no RustDesk text, release on tags."""
     pkg = c.root / MSI_DIR
@@ -143,19 +190,15 @@ def msi_checks(c, workflows):
     pre = c.read("res/msi/preprocess.py")
     c.fact("MSI product name is Boring Remote (installer, Apps list)",
            f'<Package Name="{rebrand.DISPLAY_NAME}"' in wxs)
-    m = re.search(r'"--app-name", type=str, default="([^"]*)"', pre)
-    c.fact("MSI installs BoringRemote.exe", m and m.group(1) == rebrand.APP_NAME
-           and 'Name="$(var.Product).exe"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"), m and m.group(1))
+    app = re.search(r'"--app-name", type=str, default="([^"]*)"', pre)
+    c.fact(f"MSI installs {rebrand.APP_NAME}.exe", app and app.group(1) == rebrand.APP_NAME
+           and 'Name="$(var.Product).exe"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"), app and app.group(1))
     m = re.search(r'"--manufacturer",\s*type=str,\s*default="([^"]*)"', pre)
     c.fact("MSI manufacturer is Boring Labs", m and m.group(1) == rebrand.MANUFACTURER, m and m.group(1))
     shortcut = re.search(r'<String Id="SC_Client" Value="([^"]*)"', c.read(rebrand.WXL))
     c.fact("Start menu shortcut is Boring Remote", shortcut and shortcut.group(1) == rebrand.DISPLAY_NAME)
 
-    hits = []
-    for f in sorted(pkg.rglob("*.wx[sli]")) if pkg.is_dir() else []:
-        text = re.sub(r"<!--.*?-->", "", f.read_text(encoding="utf-8-sig", errors="replace"), flags=re.S)
-        hits += [f"{f.name}: {v}" for v in VISIBLE_ATTR.findall(text)
-                 if "rustdesk" in v.lower() and not v.startswith("RuntimeBroker_")]  # helper exe, never shown
+    hits = [h for h in installer_strings(pkg) if "rustdesk" in h.split(": ", 1)[1].lower()]
     arp = re.search(r"g_arpsystemcomponent = \{(.*?)\n\}", pre, re.S)
     if arp is None or "rustdesk" in arp.group(1).lower():
         hits.append("preprocess.py: Apps list support links")
@@ -166,10 +209,13 @@ def msi_checks(c, workflows):
         c.fact(f"MSI {what} art is {size[0]}x{size[1]}, 24-bit, designed (not blank)",
                facts is not None and facts[:3] == (*size, 24) and facts[3] >= 8
                and f'"{name}"' in pre and "Package/Resources/{var}.bmp" in pre, str(facts))
-    lic = c.read(f"{MSI_DIR}/License.rtf")
+    ours_lic = (rebrand.HERE / "msi/License.rtf").read_bytes()
+    built = license_after_preprocess(c.root, app and app.group(1))
     c.fact("installer license is the Boring Remote AGPL notice",
-           "GNU Affero General Public License" in lic and "personal data" not in lic
-           and "if True:  # boring-remote: License.rtf comes from boring/msi" in pre)
+           b"GNU Affero General Public License" in ours_lic and b"personal data" not in ours_lic
+           and b"modified version of RustDesk" in ours_lic  # the upstream credit stays
+           and built == ours_lic and '<WixVariable Id="WixUILicenseRtf" Value="License.rtf" />' in wxs,
+           "preprocess.py rewrites License.rtf" if built != ours_lic else "")
     icon = (rebrand.HERE / "msi/icon.ico").read_bytes()
     c.fact("product icon is Boring Remote's", all(
         (c.root / p).is_file() and (c.root / p).read_bytes() == icon
@@ -334,9 +380,8 @@ def run_checks(root, rerun=True):
 
     msi_checks(c, workflows)
 
-    # protocol untouched
-    c.fact("protocol files untouched by the script",
-           not any("protos/" in rel or rel.endswith(".proto") for rel, *_ in rebrand.PATCHES))
+    # protocol untouched: every .proto in the tree is upstream's, byte for byte
+    c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))
 
     if rerun:
         def snap():

@@ -15,6 +15,9 @@ import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import check  # noqa: E402  (shares the installer-string reader with check.py)
+
 REPO = HERE.parent
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
@@ -127,14 +130,7 @@ class RebrandSeam(unittest.TestCase):
             self.assertEqual(head[:2], b"BM", name)
             self.assertEqual((int.from_bytes(head[18:22], "little"),
                               int.from_bytes(head[22:26], "little", signed=True)), size, name)
-        # Every string a person can read in the installer: localisation values,
-        # dialog text, shortcut and folder names, support links.
-        seen = []
-        for f in sorted(pkg.rglob("*.wx[sl]")):
-            t = re.sub(r"<!--.*?-->", "", f.read_text(encoding="utf-8-sig"), flags=re.S)
-            seen += [f"{f.name}: {v}" for v in re.findall(
-                r'\b(?:Value|Text|Title|Name|Description)="([^"]*)"', t)
-                if not v.startswith("RuntimeBroker_")]  # internal helper process, never shown
+        seen = check.installer_strings(pkg)  # every string a person can read in the installer
         self.assertEqual([s for s in seen if "rustdesk" in s.split(": ", 1)[1].lower()], [])
         self.assertIn("Package.en-us.wxl: Boring Remote", seen)           # Start menu shortcut
         lic = (pkg / "License.rtf").read_text()
@@ -195,6 +191,37 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("src/server/connection.rs", "        let addr = hbb_common::try_into_v4(addr);\n", "")
         self.assert_check_fails("whitelist is enforced on incoming connections")
+
+    def test_changed_protocol_file_fails_check(self):
+        self.rebrand()
+        proto = self.root / "libs/hbb_common/protos/rendezvous.proto"
+        proto.write_text(proto.read_text() + "\nmessage Sneaky { string id = 1; }\n")
+        self.assert_check_fails("protocol files are upstream's")
+
+    def test_crlf_checkout_of_protocol_files_passes_check(self):  # Windows, text=auto
+        for rel in ("libs/hbb_common/protos/rendezvous.proto", "libs/base/protos/message.proto"):
+            path = self.root / rel
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        self.rebrand()
+        self.assertIn("PASS protocol files are upstream's", run(CHECK, self.root, "--no-rerun").stdout)
+
+    def test_new_protocol_file_fails_check(self):
+        self.rebrand()
+        (self.root / "src/extra.proto").write_text('syntax = "proto3";\n')
+        self.assert_check_fails("protocol files are upstream's")
+
+    LICENSE_SKIP = "    if True:  # boring-remote: License.rtf comes from boring/msi and keeps its upstream credit\n"
+
+    def test_preprocess_rewriting_the_license_fails_check(self):
+        self.rebrand()
+        self.edit("res/msi/preprocess.py", self.LICENSE_SKIP, '    if app_name == "RustDesk":\n')
+        self.assert_check_fails("installer license is the Boring Remote AGPL notice")
+
+    def test_license_check_is_behaviour_not_the_comment(self):
+        self.rebrand()
+        self.edit("res/msi/preprocess.py", self.LICENSE_SKIP, "    if app_name:  # reworded, same effect\n")
+        r = run(CHECK, self.root, "--no-rerun")
+        self.assertIn("PASS installer license is the Boring Remote AGPL notice", r.stdout)
 
     def test_moved_patch_target_stops_the_script_and_writes_nothing(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
