@@ -138,6 +138,21 @@ PATCHES = [
     (HBB, "            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();\n",
      "            // boring-remote: no rendezvous server from the config file\n",
      "no rendezvous server from the config file"),
+    ("src/client.rs",
+     "            if other_server == PUBLIC_SERVER {\n"
+     "                (\n"
+     "                    check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),\n"
+     "                    RENDEZVOUS_SERVERS[1..]\n"
+     "                        .iter()\n",
+     "            if other_server == PUBLIC_SERVER {\n"
+     "                // boring-remote: the list is empty, so id@public is an error, not a panic\n"
+     "                let Some((first, rest)) = RENDEZVOUS_SERVERS.split_first() else {\n"
+     '                    bail!("Boring Remote has no public server: connect by tailnet address");\n'
+     "                };\n"
+     "                (\n"
+     "                    check_port(*first, RENDEZVOUS_PORT),\n"
+     "                    rest.iter()\n",
+     "id@public peer fails cleanly"),
     # --- lock bypasses: these write past OVERWRITE_SETTINGS ------------------
     ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n",
      "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n"

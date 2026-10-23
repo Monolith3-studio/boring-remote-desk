@@ -252,14 +252,19 @@ def run_checks(root, rerun=True):
     lib = c.read("libs/hbb_common/src/lib.rs")
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
 
-    hits = []
+    hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):
         for p in sorted((c.root / base).rglob("*")):
             if p.suffix not in (".rs", ".dart") or not p.is_file() or "/lang/" in p.as_posix():
                 continue
             code = strip_tests_and_comments(p.read_text(encoding="utf-8", errors="replace"))
             hits += [f"{p.relative_to(c.root)}: {h}" for h in PUBLIC_SERVER.findall(code)]
+            index += [f"{p.relative_to(c.root)}: {h}" for h in re.findall(r"RENDEZVOUS_SERVERS\[[^\]]*\]", code)]
     c.fact("no shipped code names a RustDesk public server", not hits, "; ".join(hits[:10]))
+    c.fact("no code indexes the empty RENDEZVOUS_SERVERS (id@public panics)", not index, "; ".join(index))
+    public = re.search(r"if other_server == PUBLIC_SERVER \{(.*?)\} else", c.read("src/client.rs"), re.S)
+    c.fact("id@public peer fails with an error", public is not None and "split_first()" in public.group(1)
+           and "bail!(" in public.group(1), public and public.group(1)[:200])
 
     # banned codecs and the Mac build flags
     wf_dir = c.root / ".github/workflows"
