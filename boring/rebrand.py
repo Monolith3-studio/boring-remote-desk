@@ -112,20 +112,23 @@ PATCHES = [
     ("src/platform/macos.rs", re.compile(r"(?:com\.carriez\.)?\{\}_service"),
      HOSTD_ID + "{:.0}", "LaunchDaemon label"),
 ] + [
-    (f"src/platform/privileges_scripts/{f}", old, new, "launchd label / prefs dir")
-    for f, pairs in (
-        ("agent.plist", ("agent", "assoc")),
-        ("daemon.plist", ("hostd", "assoc")),
-        ("install.scpt", ("agent", "hostd", "prefs")),
-        ("uninstall.scpt", ("agent", "hostd")),
-        ("update.scpt", ("agent", "hostd")),
+    (f"src/platform/privileges_scripts/{f}", old, new, why)
+    for f, old, new, why in (
+        ("agent.plist", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
+        ("agent.plist", "<string>com.carriez.rustdesk</string>", f"<string>{AGENT_ID}</string>", "agent bundle id"),
+        ("daemon.plist", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        ("daemon.plist", "<string>com.carriez.rustdesk</string>", f"<string>{AGENT_ID}</string>", "daemon bundle id"),
+        ("install.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
+        ("install.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        # the app's config dir is ~/Library/Preferences/<ORG>.<APP_NAME>, files <APP_NAME>.toml / 2.toml
+        ("install.scpt", "Preferences/com.carriez.RustDesk/", f"Preferences/{ORG}.{APP_NAME}/", "config dir"),
+        ("install.scpt", '(prefs_dir & "RustDesk.toml")', f'(prefs_dir & "{APP_NAME}.toml")', "config file"),
+        ("install.scpt", '(prefs_dir & "RustDesk2.toml")', f'(prefs_dir & "{APP_NAME}2.toml")', "config file 2"),
+        ("uninstall.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
+        ("uninstall.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        ("update.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
+        ("update.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
     )
-    for old, new in (
-        {"agent": ("com.carriez.RustDesk_server", AGENT_ID),
-         "hostd": ("com.carriez.RustDesk_service", HOSTD_ID),
-         "assoc": ("<string>com.carriez.rustdesk</string>", f"<string>{AGENT_ID}</string>"),
-         "prefs": ("Preferences/com.carriez.RustDesk/", f"Preferences/{ORG}.RustDesk/")}[p]
-        for p in pairs)
 ] + [
     # --- servers: none ------------------------------------------------------
     (HBB, 'pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];',

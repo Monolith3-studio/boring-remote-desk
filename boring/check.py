@@ -191,7 +191,8 @@ def run_checks(root, rerun=True):
 
     # identity
     m = re.search(r'static ref APP_NAME: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
-    c.fact("app name is BoringRemote", m and m.group(1) == "BoringRemote", m and m.group(1))
+    app_name = m and m.group(1)
+    c.fact("app name is BoringRemote", app_name == "BoringRemote", app_name)
     try:
         info = plistlib.loads((c.root / "flutter/macos/Runner/Info.plist").read_bytes())
     except Exception:
@@ -214,6 +215,15 @@ def run_checks(root, rerun=True):
     scripts = "".join(c.read(f"src/platform/privileges_scripts/{f}")
                       for f in ("install.scpt", "uninstall.scpt", "update.scpt"))
     c.fact("install scripts use our launchd labels", "com.carriez" not in scripts and HOSTD in scripts)
+    # the app's real config dir is ~/Library/Preferences/<ORG>.<APP_NAME> (hbb_common Config::path)
+    org = re.search(r'static ref ORG: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    conf_dir = f"{org and org.group(1)}.{app_name}"
+    install = c.read("src/platform/privileges_scripts/install.scpt")
+    dirs = set(re.findall(r"Library/Preferences/([^/\"]+)/", install))
+    tomls = set(re.findall(r'"([^"/]+\.toml)"', install))
+    c.fact("install script copies the real config dir, Preferences/io.boringlabs.BoringRemote/",
+           conf_dir == "io.boringlabs.BoringRemote" and dirs == {conf_dir}
+           and tomls == {"BoringRemote.toml", "BoringRemote2.toml"}, f"config dir {conf_dir}, script {dirs} {tomls}")
 
     # servers and locked settings
     c.fact("rendezvous servers empty", re.search(r"RENDEZVOUS_SERVERS: &\[&str\] = &\[\s*\];", cfg))
