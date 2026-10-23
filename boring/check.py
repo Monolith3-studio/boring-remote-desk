@@ -183,6 +183,10 @@ def msi_checks(c, workflows):
     c.fact("tags publish a GitHub release with the MSI and its sha256",
            "startsWith(github.ref, 'refs/tags/')" in ours and "preprocess.py" in ours
            and ".msi.sha256" in ours and "contents: write" in ours)
+    # PowerShell's Set-Content ends lines with CRLF; sha256sum -c on Ubuntu then looks for "x.msi\r"
+    writers = [l.strip() for l in ours.splitlines() if ".sha256" in l and re.search(r"Set-Content|Out-File|>", l)]
+    c.fact("MSI .sha256 is written with LF, so sha256sum -c passes on Linux",
+           writers and all("-NoNewline" in l and '`n"' in l for l in writers), str(writers))
 
 
 def run_checks(root, rerun=True):

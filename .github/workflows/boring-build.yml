@@ -174,7 +174,7 @@ jobs:
 
       - name: Install vcpkg dependencies
         run: |
-          if ! $VCPKG_ROOT/vcpkg install --x-install-root="$VCPKG_ROOT/installed"; then
+          if ! "$VCPKG_ROOT/vcpkg" install --x-install-root="$VCPKG_ROOT/installed"; then
             find "${VCPKG_ROOT}/" -name "*.log" -exec sh -c 'echo "== $1"; cat "$1"' _ {} \;
             exit 1
           fi
@@ -202,7 +202,7 @@ jobs:
           sleep 20
           kill -0 "$pid"   # still running
           kill "$pid"
-          ditto -c -k --keepParent "$APP" BoringRemote-${VERSION}-macos-arm64-unsigned.zip
+          ditto -c -k --keepParent "$APP" "BoringRemote-${VERSION}-macos-arm64-unsigned.zip"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -281,7 +281,7 @@ jobs:
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
         run: |
-          if ! $VCPKG_ROOT/vcpkg install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
+          if ! "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"; then
             find "${VCPKG_ROOT}/" -name "*.log" -exec sh -c 'echo "== $1"; cat "$1"' _ {} \;
             exit 1
           fi
@@ -328,7 +328,8 @@ jobs:
           $name = "BoringRemote-$env:VERSION-windows-x64-unsigned.msi"
           Move-Item $built.FullName "msi-out\$name"
           $hash = (Get-FileHash "msi-out\$name" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "msi-out\$name.sha256" -Value "$hash  $name" -Encoding ascii
+          # LF, not Set-Content's CRLF: the release job checks it with sha256sum -c on Ubuntu
+          Set-Content -Path "msi-out\$name.sha256" -Value "$hash  $name`n" -NoNewline -Encoding ascii
           Get-Content "msi-out\$name.sha256"
 
       # The Engine installs with msiexec /qn, so prove exactly that: silent install,
