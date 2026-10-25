@@ -643,7 +643,39 @@ fn unsafe_get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     }
 }
 
+/// The console user as the dynamic store reports it ("Name" / "UID").
+/// /dev/console can stay owned by root while a user is logged in, which made
+/// a logged-in Mac look like the login window (file transfer refused).
+fn get_console_user_key(key: &str) -> Option<String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/usr/sbin/scutil")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(b"show State:/Users/ConsoleUser\n")
+        .ok()?;
+    let output = child.wait_with_output().ok()?;
+    let prefix = format!("{key} : ");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(&prefix).map(|v| v.trim().to_owned()))
+        .filter(|v| !v.is_empty())
+}
+
 fn get_active_user(t: &str) -> String {
+    let from_store = if t == "-n" {
+        get_console_user_key("UID")
+    } else {
+        // the login window shows up as user "loginwindow"; callers expect "" there
+        get_console_user_key("Name").map(|n| if n == "loginwindow" { "".to_owned() } else { n })
+    };
+    if let Some(v) = from_store {
+        return v;
+    }
     if let Ok(output) = std::process::Command::new("ls")
         .args(vec![t, "/dev/console"])
         .output()
