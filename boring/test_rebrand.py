@@ -188,6 +188,25 @@ class RebrandSeam(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"FAIL {fact}", r.stdout)
 
+    UPDATE_FACT = "the only update URL in shipped code is the version file URL"
+
+    def test_planted_rustdesk_update_url_fails_check(self):
+        self.rebrand()
+        self.edit("src/update_notice.rs", "pub const VERSION_URL",
+                  'pub const OLD_URL: &str = "https://api.rustdesk.com/version/latest";\npub const VERSION_URL')
+        self.assert_check_fails(self.UPDATE_FACT)
+
+    def test_planted_github_releases_url_fails_check(self):
+        self.rebrand()
+        self.edit("src/update_notice_run.rs", "use crate::update_notice",
+                  'const X: &str = "https://github.com/rustdesk/rustdesk/releases/latest";\nuse crate::update_notice')
+        self.assert_check_fails(self.UPDATE_FACT)
+
+    def test_ticket_01_version_url_passes_check(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        self.assertIn(f"PASS {self.UPDATE_FACT}", r.stdout)
+
     WHITELIST_CALL = ("        if !self.check_whitelist(&addr).await {\n"
                       "            return false;\n"
                       "        }\n")

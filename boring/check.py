@@ -33,6 +33,15 @@ import rebrand  # noqa: E402
 
 AGENT, HOSTD, APP, SHOWN = rebrand.AGENT_ID, rebrand.HOSTD_ID, rebrand.APP_NAME, rebrand.DISPLAY_NAME
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
+# ADR 0003 (docs/adr/0003-update-notice-not-updater.md): the app may fetch one
+# version file and show a notice; it never downloads or installs. So no shipped
+# code may name an upstream update endpoint or a GitHub releases URL.
+_U = r"[^\s\"'`)]*"
+UPDATE_URL = re.compile(
+    r"https?://(?:" + r"[\w.-]*rustdesk\.com/" + _U + r"(?:version|update|latest|release)" + _U
+    + r"|api\.github\.com/" + _U + r"releases" + _U
+    + r"|github\.com/" + _U + r"/releases/(?:latest|download)" + _U + r")")
+VERSION_URL_DECL = re.compile(r'pub const VERSION_URL: &str = "(https://boringlabs\.online/[^"\s]+)";')
 BANNED = re.compile(r"hwcodec|vram")
 BUILD_CALL = re.compile(r"build\.py|cargo\b|FEATURES")
 HBB = rebrand.HBB
@@ -630,6 +639,20 @@ def run_checks(root):
     c.fact("update check locked off", rust_map(cfg, "OVERWRITE_LOCAL_SETTINGS").get("enable-check-update") == "N")
     lib = c.read("libs/hbb_common/src/lib.rs")
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
+
+    # ADR 0003: upstream's updater stays dead (the returns above, enable-check-update N,
+    # empty version endpoint); the one new network path is ticket 01's version file.
+    vurl = VERSION_URL_DECL.search(c.read("src/update_notice.rs"))
+    stray = []
+    for base in ("src", "libs", "flutter/lib"):
+        for p in sorted((c.root / base).rglob("*")):
+            if p.suffix not in (".rs", ".dart") or not p.is_file() or "/lang/" in p.as_posix():
+                continue
+            code = strip_tests_and_comments(p.read_text(encoding="utf-8", errors="replace"))
+            stray += [f"{p.relative_to(c.root)}: {h}" for h in UPDATE_URL.findall(code)]
+    c.fact("the only update URL in shipped code is the version file URL",
+           vurl is not None and not stray,
+           "; ".join(stray[:10]) or "src/update_notice.rs has no boringlabs.online VERSION_URL")
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):
