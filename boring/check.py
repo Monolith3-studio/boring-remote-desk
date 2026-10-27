@@ -6,7 +6,7 @@ Usage:  python3 boring/check.py [ROOT]
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
-test / updater / LAN discovery unreachable, no RustDesk public server named in shipped code,
+test / updater / LAN discovery unreachable (ADR 0003: the one update URL is the version file), no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
