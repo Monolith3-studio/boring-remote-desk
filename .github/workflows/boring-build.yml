@@ -247,6 +247,13 @@ jobs:
           IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: boring/dmg/release-mac.sh flutter/build/macos/Build/Products/Release/BoringRemote.app "$VERSION" dmg-out
 
+      # Update notice (ADR 0003): the version file the Desk app reads, beside the DMG. Fails the
+      # build if the tag is not Cargo.toml's version. Nothing is uploaded to boringlabs.online here;
+      # the release step publishes it by hand.
+      - name: Write version file (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: boring/dmg/write-version-file.sh Cargo.toml "${{ github.ref_name }}" dmg-out/BoringRemote-*-macos-arm64.dmg dmg-out
+
       # release-mac.sh deletes its keychain on exit; this covers a killed or cancelled step.
       - name: Delete temp signing keychain
         if: always()
