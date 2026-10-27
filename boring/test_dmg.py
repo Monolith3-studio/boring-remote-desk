@@ -8,6 +8,7 @@ identity in a temp keychain; nothing touches the real signing identity.
 Run: python3 -m unittest boring/test_dmg.py -v
 """
 import hashlib
+import json
 import os
 import pathlib
 import plistlib
@@ -164,6 +165,58 @@ def step(job_text, name):
     m = re.search(rf"^      - name: {re.escape(name)}\n(.*?)(?=^      - |\Z)", job_text, re.S | re.M)
     assert m, f"no step {name}"
     return m.group(1)
+
+
+VERSION_FILE = DMG / "write-version-file.sh"
+
+
+class VersionFile(unittest.TestCase):
+    """Ticket 04: a tagged build writes the-boring-remote-version.json beside the DMG."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cargo = self.tmp / "Cargo.toml"
+        self.cargo.write_text('[package]\nname = "x"\nversion = "1.5.0"\n\n[dependencies]\nfoo = { version = "9.9.9" }\n')
+        self.out = self.tmp / "out"
+        self.out.mkdir()
+        self.dmg = self.out / "BoringRemote-1.5.0-macos-arm64.dmg"
+        self.dmg.write_bytes(b"not really a dmg")
+
+    def write(self, tag):
+        return run(["bash", str(VERSION_FILE), str(self.cargo), tag, str(self.dmg), str(self.out)])
+
+    def test_writes_the_contract_json_beside_the_dmg(self):
+        r = self.write("v1.5.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads((self.out / "the-boring-remote-version.json").read_text())
+        self.assertEqual(got, {
+            "version": "1.5.0",
+            "sha256": hashlib.sha256(b"not really a dmg").hexdigest(),
+            "url": "https://boringlabs.online/downloads/BoringRemote-1.5.0-macos-arm64.dmg",
+        })
+
+    def test_bare_tag_without_v_also_matches(self):
+        self.assertEqual(self.write("1.5.0").returncode, 0)
+
+    def test_tag_that_differs_from_cargo_fails_and_writes_nothing(self):
+        r = self.write("v1.5.1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("1.5.1", r.stderr)
+        self.assertFalse((self.out / "the-boring-remote-version.json").exists())
+
+    def test_non_semver_tag_fails(self):
+        self.assertNotEqual(self.write("v1.5.0-rc1").returncode, 0)
+
+    def test_workflow_runs_it_on_tags_and_ships_the_file_with_the_dmg(self):
+        text = WORKFLOW.read_text()
+        st = step(job("build-macos"), "Write version file (tags only)")
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/')", st)
+        self.assertIn("boring/dmg/write-version-file.sh", st)
+        self.assertIn("dmg-out", st)
+        self.assertLess(job("build-macos").index("Sign, build DMG"), job("build-macos").index("Write version file"))
+        self.assertLess(job("build-macos").index("Write version file"), job("build-macos").index("path: dmg-out/*"))
+        self.assertNotRegex(text, r"(curl|scp|rsync|wrangler)[^\n]*boringlabs")
 
 
 class Workflow(unittest.TestCase):
