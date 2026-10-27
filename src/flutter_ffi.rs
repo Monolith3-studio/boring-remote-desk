@@ -1210,6 +1210,12 @@ pub fn main_http_request(url: String, method: String, body: Option<String>, head
     http_request(url, method, body, header)
 }
 
+/// Update notice (ADR 0003). Blocking HTTP, so not Sync: bridge runs it off the UI thread.
+/// Returns the newer version string, or None. Notice only; nothing is downloaded.
+pub fn main_check_update_notice() -> Option<String> {
+    crate::update_notice_run::check_now()
+}
+
 pub fn main_get_local_option(key: String) -> SyncReturn<String> {
     SyncReturn(get_local_option(key))
 }
