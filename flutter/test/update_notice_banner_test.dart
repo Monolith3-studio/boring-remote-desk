@@ -55,8 +55,22 @@ void main() {
     )));
     await tester.pump();
     expect(calls, 1);
-    await tester.pump(const Duration(hours: 1));
+    await tester.pump(kBoringUpdateRecheckInterval);
     expect(calls, 2);
+  });
+
+  testWidgets('banner hides when a later check returns null', (tester) async {
+    final answers = <String?>['1.6.0', null];
+    await tester.pumpWidget(host(UpdateNoticeBanner(
+      check: () async => answers.removeAt(0),
+      isEnabled: () => true,
+      openUrl: (_) async {},
+    )));
+    await tester.pump();
+    expect(find.text('Boring Remote 1.6.0 is out.'), findsOneWidget);
+    await tester.pump(kBoringUpdateRecheckInterval);
+    await tester.pump();
+    expect(find.textContaining('is out.'), findsNothing);
   });
 
   testWidgets('Get update opens the one update URL', (tester) async {

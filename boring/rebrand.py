@@ -32,7 +32,7 @@ LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Sour
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 
-# Ticket 18: what the connect box says when a name doesn't resolve to a tailnet
+# What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
 NOT_FOUND = "Couldn't find that machine. Type its Tailscale name or IP."
 # Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
@@ -198,7 +198,7 @@ PATCHES = [
      "                    check_port(*first, RENDEZVOUS_PORT),\n"
      "                    rest.iter()\n",
      "id@public peer fails cleanly"),
-    # --- ticket 18: connect box takes a tailnet name, never an ID --------------
+    # --- tailnet name: connect box takes a tailnet name, never an ID --------------
     ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      TAILNET_RESOLVER + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      "tailnet name resolver"),
@@ -321,7 +321,7 @@ PATCHES += [
     )
 ]
 
-# --- ticket 17: no RustDesk name, link or logo a person sees on Mac or Windows --
+# --- branding: no RustDesk name, link or logo a person sees on Mac or Windows --
 # Code names, crate names, IPC and config keys stay (boring/check.py INTERNAL says
 # which and why). Every rustdesk.com / github.com/rustdesk link goes, or points at
 # our fork. RustDesk is named once, as plain text: LEGAL_LINE on the About page.
@@ -456,13 +456,52 @@ PATCHES += [
 # (file under boring/, destination in the tree, why), copied byte for byte.
 # The art comes from boring/msi/make_art.py: re-run it, never edit the outputs.
 HERE = pathlib.Path(__file__).resolve().parent
+# --- update notice hooks (ADR 0003, docs/adr/0003-update-notice-not-updater.md) ---
+# The new files (src/update_notice*.rs, update_notice_banner.dart) are ours; these
+# patches only wire them into upstream. check.py asserts each hook landed.
+NOTICE_IMPORT = "import 'package:flutter_hbb/desktop/widgets/update_notice_banner.dart';\n"
+NOTICE_BANNER = (
+    "      // boring-remote: update notice replaces upstream's stripped updater banner slot.\n"
+    "      UpdateNoticeBanner(\n"
+    "        check: () => bind.mainCheckUpdateNotice(),\n"
+    "        isEnabled: () => mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
+    "        openUrl: (u) => launchUrl(u),\n"
+    "      ),\n")
+PATCHES += [
+    ("src/lib.rs", "mod custom_server;\n",
+     "mod custom_server;\nmod update_notice; // boring-remote: update notice (ADR 0003)\nmod update_notice_run;\n",
+     "update notice modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: update notice (ADR 0003). Blocking HTTP, so not Sync: the bridge runs it off the UI thread.\n"
+     "/// Returns the newer version string, or None. Notice only; nothing is downloaded.\n"
+     "pub fn main_check_update_notice() -> Option<String> {\n"
+     "    crate::update_notice_run::check_now()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "update notice bridge call"),
+    (HOME, "import 'package:flutter_hbb/desktop/widgets/update_progress.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/update_progress.dart';\n" + NOTICE_IMPORT,
+     "update notice import (home)"),
+    (HOME, "      if (!isOutgoingOnly) buildPasswordBoard(context),\n",
+     "      if (!isOutgoingOnly) buildPasswordBoard(context),\n" + NOTICE_BANNER,
+     "update notice banner on the home page"),
+    (SETTINGS, "import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';\n" + NOTICE_IMPORT,
+     "update notice import (settings)"),
+    (SETTINGS, "      if (!incomingOnly)\n        _OptionCheckBox(\n          context,\n",
+     "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n"
+     "            isServer: false),\n"
+     "      if (!incomingOnly)\n        _OptionCheckBox(\n          context,\n",
+     "update notice on/off switch in General settings"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),
     ("msi/License.rtf", f"{MSI}/License.rtf", "installer license: AGPL notice, not upstream's privacy policy"),
     ("msi/icon.ico", "res/icon.ico", "product icon (MSI, shortcuts, Apps list)"),
     ("msi/icon.ico", "flutter/windows/runner/resources/app_icon.ico", "exe icon"),
-] + [  # ticket 17, from boring/art/make_app_art.py: every upstream logo slot (boring/upstream-logos.sha256)
+] + [  # branding, from boring/art/make_app_art.py: every upstream logo slot (boring/upstream-logos.sha256)
     ("art/AppIcon.icns", "flutter/macos/Runner/AppIcon.icns", "Mac app and Dock icon (the Mac kit's, as-is)"),
     ("art/icon-1024.png", "res/icon.png", "app icon master"),
     ("art/icon-1024.png", "res/mac-icon.png", "Mac icon master"),

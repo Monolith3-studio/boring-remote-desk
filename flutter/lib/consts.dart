@@ -719,5 +719,3 @@ extension WindowsTargetExt on int {
 }
 
 const kCheckSoftwareUpdateFinish = 'check_software_update_finish';
-
-const String kBoringUpdateCheckOption = 'boring-update-check'; // "N" = off (src/update_notice_run.rs)

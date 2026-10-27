@@ -1,4 +1,4 @@
-"""Mac release (ticket 05): signing, DMG, verify, secret export.
+"""Mac release: signing, DMG, verify, secret export.
 
 Seams: boring/dmg/release-mac.sh and boring/dmg/export-signing-secret.sh run as
 commands (exit code, files written, output), boring/dmg/settings.py as dmgbuild
@@ -150,7 +150,7 @@ class ReleaseMac(unittest.TestCase):
 
 
 WORKFLOW = ROOT / ".github" / "workflows" / "boring-build.yml"
-PIN = "B82B9E874D0CA6CD653F1EA8D4A6367F39CAE0C6"  # ticket 01: the cert TCC grants are keyed on
+PIN = "B82B9E874D0CA6CD653F1EA8D4A6367F39CAE0C6"  # the cert TCC grants are keyed on
 
 
 def job(name):
@@ -171,7 +171,7 @@ VERSION_FILE = DMG / "write-version-file.sh"
 
 
 class VersionFile(unittest.TestCase):
-    """Ticket 04: a tagged build writes the-boring-remote-version.json beside the DMG."""
+    """A tagged build writes the-boring-remote-version.json beside the DMG."""
 
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())

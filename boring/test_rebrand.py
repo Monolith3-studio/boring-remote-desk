@@ -202,7 +202,7 @@ class RebrandSeam(unittest.TestCase):
                   'const X: &str = "https://github.com/rustdesk/rustdesk/releases/latest";\nuse crate::update_notice')
         self.assert_check_fails(self.UPDATE_FACT)
 
-    def test_ticket_01_version_url_passes_check(self):
+    def test_version_url_passes_check(self):
         self.rebrand()
         r = run(CHECK, self.root)
         self.assertIn(f"PASS {self.UPDATE_FACT}", r.stdout)
@@ -254,7 +254,7 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertIn("PASS installer license is the Boring Remote AGPL notice", r.stdout)
 
-    # --- ticket 17: branding ------------------------------------------------
+    # --- branding ------------------------------------------------
     def test_upstream_logo_copied_anywhere_fails_check(self):
         upstream_icon = subprocess.run(["git", "-C", str(REPO), "show", "HEAD:res/icon.png"],
                                        check=True, capture_output=True).stdout
@@ -311,7 +311,7 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*desktop_setting_page.dart:\d+")
 
-    # --- ticket 18: connect by tailnet name ----------------------------------
+    # --- connect by tailnet name ----------------------------------
     def test_domain_port_branch_back_in_connect_fails_check(self):
         self.rebrand()
         self.edit("src/client.rs", "        if true {\n            return Ok((\n                (\n"

@@ -428,7 +428,7 @@ def coral_text_hits(root):
 
 
 def branding_checks(c):
-    """Ticket 17: no RustDesk name, link or logo a person sees in the Mac and Windows app."""
+    """No RustDesk name, link or logo a person sees in the Mac and Windows app."""
     hits, legal = ui_brand_hits(c.root)
     c.fact("no RustDesk name or link in the Mac and Windows app's strings", not hits, "; ".join(hits[:12]))
     c.fact("About page has the one plain AGPL legal line, crediting RustDesk with our source URL",
@@ -500,7 +500,7 @@ def tailnet_exprs():
 
 
 def connect_checks(c):
-    """Ticket 18: the connect box takes an IP or a tailnet name, never an ID."""
+    """The connect box takes an IP or a tailnet name, never an ID."""
     client = c.read("src/client.rs")
     body = fn_body(client, "    async fn _start(\n") or ""
     guard = body.find(TAILNET_GUARD)
@@ -641,7 +641,7 @@ def run_checks(root):
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
 
     # ADR 0003: upstream's updater stays dead (the returns above, enable-check-update N,
-    # empty version endpoint); the one new network path is ticket 01's version file.
+    # empty version endpoint); the one new network path is the version file.
     vurl = VERSION_URL_DECL.search(c.read("src/update_notice.rs"))
     stray = []
     for base in ("src", "libs", "flutter/lib"):
@@ -653,6 +653,18 @@ def run_checks(root):
     c.fact("the only update URL in shipped code is the version file URL",
            vurl is not None and not stray,
            "; ".join(stray[:10]) or "src/update_notice.rs has no boringlabs.online VERSION_URL")
+
+    # The notice hooks into upstream files only through rebrand.py; each must have landed.
+    hooks = [
+        ("src/lib.rs", "mod update_notice;"), ("src/lib.rs", "mod update_notice_run;"),
+        ("src/flutter_ffi.rs", "pub fn main_check_update_notice()"),
+        (rebrand.HOME, "UpdateNoticeBanner("),
+        (rebrand.HOME, "update_notice_banner.dart"),
+        (rebrand.SETTINGS, "kBoringUpdateCheckOption"),
+        (rebrand.SETTINGS, "update_notice_banner.dart"),
+    ]
+    missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
+    c.fact("update notice hooks landed in upstream files (ADR 0003)", not missing, "; ".join(missing))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):

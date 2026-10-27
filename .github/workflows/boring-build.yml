@@ -235,7 +235,7 @@ jobs:
       - name: DMG tests (throwaway identity)
         run: python3 -m unittest boring/test_dmg.py -v
 
-      # Signs with the self-signed "Boring Remote Code Signing" cert (ticket 01) from the
+      # Signs with the self-signed "Boring Remote Code Signing" cert from the
       # MAC_SIGN_P12 secrets via a temp keychain, so TCC grants survive updates. No secrets
       # (forks, PRs from forks) = ad-hoc signed and the log says so; a tag without them fails.
       # Then dmgbuild, mount and verify (layout, art, volume icon, signature, designated

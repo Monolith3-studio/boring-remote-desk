@@ -489,9 +489,6 @@ class _GeneralState extends State<_General> {
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
             kOptionEnableConfirmClosingTabs,
             isServer: false),
-      if (!isWeb)
-        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,
-            isServer: false),
       if (!incomingOnly)
         _OptionCheckBox(
           context,

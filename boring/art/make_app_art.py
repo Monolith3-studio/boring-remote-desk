@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make the Boring Remote app art that replaces every RustDesk logo slot (ticket 17).
+"""Make the Boring Remote app art that replaces every RustDesk logo slot.
 
 Usage:  python3 boring/art/make_app_art.py [--icns PATH]
 

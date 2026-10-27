@@ -4,8 +4,14 @@ import 'package:flutter/material.dart';
 
 // ASSUMPTION (unconfirmed by Jason, spec "Assumptions"): the page that tells
 // buyers to use the Download Link in their purchase email. Confirm before
-// ticket 03 merges. This is the only place the URL lives.
+// this ships. This is the only place the URL lives.
 const kBoringUpdatePageUrl = 'https://boringlabs.online/remote/update';
+
+/// Local option that turns the check off when set to "N" (read in src/update_notice_run.rs).
+const String kBoringUpdateCheckOption = 'boring-update-check';
+
+// UI re-check cadence; the Rust side gates the real network fetch to once per 24 h.
+const Duration kBoringUpdateRecheckInterval = Duration(hours: 1);
 
 /// Notice only (ADR 0003): shows "Boring Remote X.Y.Z is out." and a button
 /// that opens a web page. Never downloads or installs anything.
@@ -35,7 +41,7 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
   void initState() {
     super.initState();
     _run();
-    _timer = Timer.periodic(const Duration(hours: 1), (_) => _run());
+    _timer = Timer.periodic(kBoringUpdateRecheckInterval, (_) => _run());
   }
 
   Future<void> _run() async {
@@ -49,7 +55,7 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
     } catch (_) {
       return; // keep last good answer
     }
-    if (mounted) setState(() => _version = v ?? _version);
+    if (mounted) setState(() => _version = v);
   }
 
   @override
@@ -62,6 +68,7 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
   Widget build(BuildContext context) {
     final v = _version;
     if (v == null) return const SizedBox.shrink();
+    final onFill = Theme.of(context).colorScheme.onPrimary;
     return Container(
       margin: const EdgeInsets.only(top: 20),
       padding: const EdgeInsets.all(20),
@@ -69,12 +76,11 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
       child: Row(children: [
         Expanded(
           child: Text('Boring Remote $v is out.',
-              style: const TextStyle(color: Colors.white, fontSize: 14)),
+              style: TextStyle(color: onFill, fontSize: 14)),
         ),
         TextButton(
           onPressed: () => widget.openUrl(Uri.parse(kBoringUpdatePageUrl)),
-          child: const Text('Get update',
-              style: TextStyle(color: Colors.white)),
+          child: Text('Get update', style: TextStyle(color: onFill)),
         ),
       ]),
     );
