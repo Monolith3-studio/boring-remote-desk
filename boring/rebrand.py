@@ -469,6 +469,10 @@ NOTICE_BANNER = (
     "        check: () async => UpdateNotice.fromBridge(await bind.mainCheckUpdateNotice()),\n"
     "        isEnabled: () => mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
     "        openUrl: (u) => launchUrl(u),\n"
+    # Tickets 12/15: Install update and the inline License key field (same bridges as Settings).
+    "        hasKey: () => bind.mainGetLocalOption(key: kBoringLicenseKeyOption).isNotEmpty,\n"
+    "        install: () => bind.mainInstallUpdate(),\n"
+    "        setKey: (k) => bind.mainSetLicenseKey(key: k),\n"
     "      ),\n")
 PATCHES += [
     ("src/lib.rs", "mod custom_server;\n",
@@ -636,12 +640,22 @@ def _read(path):
     return text.replace("\r\n", "\n"), "\r\n" in text
 
 
+def _applied(text, old, new):
+    """True if this patch's result is already in text. Bridge fns and mod lines share anchors,
+    so a later insertion splits an earlier `new`; a multi-line inserted block already present
+    also counts. (One-line GUARDs repeat across functions, so not those.)"""
+    if new in text:
+        return True
+    added = new.replace(old, "", 1) if isinstance(old, str) and old in new else ""
+    return added.count("\n") > 1 and added in text
+
+
 def _patch(text, old, new):
     """(patched text, replacements made); 0 replacements if already applied."""
     if isinstance(old, re.Pattern):
         return old.subn(new.replace("\\", "\\\\"), text)
     if old in new:  # an insertion: applied once `new` is there
-        return text.replace(old, new), (0 if new in text else text.count(old))
+        return text.replace(old, new), (0 if _applied(text, old, new) else text.count(old))
     return text.replace(old, new), text.count(old)
 
 
@@ -662,7 +676,7 @@ def plan(root):
         if n:
             texts[rel] = (text2, crlf)
             changed.append(f"{rel}: {why}")
-        elif new not in text:
+        elif not _applied(text, old, new):
             moved.append(f"{rel}: patch target moved ({why})")
     langs = sorted((root / LANG_DIR).glob("*.rs")) if (root / LANG_DIR).is_dir() else []
     if not langs:
