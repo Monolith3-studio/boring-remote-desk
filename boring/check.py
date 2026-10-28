@@ -6,7 +6,7 @@ Usage:  python3 boring/check.py [ROOT]
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
-test / updater / LAN discovery unreachable, no RustDesk public server named in shipped code,
+test / updater / LAN discovery unreachable (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
@@ -19,7 +19,9 @@ Prints one PASS/FAIL line per fact, then
     rebrand check: <n> passed, <m> failed
 and exits 1 if anything failed. Stdlib only.
 """
+import base64
 import hashlib
+import json
 import pathlib
 import plistlib
 import re
@@ -32,7 +34,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rebrand  # noqa: E402
 
 AGENT, HOSTD, APP, SHOWN = rebrand.AGENT_ID, rebrand.HOSTD_ID, rebrand.APP_NAME, rebrand.DISPLAY_NAME
+# Upstream lines that would log an incoming link, and with it an activate link's License key.
+LINK_LOGS = [
+    ("src/platform/delegate.rs", 'log::debug!("URL received: {}", theurl);'),
+    ("flutter/lib/common.dart", 'debugPrint("A uri was received: $uri.'),
+    ("flutter/lib/common.dart", 'print("initialLink: $initialLink");'),
+    ("flutter/lib/main.dart", 'debugPrint("launch args: $args");'),
+]
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
+# Upstream update endpoints and GitHub releases URLs never appear in shipped code
+# (ADR 0004 keeps this from ADR 0003; see updater_checks for the allowlist).
+_U = r"[^\s\"'`)]*"
+UPDATE_URL = re.compile(
+    r"https?://(?:" + r"[\w.-]*rustdesk\.com/" + _U + r"(?:version|update|latest|release)" + _U
+    + r"|api\.github\.com/" + _U + r"releases" + _U
+    + r"|github\.com/" + _U + r"/releases/(?:latest|download)" + _U + r")")
+VERSION_URL_DECL = re.compile(r'pub const VERSION_URL: &str = "(https://boringlabs\.online/[^"\s]+)";')
 BANNED = re.compile(r"hwcodec|vram")
 BUILD_CALL = re.compile(r"build\.py|cargo\b|FEATURES")
 HBB = rebrand.HBB
@@ -419,7 +436,7 @@ def coral_text_hits(root):
 
 
 def branding_checks(c):
-    """Ticket 17: no RustDesk name, link or logo a person sees in the Mac and Windows app."""
+    """No RustDesk name, link or logo a person sees in the Mac and Windows app."""
     hits, legal = ui_brand_hits(c.root)
     c.fact("no RustDesk name or link in the Mac and Windows app's strings", not hits, "; ".join(hits[:12]))
     c.fact("About page has the one plain AGPL legal line, crediting RustDesk with our source URL",
@@ -491,7 +508,7 @@ def tailnet_exprs():
 
 
 def connect_checks(c):
-    """Ticket 18: the connect box takes an IP or a tailnet name, never an ID."""
+    """The connect box takes an IP or a tailnet name, never an ID."""
     client = c.read("src/client.rs")
     body = fn_body(client, "    async fn _start(\n") or ""
     guard = body.find(TAILNET_GUARD)
@@ -533,6 +550,99 @@ def connect_checks(c):
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [p.name for p in langs if p.read_text(encoding="utf-8").count(key) != 1]
     c.fact("plain not-found error is in every translation file", langs and not missing, ", ".join(missing))
+
+
+# ADR 0004 (docs/adr/0004-in-app-updater.md, supersedes 0003): the app may fetch
+# the signed version file and its .sig, and POST the license key to fulfillment
+# /update. Nothing else in shipped code is an update endpoint, and the only thing
+# run as root for an update is install-update.sh.
+UPDATE_ENDPOINTS = {
+    "VERSION_URL": ("src/update_notice.rs", "https://boringlabs.online/downloads/the-boring-remote-version.json"),
+    "UPDATE_ENDPOINT": ("src/license_key.rs", "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update"),
+}
+UPDATEISH_URL = re.compile(r"https?://[^\s\"'`)<>]*(?:version|update|release|latest|download)[^\s\"'`)<>]*", re.I)
+# Not app updates: (prefix, why).
+NOT_UPDATE_URLS = (("https://api.telegram.org/bot{}/getUpdates", "2FA Telegram bot polling"),)
+INSTALL_SCRIPT = "src/platform/privileges_scripts/install-update.sh"
+# Every `with administrator privileges` site, as file or file:enclosing fn/const.
+ROOT_CALLERS = {
+    "src/update_install_run.rs:OSA": "runs Resources/boring-install-update.sh (slice 6), the one update path",
+    "src/platform/macos.rs:elevate": "upstream daemon install/uninstall elevation, not an update",
+    "src/platform/macos.rs:update_me": "upstream updater; dead because start_auto_update_macos returns first",
+    "src/platform/privileges_scripts/update.scpt": "upstream updater script, only reached from update_me",
+    "src/platform/privileges_scripts/install.scpt": "daemon install",
+    "src/platform/privileges_scripts/uninstall.scpt": "daemon unload",
+}
+ROOT_SUFFIXES = (".rs", ".dart", ".scpt", ".swift", ".sh", ".py", ".m", ".mm")
+
+
+def shipped_files(c, suffixes):
+    for base in ("src", "libs", "flutter/lib"):
+        for p in sorted((c.root / base).rglob("*")):
+            if p.suffix in suffixes and p.is_file() and "/lang/" not in p.as_posix():
+                yield p.relative_to(c.root).as_posix(), p.read_text(encoding="utf-8", errors="replace")
+
+
+def activate_link_checks(c):
+    """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
+    plist = c.read("flutter/macos/Runner/Info.plist")
+    schemes = re.findall(r"<key>CFBundleURLSchemes</key>\s*<array>(.*?)</array>", plist, re.S)
+    names = [n for block in schemes for n in re.findall(r"<string>(.*?)</string>", block)]
+    c.fact("Mac URL scheme is boringremote only", names == [rebrand.APP_NAME.lower()], names)
+    src = c.read("src/activate_link.rs")
+    c.fact("activate link parser uses the app's scheme",
+           f'const SCHEME: &str = "{rebrand.APP_NAME.lower()}://";' in src)
+    dart = c.read("flutter/lib/common.dart")
+    branch = re.findall(r'uri\.authority == "activate"\) \{(.*?)return null;', dart, re.S)
+    c.fact("one activate branch, and it only hands the link to Rust",
+           len(branch) == 1 and "bind.mainActivateLink(url: url)" in branch[0] and "--" not in branch[0],
+           branch)
+    run = fn_body(c.read("src/license_key_run.rs"), "pub fn activate_link(url: &str) -> String {") or ""
+    c.fact("activate link stores a key only via the parser", "crate::activate_link::parse(url)" in run
+           and run.count("set_and_check(") == 1, run[:200])
+    logged = [f"{rel}: {needle}" for rel, needle in LINK_LOGS if needle in c.read(rel)]
+    c.fact("incoming links (and the key in them) are never logged", not logged, "; ".join(logged))
+
+
+def updater_checks(c):
+    for name, (rel, want) in UPDATE_ENDPOINTS.items():
+        m = re.search(rf'pub const {name}: &str = "([^"]*)";', c.read(rel))
+        c.fact(f"{name} is {want} (ADR 0004)", m is not None and m.group(1) == want, m and m.group(1))
+    allowed = {want for _, want in UPDATE_ENDPOINTS.values()}
+    stray = []
+    for rel, text in shipped_files(c, (".rs", ".dart")):
+        code = strip_tests_and_comments(text)
+        stray += [f"{rel}: {h}" for h in UPDATE_URL.findall(code)]
+        if rel.endswith(".rs"):  # network calls live in Rust; Dart URLs are links opened in a browser
+            stray += [f"{rel}: {h}" for h in UPDATEISH_URL.findall(code)
+                      if h not in allowed and not h.startswith(tuple(p for p, _ in NOT_UPDATE_URLS))]
+    c.fact("the only update endpoints are VERSION_URL, its .sig and fulfillment /update (ADR 0004)",
+           not stray, "; ".join(stray[:10]))
+
+    callers = []
+    for rel, text in shipped_files(c, ROOT_SUFFIXES):
+        if rel.endswith(".rs"):
+            code = strip_tests_and_comments(text)
+        else:
+            code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith(("#", "--", "//")))
+        for m in re.finditer(r"with administrator privileges", code):
+            owner = re.findall(r"\b(?:fn|const|static)\s+(\w+)", code[:m.start()])
+            key = f"{rel}:{owner[-1]}" if rel.endswith(".rs") and owner else rel
+            if key not in ROOT_CALLERS:
+                callers.append(key)
+    runner = c.read("src/update_install_run.rs")
+    c.fact("the only root-run update path is install-update.sh (ADR 0004)",
+           not callers and (c.root / INSTALL_SCRIPT).is_file()
+           and "Resources/boring-install-update.sh" in runner,
+           "; ".join(callers) or f"{INSTALL_SCRIPT} missing or not what update_install_run.rs runs")
+
+    try:
+        keys = json.loads(c.read("boring/update-pubkeys.json"))
+        cur, bak = (base64.b64decode(keys[k], validate=True) for k in ("current", "backup"))
+        ok = len(cur) == 32 and len(bak) == 32 and cur != bak
+    except Exception as e:  # noqa: BLE001
+        ok, keys = False, e
+    c.fact("both update public keys present and different (ADR 0004)", ok, str(keys))
 
 
 def run_checks(root):
@@ -630,6 +740,34 @@ def run_checks(root):
     c.fact("update check locked off", rust_map(cfg, "OVERWRITE_LOCAL_SETTINGS").get("enable-check-update") == "N")
     lib = c.read("libs/hbb_common/src/lib.rs")
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
+
+    updater_checks(c)
+
+    # The notice hooks into upstream files only through rebrand.py; each must have landed.
+    hooks = [
+        ("src/lib.rs", "mod update_notice;"), ("src/lib.rs", "mod update_notice_run;"),
+        ("src/flutter_ffi.rs", "pub fn main_check_update_notice()"),
+        (rebrand.HOME, "UpdateNoticeBanner("),
+        (rebrand.HOME, "update_notice_banner.dart"),
+        (rebrand.SETTINGS, "kBoringUpdateCheckOption"),
+        (rebrand.SETTINGS, "update_notice_banner.dart"),
+        ("src/lib.rs", "mod license_key;"), ("src/lib.rs", "mod license_key_run;"),
+        ("src/flutter_ffi.rs", "pub fn main_set_license_key("),
+        (rebrand.SETTINGS, "LicenseKeyField("),
+        (rebrand.SETTINGS, "license_key_field.dart"),
+        ("src/lib.rs", "mod update_install;"), ("src/lib.rs", "mod update_install_run;"),
+        ("src/lib.rs", "mod update_rollback;"),
+        ("src/flutter_ffi.rs", "pub fn main_install_update()"),
+        ("src/core_main.rs", '"--boring-verify-package"'),
+        (rebrand.HOME, "bind.mainInstallUpdate()"),
+        (rebrand.HOME, "setKey: (k) => bind.mainSetLicenseKey(key: k),"),  # ticket 15
+        ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),        ("src/lib.rs", "mod activate_link;"),
+        ("src/flutter_ffi.rs", "pub fn main_activate_link("),
+        ("flutter/lib/common.dart", "bind.mainActivateLink(url: url)"),
+    ]
+    missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
+    c.fact("update hooks landed in upstream files (ADR 0004)", not missing, "; ".join(missing))
+    activate_link_checks(c)
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):

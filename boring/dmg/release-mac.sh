@@ -10,7 +10,7 @@
 # Neither    -> ad-hoc signed, BoringRemote-<v>-macos-arm64-adhoc.dmg, and the log says so.
 #               Refused when IS_TAG=true: a tag never ships an ad-hoc build.
 # One of two -> refused.
-# The pin is the certificate's SHA-1 (ticket 01). TCC keeps grants only for this exact leaf.
+# The pin is the certificate's SHA-1. TCC keeps grants only for this exact leaf.
 # Never prints a secret. Needs dmgbuild (pip) and Xcode's codesign.
 set -euo pipefail
 set +x

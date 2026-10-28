@@ -73,7 +73,7 @@ It checks every target before it changes any file. It prints `ERROR <file>: patc
 
 `check.py` scans every string a person can see in the Mac and Windows app (Flutter `lib/` minus mobile and web, `src/` minus translations and Linux-only files, the Mac and Windows runners), every translation value, and the app metadata (Info.plist, the Mac menu, exe properties). A new RustDesk name or `rustdesk.com` / `github.com/rustdesk` link fails it. Triage each one:
 
-- A person sees it: add a patch in the ticket 17 block of `boring/rebrand.py` (our name, or no link, or `FORK_URL`).
+- A person sees it: add a patch in the branding block of `boring/rebrand.py` (our name, or no link, or `FORK_URL`).
 - Never shown (a code name, path, window class, log line): add it to `INTERNAL` in `boring/check.py` with the reason.
 
 RustDesk is named once, on purpose: `LEGAL_LINE`, plain text on the About page. Translations are rewritten by the script (`RustDesk` becomes the display name in every language) and `lang.rs` does the same at run time for keys that fall back to themselves, so a new translation needs no work.

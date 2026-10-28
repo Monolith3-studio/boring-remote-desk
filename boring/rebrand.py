@@ -32,7 +32,7 @@ LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Sour
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 
-# Ticket 18: what the connect box says when a name doesn't resolve to a tailnet
+# What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
 NOT_FOUND = "Couldn't find that machine. Type its Tailscale name or IP."
 # Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
@@ -167,6 +167,9 @@ PATCHES = [
         ("uninstall.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("update.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("update.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        # ours (Install update, slice 6): same label as daemon.plist, from the same constant
+        ("install-update.sh", 'SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{HOSTD_ID}"',
+         "LaunchDaemon label (install update)"),
     )
 ] + [
     # --- servers: none ------------------------------------------------------
@@ -198,7 +201,7 @@ PATCHES = [
      "                    check_port(*first, RENDEZVOUS_PORT),\n"
      "                    rest.iter()\n",
      "id@public peer fails cleanly"),
-    # --- ticket 18: connect box takes a tailnet name, never an ID --------------
+    # --- tailnet name: connect box takes a tailnet name, never an ID --------------
     ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      TAILNET_RESOLVER + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      "tailnet name resolver"),
@@ -321,7 +324,7 @@ PATCHES += [
     )
 ]
 
-# --- ticket 17: no RustDesk name, link or logo a person sees on Mac or Windows --
+# --- branding: no RustDesk name, link or logo a person sees on Mac or Windows --
 # Code names, crate names, IPC and config keys stay (boring/check.py INTERNAL says
 # which and why). Every rustdesk.com / github.com/rustdesk link goes, or points at
 # our fork. RustDesk is named once, as plain text: LEGAL_LINE on the About page.
@@ -456,13 +459,147 @@ PATCHES += [
 # (file under boring/, destination in the tree, why), copied byte for byte.
 # The art comes from boring/msi/make_art.py: re-run it, never edit the outputs.
 HERE = pathlib.Path(__file__).resolve().parent
+# --- update notice hooks (ADR 0003, docs/adr/0003-update-notice-not-updater.md) ---
+# The new files (src/update_notice*.rs, update_notice_banner.dart) are ours; these
+# patches only wire them into upstream. check.py asserts each hook landed.
+NOTICE_IMPORT = "import 'package:flutter_hbb/desktop/widgets/update_notice_banner.dart';\n"
+NOTICE_BANNER = (
+    "      // boring-remote: update notice replaces upstream's stripped updater banner slot.\n"
+    "      UpdateNoticeBanner(\n"
+    "        check: () async => UpdateNotice.fromBridge(await bind.mainCheckUpdateNotice()),\n"
+    "        isEnabled: () => mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
+    "        openUrl: (u) => launchUrl(u),\n"
+    # Tickets 12/15: Install update and the inline License key field (same bridges as Settings).
+    "        hasKey: () => bind.mainGetLocalOption(key: kBoringLicenseKeyOption).isNotEmpty,\n"
+    "        install: () => bind.mainInstallUpdate(),\n"
+    "        setKey: (k) => bind.mainSetLicenseKey(key: k),\n"
+    "      ),\n")
+PATCHES += [
+    ("src/lib.rs", "mod custom_server;\n",
+     "mod custom_server;\nmod update_notice; // boring-remote: update notice (ADR 0003)\nmod update_notice_run;\n",
+     "update notice modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: update notice (ADR 0003). Blocking HTTP, so not Sync: the bridge runs it off the UI thread.\n"
+     "/// Returns {\"version\",\"below_min\"} as JSON, or None. Notice only; nothing is downloaded.\n"
+     "pub fn main_check_update_notice() -> Option<String> {\n"
+     "    crate::update_notice_run::check_now()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "update notice bridge call"),
+    (HOME, "import 'package:flutter_hbb/desktop/widgets/update_progress.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/update_progress.dart';\n" + NOTICE_IMPORT,
+     "update notice import (home)"),
+    (HOME, "      if (!isOutgoingOnly) buildPasswordBoard(context),\n",
+     "      if (!isOutgoingOnly) buildPasswordBoard(context),\n" + NOTICE_BANNER,
+     "update notice banner on the home page"),
+    (SETTINGS, "import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';\n" + NOTICE_IMPORT,
+     "update notice import (settings)"),
+    (SETTINGS, "      if (!incomingOnly)\n        _OptionCheckBox(\n          context,\n",
+     "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n"
+     "            isServer: false),\n"
+     "      if (!incomingOnly)\n        _OptionCheckBox(\n          context,\n",
+     "update notice on/off switch in General settings"),
+]
+
+# --- License key hooks (in-app updater spec, slice 5) ----------------------------
+# src/license_key*.rs and license_key_field.dart are ours; these wire them in.
+PATCHES += [
+    ("src/lib.rs", "mod update_notice_run;\n",
+     "mod update_notice_run;\nmod license_key; // boring-remote: License key (slice 5)\nmod license_key_run;\n",
+     "license key modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: store the License key in `boring-license-key`, then check it with\n"
+     "/// fulfillment. Blocking HTTP, so not Sync. Returns valid|revoked|refunded|unknown|busy|network|none.\n"
+     "pub fn main_set_license_key(key: String) -> String {\n"
+     "    crate::license_key_run::set_and_check(&key)\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "license key bridge call"),
+    (SETTINGS, NOTICE_IMPORT,
+     NOTICE_IMPORT + "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "license key import (settings)"),
+    (SETTINGS, "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
+     "      if (!isWeb)\n        LicenseKeyField(\n"
+     "          initialKey: bind.mainGetLocalOption(key: kBoringLicenseKeyOption),\n"
+     "          setKey: (k) => bind.mainSetLicenseKey(key: k),\n"
+     "        ),\n"
+     "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
+     "license key field in General settings"),
+]
+
+# --- Install update hooks (ADR 0004, spec slices 5-6) ----------------------------
+# src/update_install*.rs and privileges_scripts/install-update.sh are ours; these wire them in.
+PATCHES += [
+    ("src/lib.rs", "mod license_key_run;\n",
+     "mod license_key_run;\nmod update_install; // boring-remote: Install update (ADR 0004)\nmod update_install_run;\n"
+     "mod update_rollback;\n",
+     "install update modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: Install update (ADR 0004). Downloads, checks sha256 + sig, then runs the\n"
+     "/// root install script (one admin prompt). Blocking, so not Sync. Returns ok or an error word.\n"
+     "pub fn main_install_update() -> String {\n"
+     "    crate::update_install_run::install_now()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "install update bridge call"),
+    ("src/core_main.rs", '        if args[0] == "--version" {\n',
+     "        // boring-remote: the install script's own sig check (ADR 0004).\n"
+     '        if args[0] == "--boring-verify-package" {\n'
+     "            std::process::exit(crate::update_install::verify_cli(&args[1..]));\n"
+     "        }\n"
+     '        if args[0] == "--version" {\n',
+     "install update --verify mode"),
+    (HOME, NOTICE_IMPORT,
+     NOTICE_IMPORT + "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "license key option name (home banner)"),
+]
+
+# --- Activate link (ticket 14) ----------------------------------------------------
+# Rides upstream's URL scheme (already renamed to boringremote above). src/activate_link.rs
+# and activate_link.dart are ours; these wire them in and stop upstream logging incoming
+# links, since an activate link carries the License key.
+PATCHES += [
+    ("src/lib.rs", "mod license_key_run;\n",
+     "mod license_key_run;\nmod activate_link; // boring-remote: boringremote://activate?key= (ticket 14)\n",
+     "activate link module"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: boringremote://activate?key=<License key>. Stores + checks the key like\n"
+     "/// main_set_license_key; anything but a clean activate link returns `rejected`. Blocking.\n"
+     "pub fn main_activate_link(url: String) -> String {\n"
+     "    crate::license_key_run::activate_link(&url)\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "activate link bridge call"),
+    ("flutter/lib/common.dart", "import 'package:flutter_hbb/utils/http_service.dart' as http;\n",
+     "import 'package:flutter_hbb/utils/http_service.dart' as http;\n"
+     "import 'package:flutter_hbb/desktop/widgets/activate_link.dart';\n",
+     "activate link import"),
+    ("flutter/lib/common.dart", '  } else if (uri.authority == "config") {\n',
+     '  } else if (uri.authority == "activate") {\n'
+     "    // boring-remote: one-click activate link (ticket 14). Rust parses and checks it.\n"
+     "    final url = uri.toString();\n"
+     "    Timer(Duration(seconds: 1), () async {\n"
+     "      showActivateLinkResult(await bind.mainActivateLink(url: url));\n"
+     "    });\n"
+     "    return null;\n"
+     '  } else if (uri.authority == "config") {\n',
+     "activate link handler"),
+    ("src/platform/delegate.rs", '            log::debug!("URL received: {}", theurl);\n', "",
+     "don't log incoming links (they can carry a License key)"),
+    ("flutter/lib/common.dart", '    debugPrint("A uri was received: $uri. handleByFlutter $handleByFlutter");\n', "",
+     "don't log incoming links"),
+    ("flutter/lib/common.dart", '    print("initialLink: $initialLink");\n', "", "don't log the cold-boot link"),
+    ("flutter/lib/main.dart", '  debugPrint("launch args: $args");\n', "", "don't log launch args (may be a link)"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),
     ("msi/License.rtf", f"{MSI}/License.rtf", "installer license: AGPL notice, not upstream's privacy policy"),
     ("msi/icon.ico", "res/icon.ico", "product icon (MSI, shortcuts, Apps list)"),
     ("msi/icon.ico", "flutter/windows/runner/resources/app_icon.ico", "exe icon"),
-] + [  # ticket 17, from boring/art/make_app_art.py: every upstream logo slot (boring/upstream-logos.sha256)
+] + [  # branding, from boring/art/make_app_art.py: every upstream logo slot (boring/upstream-logos.sha256)
     ("art/AppIcon.icns", "flutter/macos/Runner/AppIcon.icns", "Mac app and Dock icon (the Mac kit's, as-is)"),
     ("art/icon-1024.png", "res/icon.png", "app icon master"),
     ("art/icon-1024.png", "res/mac-icon.png", "Mac icon master"),
@@ -503,12 +640,22 @@ def _read(path):
     return text.replace("\r\n", "\n"), "\r\n" in text
 
 
+def _applied(text, old, new):
+    """True if this patch's result is already in text. Bridge fns and mod lines share anchors,
+    so a later insertion splits an earlier `new`; a multi-line inserted block already present
+    also counts. (One-line GUARDs repeat across functions, so not those.)"""
+    if new in text:
+        return True
+    added = new.replace(old, "", 1) if isinstance(old, str) and old in new else ""
+    return added.count("\n") > 1 and added in text
+
+
 def _patch(text, old, new):
     """(patched text, replacements made); 0 replacements if already applied."""
     if isinstance(old, re.Pattern):
         return old.subn(new.replace("\\", "\\\\"), text)
     if old in new:  # an insertion: applied once `new` is there
-        return text.replace(old, new), (0 if new in text else text.count(old))
+        return text.replace(old, new), (0 if _applied(text, old, new) else text.count(old))
     return text.replace(old, new), text.count(old)
 
 
@@ -529,7 +676,7 @@ def plan(root):
         if n:
             texts[rel] = (text2, crlf)
             changed.append(f"{rel}: {why}")
-        elif new not in text:
+        elif not _applied(text, old, new):
             moved.append(f"{rel}: patch target moved ({why})")
     langs = sorted((root / LANG_DIR).glob("*.rs")) if (root / LANG_DIR).is_dir() else []
     if not langs:

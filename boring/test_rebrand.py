@@ -188,6 +188,25 @@ class RebrandSeam(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"FAIL {fact}", r.stdout)
 
+    UPDATE_FACT = "the only update URL in shipped code is the version file URL"
+
+    def test_planted_rustdesk_update_url_fails_check(self):
+        self.rebrand()
+        self.edit("src/update_notice.rs", "pub const VERSION_URL",
+                  'pub const OLD_URL: &str = "https://api.rustdesk.com/version/latest";\npub const VERSION_URL')
+        self.assert_check_fails(self.UPDATE_FACT)
+
+    def test_planted_github_releases_url_fails_check(self):
+        self.rebrand()
+        self.edit("src/update_notice_run.rs", "use crate::update_notice",
+                  'const X: &str = "https://github.com/rustdesk/rustdesk/releases/latest";\nuse crate::update_notice')
+        self.assert_check_fails(self.UPDATE_FACT)
+
+    def test_version_url_passes_check(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        self.assertIn(f"PASS {self.UPDATE_FACT}", r.stdout)
+
     WHITELIST_CALL = ("        if !self.check_whitelist(&addr).await {\n"
                       "            return false;\n"
                       "        }\n")
@@ -235,7 +254,7 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertIn("PASS installer license is the Boring Remote AGPL notice", r.stdout)
 
-    # --- ticket 17: branding ------------------------------------------------
+    # --- branding ------------------------------------------------
     def test_upstream_logo_copied_anywhere_fails_check(self):
         upstream_icon = subprocess.run(["git", "-C", str(REPO), "show", "HEAD:res/icon.png"],
                                        check=True, capture_output=True).stdout
@@ -292,7 +311,7 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*desktop_setting_page.dart:\d+")
 
-    # --- ticket 18: connect by tailnet name ----------------------------------
+    # --- connect by tailnet name ----------------------------------
     def test_domain_port_branch_back_in_connect_fails_check(self):
         self.rebrand()
         self.edit("src/client.rs", "        if true {\n            return Ok((\n                (\n"
