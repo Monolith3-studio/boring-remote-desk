@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -182,9 +183,46 @@ class VersionFile(unittest.TestCase):
         self.out.mkdir()
         self.dmg = self.out / "BoringRemote-1.5.0-macos-arm64.dmg"
         self.dmg.write_bytes(b"not really a dmg")
+        self.pkg = self.out / "BoringRemote-1.5.0-macos-arm64.app.tar.xz"
+        self.pkg.write_bytes(b"not really a package")
+        self.minv = self.tmp / "min-version"
+        self.minv.write_text("1.4.0\n")
 
     def write(self, tag):
-        return run(["bash", str(VERSION_FILE), str(self.cargo), tag, str(self.dmg), str(self.out)])
+        return run(["bash", str(VERSION_FILE), str(self.cargo), tag, str(self.dmg), str(self.pkg),
+                    str(self.minv), str(self.out)])
+
+    def assert_refused(self, min_version):
+        self.minv.write_text(min_version)
+        r = self.write("v1.5.0")
+        self.assertNotEqual(r.returncode, 0, f"accepted min-version {min_version!r}")
+        self.assertIn("min-version", r.stderr)
+        self.assertFalse((self.out / "the-boring-remote-version.json").exists())
+
+    def test_min_version_above_version_fails(self):
+        self.assert_refused("1.6.0\n")
+        self.assert_refused("1.5.1\n")
+        self.assert_refused("2.0.0\n")
+
+    def test_min_version_malformed_fails(self):
+        for bad in ("1.4\n", "v1.4.0\n", "1.4.0-rc1\n", "\n", "1.4.0\n1.3.0\n", "01.4.0\n"):
+            self.assert_refused(bad)
+
+    def test_min_version_equal_to_version_is_allowed(self):
+        self.minv.write_text("1.5.0")
+        self.assertEqual(self.write("v1.5.0").returncode, 0)
+
+    def test_min_version_compares_numerically(self):
+        self.cargo.write_text('[package]\nversion = "1.10.0"\n')
+        self.minv.write_text("1.9.0\n")
+        self.assertEqual(self.write("v1.10.0").returncode, 0)
+
+    def test_checked_in_min_version_is_strict_and_not_above_cargo(self):
+        mv = (ROOT / "boring" / "min-version").read_text()
+        self.assertRegex(mv, r"\A(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\n?\Z")
+        cargo = re.search(r'^version *= *"([^"]+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
+        key = lambda v: tuple(map(int, v.strip().split(".")))
+        self.assertLessEqual(key(mv), key(cargo))
 
     def test_writes_the_contract_json_beside_the_dmg(self):
         r = self.write("v1.5.0")
@@ -194,7 +232,11 @@ class VersionFile(unittest.TestCase):
             "version": "1.5.0",
             "sha256": hashlib.sha256(b"not really a dmg").hexdigest(),
             "url": "https://boringlabs.online/downloads/BoringRemote-1.5.0-macos-arm64.dmg",
+            "package_sha256": hashlib.sha256(b"not really a package").hexdigest(),
+            "package_sig": "",
+            "min_version": "1.4.0",
         })
+        self.assertEqual(sorted(p.name for p in self.out.iterdir() if p.suffix == ".sig"), [])
 
     def test_bare_tag_without_v_also_matches(self):
         self.assertEqual(self.write("1.5.0").returncode, 0)
@@ -217,6 +259,39 @@ class VersionFile(unittest.TestCase):
         self.assertLess(job("build-macos").index("Sign, build DMG"), job("build-macos").index("Write version file"))
         self.assertLess(job("build-macos").index("Write version file"), job("build-macos").index("path: dmg-out/*"))
         self.assertNotRegex(text, r"(curl|scp|rsync|wrangler)[^\n]*boringlabs")
+        self.assertIn("boring/min-version", st)
+        self.assertNotIn(".sig", job("build-macos"))
+
+    def test_workflow_builds_the_update_package_from_the_signed_app(self):
+        st = step(job("build-macos"), "Build update package")
+        self.assertIn("boring/dmg/make-update-package.sh", st)
+        self.assertIn("Release/BoringRemote.app", st)
+        j = job("build-macos")
+        self.assertLess(j.index("Sign, build DMG"), j.index("Build update package"))
+        self.assertLess(j.index("Build update package"), j.index("Write version file"))
+
+
+PACKAGE = DMG / "make-update-package.sh"
+
+
+class UpdatePackage(unittest.TestCase):
+    """The Update package: the DMG's .app as tar.xz, bundle at the top level."""
+
+    def test_packs_the_app_bundle_at_top_level(self):
+        tmp = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp, True)
+        app = make_app(tmp / "build")
+        r = run(["bash", str(PACKAGE), str(app), "1.5.0", str(tmp / "out")])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pkg = tmp / "out" / "BoringRemote-1.5.0-macos-arm64.app.tar.xz"
+        self.assertEqual(r.stdout.strip().splitlines()[-1], str(pkg))
+        with tarfile.open(pkg, "r:xz") as t:
+            names = t.getnames()
+        self.assertEqual({n.split("/")[0] for n in names}, {"BoringRemote.app"})
+        self.assertIn("BoringRemote.app/Contents/Info.plist", names)
+
+    def test_missing_app_fails(self):
+        tmp = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertNotEqual(run(["bash", str(PACKAGE), str(tmp / "nope.app"), "1.5.0", str(tmp)]).returncode, 0)
 
 
 class Workflow(unittest.TestCase):

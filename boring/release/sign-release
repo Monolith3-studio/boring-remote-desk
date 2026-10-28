@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Sign a CI artifact dir for release (spec slice 4, ADR 0004).
+
+Usage:  boring/release/sign-release [--key-name NAME] <dmg-out dir>
+
+Reads the private seed with `cred get NAME` (base64 of a 32-byte raw ed25519
+seed). NAME is BORING_REMOTE_UPDATE_KEY (current, the default) or
+BORING_REMOTE_UPDATE_KEY_BACKUP; --key-name wins over env BORING_REMOTE_UPDATE_KEY_NAME. Fills package_sig in the-boring-remote-version.json,
+rewrites it, writes the-boring-remote-version.json.sig over its exact bytes,
+then verifies both against boring/update-pubkeys.json. The seed is never
+printed, logged or written. Exit 0 only when both verify.
+"""
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey)
+
+VERSION_FILE = "the-boring-remote-version.json"
+PUBKEYS = pathlib.Path(__file__).resolve().parent.parent / "update-pubkeys.json"
+CRED = pathlib.Path.home() / "Jason-little-brain/Tools/creds/cred"
+
+
+KEY_NAMES = ("BORING_REMOTE_UPDATE_KEY", "BORING_REMOTE_UPDATE_KEY_BACKUP")
+
+
+class SignError(Exception):
+    pass
+
+
+def cred_seed(name=KEY_NAMES[0]):
+    out = subprocess.run([os.environ.get("CRED", str(CRED)), "get", name],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SignError(f"cred get {name} failed")
+    return out.stdout.strip()
+
+
+def embedded_keys(path):
+    keys = json.loads(pathlib.Path(path).read_text())
+    return [Ed25519PublicKey.from_public_bytes(base64.b64decode(keys[k]))
+            for k in ("current", "backup") if keys.get(k)]
+
+
+def verifies(keys, sig, data):
+    for k in keys:
+        try:
+            k.verify(sig, data)
+            return True
+        except InvalidSignature:
+            pass
+    return False
+
+
+def sign_release(artifact_dir, seed_source=cred_seed, pubkeys=PUBKEYS):
+    d = pathlib.Path(artifact_dir)
+    vf = d / VERSION_FILE
+    data = json.loads(vf.read_text())
+    pkg = d / f"BoringRemote-{data['version']}-macos-arm64.app.tar.xz"
+    pkg_bytes = pkg.read_bytes()
+    if hashlib.sha256(pkg_bytes).hexdigest() != data.get("package_sha256"):
+        raise SignError(f"package_sha256 does not match {pkg.name}")
+
+    keys = embedded_keys(pubkeys)
+    raw = base64.b64decode(seed_source())
+    if len(raw) != 32:
+        raise SignError("seed is not 32 bytes")
+    key = Ed25519PrivateKey.from_private_bytes(raw)
+    del raw
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    if not any(k.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw) == pub
+               for k in keys):
+        raise SignError("signing key is neither embedded public key")
+
+    data["package_sig"] = base64.b64encode(key.sign(pkg_bytes)).decode()
+    body = (json.dumps(data, separators=(",", ":")) + "\n").encode()
+    file_sig = key.sign(body)
+    vf.write_bytes(body)
+    (d / (VERSION_FILE + ".sig")).write_text(base64.b64encode(file_sig).decode() + "\n")
+
+    # Verify what is on disk, from the files alone.
+    on_disk = vf.read_bytes()
+    sig = base64.b64decode((d / (VERSION_FILE + ".sig")).read_text().strip())
+    pkg_sig = base64.b64decode(json.loads(on_disk)["package_sig"])
+    if not (verifies(keys, sig, on_disk) and verifies(keys, pkg_sig, pkg.read_bytes())):
+        raise SignError("written signatures do not verify")
+    return pkg, vf
+
+
+def main(argv):
+    args = argv[1:]
+    name = os.environ.get("BORING_REMOTE_UPDATE_KEY_NAME") or KEY_NAMES[0]
+    if args[:1] == ["--key-name"] and len(args) >= 2:
+        name, args = args[1], args[2:]
+    if len(args) != 1 or name not in KEY_NAMES:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        pkg, vf = sign_release(args[0], lambda: cred_seed(name), PUBKEYS)
+    except (SignError, OSError, KeyError, ValueError) as e:
+        print(f"sign-release: {e}", file=sys.stderr)
+        return 1
+    print(f"signed {pkg.name}, {vf.name}, {vf.name}.sig; verified against embedded keys")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

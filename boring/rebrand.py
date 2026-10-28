@@ -167,6 +167,9 @@ PATCHES = [
         ("uninstall.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("update.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("update.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        # ours (Install update, slice 6): same label as daemon.plist, from the same constant
+        ("install-update.sh", 'SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{HOSTD_ID}"',
+         "LaunchDaemon label (install update)"),
     )
 ] + [
     # --- servers: none ------------------------------------------------------
@@ -463,7 +466,7 @@ NOTICE_IMPORT = "import 'package:flutter_hbb/desktop/widgets/update_notice_banne
 NOTICE_BANNER = (
     "      // boring-remote: update notice replaces upstream's stripped updater banner slot.\n"
     "      UpdateNoticeBanner(\n"
-    "        check: () => bind.mainCheckUpdateNotice(),\n"
+    "        check: () async => UpdateNotice.fromBridge(await bind.mainCheckUpdateNotice()),\n"
     "        isEnabled: () => mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
     "        openUrl: (u) => launchUrl(u),\n"
     "      ),\n")
@@ -473,7 +476,7 @@ PATCHES += [
      "update notice modules"),
     ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
      "/// boring-remote: update notice (ADR 0003). Blocking HTTP, so not Sync: the bridge runs it off the UI thread.\n"
-     "/// Returns the newer version string, or None. Notice only; nothing is downloaded.\n"
+     "/// Returns {\"version\",\"below_min\"} as JSON, or None. Notice only; nothing is downloaded.\n"
      "pub fn main_check_update_notice() -> Option<String> {\n"
      "    crate::update_notice_run::check_now()\n"
      "}\n\n"
@@ -493,6 +496,59 @@ PATCHES += [
      "            isServer: false),\n"
      "      if (!incomingOnly)\n        _OptionCheckBox(\n          context,\n",
      "update notice on/off switch in General settings"),
+]
+
+# --- License key hooks (in-app updater spec, slice 5) ----------------------------
+# src/license_key*.rs and license_key_field.dart are ours; these wire them in.
+PATCHES += [
+    ("src/lib.rs", "mod update_notice_run;\n",
+     "mod update_notice_run;\nmod license_key; // boring-remote: License key (slice 5)\nmod license_key_run;\n",
+     "license key modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: store the License key in `boring-license-key`, then check it with\n"
+     "/// fulfillment. Blocking HTTP, so not Sync. Returns valid|revoked|refunded|unknown|busy|network|none.\n"
+     "pub fn main_set_license_key(key: String) -> String {\n"
+     "    crate::license_key_run::set_and_check(&key)\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "license key bridge call"),
+    (SETTINGS, NOTICE_IMPORT,
+     NOTICE_IMPORT + "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "license key import (settings)"),
+    (SETTINGS, "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
+     "      if (!isWeb)\n        LicenseKeyField(\n"
+     "          initialKey: bind.mainGetLocalOption(key: kBoringLicenseKeyOption),\n"
+     "          setKey: (k) => bind.mainSetLicenseKey(key: k),\n"
+     "        ),\n"
+     "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
+     "license key field in General settings"),
+]
+
+# --- Install update hooks (ADR 0004, spec slices 5-6) ----------------------------
+# src/update_install*.rs and privileges_scripts/install-update.sh are ours; these wire them in.
+PATCHES += [
+    ("src/lib.rs", "mod license_key_run;\n",
+     "mod license_key_run;\nmod update_install; // boring-remote: Install update (ADR 0004)\nmod update_install_run;\n"
+     "mod update_rollback;\n",
+     "install update modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: Install update (ADR 0004). Downloads, checks sha256 + sig, then runs the\n"
+     "/// root install script (one admin prompt). Blocking, so not Sync. Returns ok or an error word.\n"
+     "pub fn main_install_update() -> String {\n"
+     "    crate::update_install_run::install_now()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "install update bridge call"),
+    ("src/core_main.rs", '        if args[0] == "--version" {\n',
+     "        // boring-remote: the install script's own sig check (ADR 0004).\n"
+     '        if args[0] == "--boring-verify-package" {\n'
+     "            std::process::exit(crate::update_install::verify_cli(&args[1..]));\n"
+     "        }\n"
+     '        if args[0] == "--version" {\n',
+     "install update --verify mode"),
+    (HOME, NOTICE_IMPORT,
+     NOTICE_IMPORT + "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "license key option name (home banner)"),
 ]
 
 COPIES = [

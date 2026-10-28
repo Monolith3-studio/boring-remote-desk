@@ -6,7 +6,7 @@ Usage:  python3 boring/check.py [ROOT]
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
-test / updater / LAN discovery unreachable (ADR 0003: the one update URL is the version file), no RustDesk public server named in shipped code,
+test / updater / LAN discovery unreachable (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
@@ -19,7 +19,9 @@ Prints one PASS/FAIL line per fact, then
     rebrand check: <n> passed, <m> failed
 and exits 1 if anything failed. Stdlib only.
 """
+import base64
 import hashlib
+import json
 import pathlib
 import plistlib
 import re
@@ -33,9 +35,8 @@ import rebrand  # noqa: E402
 
 AGENT, HOSTD, APP, SHOWN = rebrand.AGENT_ID, rebrand.HOSTD_ID, rebrand.APP_NAME, rebrand.DISPLAY_NAME
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
-# ADR 0003 (docs/adr/0003-update-notice-not-updater.md): the app may fetch one
-# version file and show a notice; it never downloads or installs. So no shipped
-# code may name an upstream update endpoint or a GitHub releases URL.
+# Upstream update endpoints and GitHub releases URLs never appear in shipped code
+# (ADR 0004 keeps this from ADR 0003; see updater_checks for the allowlist).
 _U = r"[^\s\"'`)]*"
 UPDATE_URL = re.compile(
     r"https?://(?:" + r"[\w.-]*rustdesk\.com/" + _U + r"(?:version|update|latest|release)" + _U
@@ -544,6 +545,78 @@ def connect_checks(c):
     c.fact("plain not-found error is in every translation file", langs and not missing, ", ".join(missing))
 
 
+# ADR 0004 (docs/adr/0004-in-app-updater.md, supersedes 0003): the app may fetch
+# the signed version file and its .sig, and POST the license key to fulfillment
+# /update. Nothing else in shipped code is an update endpoint, and the only thing
+# run as root for an update is install-update.sh.
+UPDATE_ENDPOINTS = {
+    "VERSION_URL": ("src/update_notice.rs", "https://boringlabs.online/downloads/the-boring-remote-version.json"),
+    "UPDATE_ENDPOINT": ("src/license_key.rs", "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update"),
+}
+UPDATEISH_URL = re.compile(r"https?://[^\s\"'`)<>]*(?:version|update|release|latest|download)[^\s\"'`)<>]*", re.I)
+# Not app updates: (prefix, why).
+NOT_UPDATE_URLS = (("https://api.telegram.org/bot{}/getUpdates", "2FA Telegram bot polling"),)
+INSTALL_SCRIPT = "src/platform/privileges_scripts/install-update.sh"
+# Every `with administrator privileges` site, as file or file:enclosing fn/const.
+ROOT_CALLERS = {
+    "src/update_install_run.rs:OSA": "runs Resources/boring-install-update.sh (slice 6), the one update path",
+    "src/platform/macos.rs:elevate": "upstream daemon install/uninstall elevation, not an update",
+    "src/platform/macos.rs:update_me": "upstream updater; dead because start_auto_update_macos returns first",
+    "src/platform/privileges_scripts/update.scpt": "upstream updater script, only reached from update_me",
+    "src/platform/privileges_scripts/install.scpt": "daemon install",
+    "src/platform/privileges_scripts/uninstall.scpt": "daemon unload",
+}
+ROOT_SUFFIXES = (".rs", ".dart", ".scpt", ".swift", ".sh", ".py", ".m", ".mm")
+
+
+def shipped_files(c, suffixes):
+    for base in ("src", "libs", "flutter/lib"):
+        for p in sorted((c.root / base).rglob("*")):
+            if p.suffix in suffixes and p.is_file() and "/lang/" not in p.as_posix():
+                yield p.relative_to(c.root).as_posix(), p.read_text(encoding="utf-8", errors="replace")
+
+
+def updater_checks(c):
+    for name, (rel, want) in UPDATE_ENDPOINTS.items():
+        m = re.search(rf'pub const {name}: &str = "([^"]*)";', c.read(rel))
+        c.fact(f"{name} is {want} (ADR 0004)", m is not None and m.group(1) == want, m and m.group(1))
+    allowed = {want for _, want in UPDATE_ENDPOINTS.values()}
+    stray = []
+    for rel, text in shipped_files(c, (".rs", ".dart")):
+        code = strip_tests_and_comments(text)
+        stray += [f"{rel}: {h}" for h in UPDATE_URL.findall(code)]
+        if rel.endswith(".rs"):  # network calls live in Rust; Dart URLs are links opened in a browser
+            stray += [f"{rel}: {h}" for h in UPDATEISH_URL.findall(code)
+                      if h not in allowed and not h.startswith(tuple(p for p, _ in NOT_UPDATE_URLS))]
+    c.fact("the only update endpoints are VERSION_URL, its .sig and fulfillment /update (ADR 0004)",
+           not stray, "; ".join(stray[:10]))
+
+    callers = []
+    for rel, text in shipped_files(c, ROOT_SUFFIXES):
+        if rel.endswith(".rs"):
+            code = strip_tests_and_comments(text)
+        else:
+            code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith(("#", "--", "//")))
+        for m in re.finditer(r"with administrator privileges", code):
+            owner = re.findall(r"\b(?:fn|const|static)\s+(\w+)", code[:m.start()])
+            key = f"{rel}:{owner[-1]}" if rel.endswith(".rs") and owner else rel
+            if key not in ROOT_CALLERS:
+                callers.append(key)
+    runner = c.read("src/update_install_run.rs")
+    c.fact("the only root-run update path is install-update.sh (ADR 0004)",
+           not callers and (c.root / INSTALL_SCRIPT).is_file()
+           and "Resources/boring-install-update.sh" in runner,
+           "; ".join(callers) or f"{INSTALL_SCRIPT} missing or not what update_install_run.rs runs")
+
+    try:
+        keys = json.loads(c.read("boring/update-pubkeys.json"))
+        cur, bak = (base64.b64decode(keys[k], validate=True) for k in ("current", "backup"))
+        ok = len(cur) == 32 and len(bak) == 32 and cur != bak
+    except Exception as e:  # noqa: BLE001
+        ok, keys = False, e
+    c.fact("both update public keys present and different (ADR 0004)", ok, str(keys))
+
+
 def run_checks(root):
     c = Check(root)
     cfg = c.read(HBB)
@@ -640,19 +713,7 @@ def run_checks(root):
     lib = c.read("libs/hbb_common/src/lib.rs")
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
 
-    # ADR 0003: upstream's updater stays dead (the returns above, enable-check-update N,
-    # empty version endpoint); the one new network path is the version file.
-    vurl = VERSION_URL_DECL.search(c.read("src/update_notice.rs"))
-    stray = []
-    for base in ("src", "libs", "flutter/lib"):
-        for p in sorted((c.root / base).rglob("*")):
-            if p.suffix not in (".rs", ".dart") or not p.is_file() or "/lang/" in p.as_posix():
-                continue
-            code = strip_tests_and_comments(p.read_text(encoding="utf-8", errors="replace"))
-            stray += [f"{p.relative_to(c.root)}: {h}" for h in UPDATE_URL.findall(code)]
-    c.fact("the only update URL in shipped code is the version file URL",
-           vurl is not None and not stray,
-           "; ".join(stray[:10]) or "src/update_notice.rs has no boringlabs.online VERSION_URL")
+    updater_checks(c)
 
     # The notice hooks into upstream files only through rebrand.py; each must have landed.
     hooks = [
@@ -662,9 +723,19 @@ def run_checks(root):
         (rebrand.HOME, "update_notice_banner.dart"),
         (rebrand.SETTINGS, "kBoringUpdateCheckOption"),
         (rebrand.SETTINGS, "update_notice_banner.dart"),
+        ("src/lib.rs", "mod license_key;"), ("src/lib.rs", "mod license_key_run;"),
+        ("src/flutter_ffi.rs", "pub fn main_set_license_key("),
+        (rebrand.SETTINGS, "LicenseKeyField("),
+        (rebrand.SETTINGS, "license_key_field.dart"),
+        ("src/lib.rs", "mod update_install;"), ("src/lib.rs", "mod update_install_run;"),
+        ("src/lib.rs", "mod update_rollback;"),
+        ("src/flutter_ffi.rs", "pub fn main_install_update()"),
+        ("src/core_main.rs", '"--boring-verify-package"'),
+        (rebrand.HOME, "bind.mainInstallUpdate()"),
+        ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),
     ]
     missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
-    c.fact("update notice hooks landed in upstream files (ADR 0003)", not missing, "; ".join(missing))
+    c.fact("update hooks landed in upstream files (ADR 0004)", not missing, "; ".join(missing))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):
