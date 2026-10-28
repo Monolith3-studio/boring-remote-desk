@@ -8,7 +8,7 @@ Widget host(UpdateNoticeBanner b) =>
 void main() {
   testWidgets('banner shows for a newer version', (tester) async {
     await tester.pumpWidget(host(UpdateNoticeBanner(
-      check: () async => '1.6.0',
+      check: () async => const UpdateNotice('1.6.0'),
       isEnabled: () => true,
       openUrl: (_) async {},
     )));
@@ -33,7 +33,7 @@ void main() {
     await tester.pumpWidget(host(UpdateNoticeBanner(
       check: () async {
         calls++;
-        return '9.9.9';
+        return const UpdateNotice('9.9.9');
       },
       isEnabled: () => false,
       openUrl: (_) async {},
@@ -60,7 +60,7 @@ void main() {
   });
 
   testWidgets('banner hides when a later check returns null', (tester) async {
-    final answers = <String?>['1.6.0', null];
+    final answers = <UpdateNotice?>[const UpdateNotice('1.6.0'), null];
     await tester.pumpWidget(host(UpdateNoticeBanner(
       check: () async => answers.removeAt(0),
       isEnabled: () => true,
@@ -76,12 +76,46 @@ void main() {
   testWidgets('Get update opens the one update URL', (tester) async {
     Uri? opened;
     await tester.pumpWidget(host(UpdateNoticeBanner(
-      check: () async => '1.6.0',
+      check: () async => const UpdateNotice('1.6.0'),
       isEnabled: () => true,
       openUrl: (u) async => opened = u,
     )));
     await tester.pump();
     await tester.tap(find.text('Get update'));
     expect(opened.toString(), 'https://boringlabs.online/remote/update');
+  });
+
+  testWidgets('dismiss hides the banner when not below min', (tester) async {
+    await tester.pumpWidget(host(UpdateNoticeBanner(
+      check: () async => const UpdateNotice('1.6.0'),
+      isEnabled: () => true,
+      openUrl: (_) async {},
+    )));
+    await tester.pump();
+    expect(find.byTooltip('Dismiss'), findsOneWidget);
+    await tester.tap(find.byTooltip('Dismiss'));
+    await tester.pump();
+    expect(find.textContaining('is out.'), findsNothing);
+  });
+
+  testWidgets('below min: no dismiss control, banner stays', (tester) async {
+    await tester.pumpWidget(host(UpdateNoticeBanner(
+      check: () async => const UpdateNotice('1.7.0', belowMin: true),
+      isEnabled: () => true,
+      openUrl: (_) async {},
+    )));
+    await tester.pump();
+    expect(find.text('Boring Remote 1.7.0 is out.'), findsOneWidget);
+    expect(find.byTooltip('Dismiss'), findsNothing);
+  });
+
+  test('fromBridge parses the Rust JSON and rejects junk', () {
+    expect(UpdateNotice.fromBridge(null), isNull);
+    expect(UpdateNotice.fromBridge('nope'), isNull);
+    expect(UpdateNotice.fromBridge('{"below_min":true}'), isNull);
+    final n = UpdateNotice.fromBridge('{"version":"1.7.0","below_min":true}')!;
+    expect(n.version, '1.7.0');
+    expect(n.belowMin, isTrue);
+    expect(UpdateNotice.fromBridge('{"version":"1.7.0"}')!.belowMin, isFalse);
   });
 }

@@ -463,7 +463,7 @@ NOTICE_IMPORT = "import 'package:flutter_hbb/desktop/widgets/update_notice_banne
 NOTICE_BANNER = (
     "      // boring-remote: update notice replaces upstream's stripped updater banner slot.\n"
     "      UpdateNoticeBanner(\n"
-    "        check: () => bind.mainCheckUpdateNotice(),\n"
+    "        check: () async => UpdateNotice.fromBridge(await bind.mainCheckUpdateNotice()),\n"
     "        isEnabled: () => mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
     "        openUrl: (u) => launchUrl(u),\n"
     "      ),\n")
@@ -473,7 +473,7 @@ PATCHES += [
      "update notice modules"),
     ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
      "/// boring-remote: update notice (ADR 0003). Blocking HTTP, so not Sync: the bridge runs it off the UI thread.\n"
-     "/// Returns the newer version string, or None. Notice only; nothing is downloaded.\n"
+     "/// Returns {\"version\",\"below_min\"} as JSON, or None. Notice only; nothing is downloaded.\n"
      "pub fn main_check_update_notice() -> Option<String> {\n"
      "    crate::update_notice_run::check_now()\n"
      "}\n\n"

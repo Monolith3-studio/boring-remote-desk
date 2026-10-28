@@ -28,8 +28,9 @@ impl Store for Local {
     }
 }
 
-/// The newer version string if one is out, else None.
+/// `{"version":"X.Y.Z","below_min":bool}` if a newer signed version is out, else None.
 pub fn check_now() -> Option<String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    check(&Http, &mut Local, now, crate::VERSION)
+    let n = check(&Http, &mut Local, now, crate::VERSION)?;
+    Some(serde_json::json!({"version": n.version, "below_min": n.below_min}).to_string())
 }
