@@ -22,7 +22,7 @@ GOOD = {
         'pub const VERSION_URL: &str = "https://boringlabs.online/downloads/the-boring-remote-version.json";\n'
         'pub fn sig_url() -> String { format!("{VERSION_URL}.sig") }\n',
     "src/license_key.rs":
-        'pub const UPDATE_ENDPOINT: &str = "https://store-fulfillment.boringstories.workers.dev/update";\n',
+        'pub const UPDATE_ENDPOINT: &str = "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update";\n',
     "src/update_install_run.rs": OSA,
     "src/platform/privileges_scripts/install-update.sh": "#!/bin/sh\n# run with administrator privileges\n",
     "src/platform/privileges_scripts/install.scpt": 'do shell script sh with administrator privileges\n',

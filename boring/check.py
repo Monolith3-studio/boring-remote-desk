@@ -551,7 +551,7 @@ def connect_checks(c):
 # run as root for an update is install-update.sh.
 UPDATE_ENDPOINTS = {
     "VERSION_URL": ("src/update_notice.rs", "https://boringlabs.online/downloads/the-boring-remote-version.json"),
-    "UPDATE_ENDPOINT": ("src/license_key.rs", "https://store-fulfillment.boringstories.workers.dev/update"),
+    "UPDATE_ENDPOINT": ("src/license_key.rs", "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update"),
 }
 UPDATEISH_URL = re.compile(r"https?://[^\s\"'`)<>]*(?:version|update|release|latest|download)[^\s\"'`)<>]*", re.I)
 # Not app updates: (prefix, why).

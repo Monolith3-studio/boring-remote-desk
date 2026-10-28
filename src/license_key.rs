@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 pub const KEY_OPTION: &str = "boring-license-key";
-pub const UPDATE_ENDPOINT: &str = "https://store-fulfillment.boringstories.workers.dev/update";
+pub const UPDATE_ENDPOINT: &str = "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update";
 
 pub trait Post {
     fn post_json(&self, url: &str, body: &str, timeout: Duration) -> Result<(u16, String), String>;
@@ -88,7 +88,7 @@ mod tests {
         let f = fake(Ok((200, r#"{"valid":true,"reason":null}"#)));
         assert_eq!(check(&f, "ABC-123").as_str(), "valid");
         let (url, body) = f.sent.borrow()[0].clone();
-        assert_eq!(url, "https://store-fulfillment.boringstories.workers.dev/update");
+        assert_eq!(url, "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v, serde_json::json!({"license_key": "ABC-123", "check": true}));
     }
