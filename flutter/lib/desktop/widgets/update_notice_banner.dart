@@ -3,6 +3,8 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import 'license_key_field.dart';
+
 // ASSUMPTION (unconfirmed by Jason, spec "Assumptions"): the page that tells
 // buyers to use the Download Link in their purchase email. Confirm before
 // this ships. This is the only place the URL lives.
@@ -69,6 +71,9 @@ class UpdateNoticeBanner extends StatefulWidget {
   final bool Function()? hasKey;
   final Future<bool> Function()? liveSession;
   final Future<String> Function()? install;
+  /// Ticket 15: wraps `mainSetLicenseKey` (same bridge as Settings). When set and
+  /// there's no key, the banner shows the License key field inline.
+  final Future<String> Function(String)? setKey;
 
   const UpdateNoticeBanner({
     super.key,
@@ -78,6 +83,7 @@ class UpdateNoticeBanner extends StatefulWidget {
     this.hasKey,
     this.liveSession,
     this.install,
+    this.setKey,
   });
 
   @override
@@ -93,6 +99,8 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
   String? _error;
   // Version the user dismissed this run; a newer one shows again.
   String? _dismissed;
+  // A key checked valid from the banner's own field this run.
+  bool _keyOk = false;
 
   @override
   void initState() {
@@ -186,7 +194,9 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
         ]),
       );
     }
-    final canInstall = widget.install != null && (widget.hasKey?.call() ?? false);
+    final canInstall =
+        widget.install != null && (_keyOk || (widget.hasKey?.call() ?? false));
+    final showKeyField = !canInstall && widget.install != null && widget.setKey != null;
     return Container(
       margin: const EdgeInsets.only(top: 20),
       padding: const EdgeInsets.all(20),
@@ -198,6 +208,24 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
                 style: TextStyle(color: onFill, fontSize: 14)),
             if (_error != null)
               Text(_error!, style: TextStyle(color: onFill, fontSize: 13)),
+            if (showKeyField) ...[
+              Text('Have your License key? Paste it here to install.',
+                  style: TextStyle(color: onFill, fontSize: 13)),
+              Material(
+                color: Theme.of(context).colorScheme.surface,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: LicenseKeyField(
+                    initialKey: '',
+                    setKey: (k) async {
+                      final s = await widget.setKey!(k);
+                      if (s == 'valid' && mounted) setState(() => _keyOk = true);
+                      return s;
+                    },
+                  ),
+                ),
+              ),
+            ],
           ]),
         ),
         if (canInstall)

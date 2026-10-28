@@ -469,6 +469,10 @@ NOTICE_BANNER = (
     "        check: () async => UpdateNotice.fromBridge(await bind.mainCheckUpdateNotice()),\n"
     "        isEnabled: () => mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
     "        openUrl: (u) => launchUrl(u),\n"
+    # Tickets 12/15: Install update and the inline License key field (same bridges as Settings).
+    "        hasKey: () => bind.mainGetLocalOption(key: kBoringLicenseKeyOption).isNotEmpty,\n"
+    "        install: () => bind.mainInstallUpdate(),\n"
+    "        setKey: (k) => bind.mainSetLicenseKey(key: k),\n"
     "      ),\n")
 PATCHES += [
     ("src/lib.rs", "mod custom_server;\n",
@@ -551,6 +555,44 @@ PATCHES += [
      "license key option name (home banner)"),
 ]
 
+# --- Activate link (ticket 14) ----------------------------------------------------
+# Rides upstream's URL scheme (already renamed to boringremote above). src/activate_link.rs
+# and activate_link.dart are ours; these wire them in and stop upstream logging incoming
+# links, since an activate link carries the License key.
+PATCHES += [
+    ("src/lib.rs", "mod license_key_run;\n",
+     "mod license_key_run;\nmod activate_link; // boring-remote: boringremote://activate?key= (ticket 14)\n",
+     "activate link module"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: boringremote://activate?key=<License key>. Stores + checks the key like\n"
+     "/// main_set_license_key; anything but a clean activate link returns `rejected`. Blocking.\n"
+     "pub fn main_activate_link(url: String) -> String {\n"
+     "    crate::license_key_run::activate_link(&url)\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "activate link bridge call"),
+    ("flutter/lib/common.dart", "import 'package:flutter_hbb/utils/http_service.dart' as http;\n",
+     "import 'package:flutter_hbb/utils/http_service.dart' as http;\n"
+     "import 'package:flutter_hbb/desktop/widgets/activate_link.dart';\n",
+     "activate link import"),
+    ("flutter/lib/common.dart", '  } else if (uri.authority == "config") {\n',
+     '  } else if (uri.authority == "activate") {\n'
+     "    // boring-remote: one-click activate link (ticket 14). Rust parses and checks it.\n"
+     "    final url = uri.toString();\n"
+     "    Timer(Duration(seconds: 1), () async {\n"
+     "      showActivateLinkResult(await bind.mainActivateLink(url: url));\n"
+     "    });\n"
+     "    return null;\n"
+     '  } else if (uri.authority == "config") {\n',
+     "activate link handler"),
+    ("src/platform/delegate.rs", '            log::debug!("URL received: {}", theurl);\n', "",
+     "don't log incoming links (they can carry a License key)"),
+    ("flutter/lib/common.dart", '    debugPrint("A uri was received: $uri. handleByFlutter $handleByFlutter");\n', "",
+     "don't log incoming links"),
+    ("flutter/lib/common.dart", '    print("initialLink: $initialLink");\n', "", "don't log the cold-boot link"),
+    ("flutter/lib/main.dart", '  debugPrint("launch args: $args");\n', "", "don't log launch args (may be a link)"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),
@@ -598,12 +640,22 @@ def _read(path):
     return text.replace("\r\n", "\n"), "\r\n" in text
 
 
+def _applied(text, old, new):
+    """True if this patch's result is already in text. Bridge fns and mod lines share anchors,
+    so a later insertion splits an earlier `new`; a multi-line inserted block already present
+    also counts. (One-line GUARDs repeat across functions, so not those.)"""
+    if new in text:
+        return True
+    added = new.replace(old, "", 1) if isinstance(old, str) and old in new else ""
+    return added.count("\n") > 1 and added in text
+
+
 def _patch(text, old, new):
     """(patched text, replacements made); 0 replacements if already applied."""
     if isinstance(old, re.Pattern):
         return old.subn(new.replace("\\", "\\\\"), text)
     if old in new:  # an insertion: applied once `new` is there
-        return text.replace(old, new), (0 if new in text else text.count(old))
+        return text.replace(old, new), (0 if _applied(text, old, new) else text.count(old))
     return text.replace(old, new), text.count(old)
 
 
@@ -624,7 +676,7 @@ def plan(root):
         if n:
             texts[rel] = (text2, crlf)
             changed.append(f"{rel}: {why}")
-        elif new not in text:
+        elif not _applied(text, old, new):
             moved.append(f"{rel}: patch target moved ({why})")
     langs = sorted((root / LANG_DIR).glob("*.rs")) if (root / LANG_DIR).is_dir() else []
     if not langs:
