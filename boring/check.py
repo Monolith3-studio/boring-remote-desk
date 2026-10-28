@@ -34,6 +34,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rebrand  # noqa: E402
 
 AGENT, HOSTD, APP, SHOWN = rebrand.AGENT_ID, rebrand.HOSTD_ID, rebrand.APP_NAME, rebrand.DISPLAY_NAME
+# Upstream lines that would log an incoming link, and with it an activate link's License key.
+LINK_LOGS = [
+    ("src/platform/delegate.rs", 'log::debug!("URL received: {}", theurl);'),
+    ("flutter/lib/common.dart", 'debugPrint("A uri was received: $uri.'),
+    ("flutter/lib/common.dart", 'print("initialLink: $initialLink");'),
+    ("flutter/lib/main.dart", 'debugPrint("launch args: $args");'),
+]
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
 # Upstream update endpoints and GitHub releases URLs never appear in shipped code
 # (ADR 0004 keeps this from ADR 0003; see updater_checks for the allowlist).
@@ -576,6 +583,27 @@ def shipped_files(c, suffixes):
                 yield p.relative_to(c.root).as_posix(), p.read_text(encoding="utf-8", errors="replace")
 
 
+def activate_link_checks(c):
+    """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
+    plist = c.read("flutter/macos/Runner/Info.plist")
+    schemes = re.findall(r"<key>CFBundleURLSchemes</key>\s*<array>(.*?)</array>", plist, re.S)
+    names = [n for block in schemes for n in re.findall(r"<string>(.*?)</string>", block)]
+    c.fact("Mac URL scheme is boringremote only", names == [rebrand.APP_NAME.lower()], names)
+    src = c.read("src/activate_link.rs")
+    c.fact("activate link parser uses the app's scheme",
+           f'const SCHEME: &str = "{rebrand.APP_NAME.lower()}://";' in src)
+    dart = c.read("flutter/lib/common.dart")
+    branch = re.findall(r'uri\.authority == "activate"\) \{(.*?)return null;', dart, re.S)
+    c.fact("one activate branch, and it only hands the link to Rust",
+           len(branch) == 1 and "bind.mainActivateLink(url: url)" in branch[0] and "--" not in branch[0],
+           branch)
+    run = fn_body(c.read("src/license_key_run.rs"), "pub fn activate_link(url: &str) -> String {") or ""
+    c.fact("activate link stores a key only via the parser", "crate::activate_link::parse(url)" in run
+           and run.count("set_and_check(") == 1, run[:200])
+    logged = [f"{rel}: {needle}" for rel, needle in LINK_LOGS if needle in c.read(rel)]
+    c.fact("incoming links (and the key in them) are never logged", not logged, "; ".join(logged))
+
+
 def updater_checks(c):
     for name, (rel, want) in UPDATE_ENDPOINTS.items():
         m = re.search(rf'pub const {name}: &str = "([^"]*)";', c.read(rel))
@@ -732,10 +760,13 @@ def run_checks(root):
         ("src/flutter_ffi.rs", "pub fn main_install_update()"),
         ("src/core_main.rs", '"--boring-verify-package"'),
         (rebrand.HOME, "bind.mainInstallUpdate()"),
-        ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),
+        ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),        ("src/lib.rs", "mod activate_link;"),
+        ("src/flutter_ffi.rs", "pub fn main_activate_link("),
+        ("flutter/lib/common.dart", "bind.mainActivateLink(url: url)"),
     ]
     missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
     c.fact("update hooks landed in upstream files (ADR 0004)", not missing, "; ".join(missing))
+    activate_link_checks(c)
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):

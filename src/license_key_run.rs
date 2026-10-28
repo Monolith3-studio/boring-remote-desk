@@ -26,3 +26,12 @@ pub fn set_and_check(key: &str) -> String {
     LocalConfig::set_option(KEY_OPTION.to_owned(), key.to_owned());
     check(&Http, key).as_str().to_owned()
 }
+
+/// Activate link (ticket 14): parse `boringremote://activate?key=…`, then store + check
+/// like the Settings field. Anything else → `rejected`, nothing stored. Key never logged.
+pub fn activate_link(url: &str) -> String {
+    match crate::activate_link::parse(url) {
+        Some(key) => set_and_check(&key),
+        None => "rejected".to_owned(),
+    }
+}
