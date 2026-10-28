@@ -2,7 +2,7 @@
 //! session count, and the root install script through osascript. Blocking:
 //! call off the UI thread.
 use crate::update_install::{install, Clock, Deps, Fetcher, InstallError, Runner, SessionCount};
-use hbb_common::config::LocalConfig;
+use hbb_common::{config::LocalConfig, log};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
