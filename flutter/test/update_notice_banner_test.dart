@@ -217,4 +217,50 @@ void main() {
     await tester.pump();
     expect(find.textContaining("didn't take"), findsNothing);
   });
+
+  // --- Key field in the banner (ticket 15) ---
+  UpdateNoticeBanner noKey(Future<String> Function(String) setKey) =>
+      UpdateNoticeBanner(
+        check: () async => const UpdateNotice('1.6.0'),
+        isEnabled: () => true,
+        openUrl: (_) async {},
+        hasKey: () => false,
+        liveSession: () async => false,
+        install: () async => 'ok',
+        setKey: setKey,
+      );
+
+  testWidgets('no key: key field shown, Get update kept', (tester) async {
+    await tester.pumpWidget(host(noKey((_) async => 'valid')));
+    await tester.pump();
+    expect(find.byType(TextField), findsOneWidget);
+    expect(find.text('Get update'), findsOneWidget);
+    expect(find.text('Install update'), findsNothing);
+  });
+
+  testWidgets('valid key from the banner: Install update', (tester) async {
+    String? sent;
+    await tester.pumpWidget(host(noKey((k) async {
+      sent = k;
+      return 'valid';
+    })));
+    await tester.pump();
+    await tester.enterText(find.byType(TextField), 'BR-123');
+    await tester.tap(find.text('Check'));
+    await tester.pumpAndSettle();
+    expect(sent, 'BR-123');
+    expect(find.text('Install update'), findsOneWidget);
+    expect(find.byType(TextField), findsNothing);
+  });
+
+  testWidgets('invalid key: message shown, field stays', (tester) async {
+    await tester.pumpWidget(host(noKey((_) async => 'unknown')));
+    await tester.pump();
+    await tester.enterText(find.byType(TextField), 'nope');
+    await tester.tap(find.text('Check'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining("We don't recognize that key"), findsOneWidget);
+    expect(find.byType(TextField), findsOneWidget);
+    expect(find.text('Install update'), findsNothing);
+  });
 }
