@@ -188,7 +188,7 @@ class RebrandSeam(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"FAIL {fact}", r.stdout)
 
-    UPDATE_FACT = "the only update URL in shipped code is the version file URL"
+    UPDATE_FACT = "the only update endpoints are VERSION_URL, its .sig and fulfillment /update (ADR 0004)"
 
     def test_planted_rustdesk_update_url_fails_check(self):
         self.rebrand()
