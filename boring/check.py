@@ -662,6 +662,10 @@ def run_checks(root):
         (rebrand.HOME, "update_notice_banner.dart"),
         (rebrand.SETTINGS, "kBoringUpdateCheckOption"),
         (rebrand.SETTINGS, "update_notice_banner.dart"),
+        ("src/lib.rs", "mod license_key;"), ("src/lib.rs", "mod license_key_run;"),
+        ("src/flutter_ffi.rs", "pub fn main_set_license_key("),
+        (rebrand.SETTINGS, "LicenseKeyField("),
+        (rebrand.SETTINGS, "license_key_field.dart"),
     ]
     missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
     c.fact("update notice hooks landed in upstream files (ADR 0003)", not missing, "; ".join(missing))

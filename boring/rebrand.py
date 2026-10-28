@@ -495,6 +495,32 @@ PATCHES += [
      "update notice on/off switch in General settings"),
 ]
 
+# --- License key hooks (in-app updater spec, slice 5) ----------------------------
+# src/license_key*.rs and license_key_field.dart are ours; these wire them in.
+PATCHES += [
+    ("src/lib.rs", "mod update_notice_run;\n",
+     "mod update_notice_run;\nmod license_key; // boring-remote: License key (slice 5)\nmod license_key_run;\n",
+     "license key modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: store the License key in `boring-license-key`, then check it with\n"
+     "/// fulfillment. Blocking HTTP, so not Sync. Returns valid|revoked|refunded|unknown|busy|network|none.\n"
+     "pub fn main_set_license_key(key: String) -> String {\n"
+     "    crate::license_key_run::set_and_check(&key)\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "license key bridge call"),
+    (SETTINGS, NOTICE_IMPORT,
+     NOTICE_IMPORT + "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "license key import (settings)"),
+    (SETTINGS, "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
+     "      if (!isWeb)\n        LicenseKeyField(\n"
+     "          initialKey: bind.mainGetLocalOption(key: kBoringLicenseKeyOption),\n"
+     "          setKey: (k) => bind.mainSetLicenseKey(key: k),\n"
+     "        ),\n"
+     "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
+     "license key field in General settings"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),
