@@ -189,4 +189,21 @@ void main() {
     expect(find.text('Install update'), findsOneWidget);
     expect(find.byTooltip('Dismiss'), findsNothing);
   });
+
+  testWidgets('rolled-back update says it failed, no install button', (tester) async {
+    await tester.pumpWidget(host(UpdateNoticeBanner(
+      check: () async =>
+          UpdateNotice.fromBridge('{"failed":"1.6.0","running":"1.5.0"}'),
+      isEnabled: () => true,
+      openUrl: (_) async {},
+      hasKey: () => true,
+      install: () async => 'ok',
+    )));
+    await tester.pump();
+    expect(find.text('Update failed, still on 1.5.0.'), findsOneWidget);
+    expect(find.text('Install update'), findsNothing);
+    await tester.tap(find.byTooltip('Dismiss'));
+    await tester.pump();
+    expect(find.textContaining('Update failed'), findsNothing);
+  });
 }

@@ -32,16 +32,22 @@ const Map<String, String> kBoringInstallErrorText = {
 
 /// One answer from the Rust check: the newer version, and whether this build is
 /// below the version file's Minimum version (then the banner can't be dismissed).
+/// With [failedTo] set, an update to that version was rolled back and [version]
+/// is the one still running (spec slice 7); Rust reports it only once.
 class UpdateNotice {
   final String version;
   final bool belowMin;
-  const UpdateNotice(this.version, {this.belowMin = false});
+  final String? failedTo;
+  const UpdateNotice(this.version, {this.belowMin = false, this.failedTo});
 
-  /// Parses `main_check_update_notice`'s `{"version","below_min"}` JSON; null on none or junk.
+  /// Parses `main_check_update_notice`'s `{"version","below_min"}` or
+  /// `{"failed","running"}` JSON; null on none or junk.
   static UpdateNotice? fromBridge(String? json) {
     if (json == null) return null;
     try {
       final m = jsonDecode(json);
+      final f = m['failed'], r = m['running'];
+      if (f is String && r is String) return UpdateNotice(r, failedTo: f);
       final v = m['version'];
       if (v is! String) return null;
       return UpdateNotice(v, belowMin: m['below_min'] == true);
@@ -158,8 +164,26 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
       return const SizedBox.shrink();
     }
     final v = n.version;
-    final canInstall = widget.install != null && (widget.hasKey?.call() ?? false);
     final onFill = Theme.of(context).colorScheme.onPrimary;
+    if (n.failedTo != null) {
+      // TODO(humanizer): run past the humanizer before ship.
+      return Container(
+        margin: const EdgeInsets.only(top: 20),
+        padding: const EdgeInsets.all(20),
+        color: Theme.of(context).colorScheme.primary,
+        child: Row(children: [
+          Expanded(
+              child: Text('Update failed, still on $v.',
+                  style: TextStyle(color: onFill, fontSize: 14))),
+          IconButton(
+            tooltip: 'Dismiss',
+            icon: Icon(Icons.close, color: onFill, size: 18),
+            onPressed: () => setState(() => _dismissed = v),
+          ),
+        ]),
+      );
+    }
+    final canInstall = widget.install != null && (widget.hasKey?.call() ?? false);
     return Container(
       margin: const EdgeInsets.only(top: 20),
       padding: const EdgeInsets.all(20),

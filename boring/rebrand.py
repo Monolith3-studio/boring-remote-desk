@@ -528,7 +528,8 @@ PATCHES += [
 # src/update_install*.rs and privileges_scripts/install-update.sh are ours; these wire them in.
 PATCHES += [
     ("src/lib.rs", "mod license_key_run;\n",
-     "mod license_key_run;\nmod update_install; // boring-remote: Install update (ADR 0004)\nmod update_install_run;\n",
+     "mod license_key_run;\nmod update_install; // boring-remote: Install update (ADR 0004)\nmod update_install_run;\n"
+     "mod update_rollback;\n",
      "install update modules"),
     ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
      "/// boring-remote: Install update (ADR 0004). Downloads, checks sha256 + sig, then runs the\n"

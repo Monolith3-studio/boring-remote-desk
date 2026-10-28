@@ -12,6 +12,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -69,9 +70,9 @@ class InstallUpdate(unittest.TestCase):
             t.add(src / name, arcname=name)
         return pkg
 
-    def run_script(self, *args, root=True):
+    def run_script(self, *args, root=True, wait=2):
         env = {"PATH": f"{self.stubs}:/usr/bin:/bin:/usr/sbin:/sbin", "STUB_LOG": str(self.log),
-               "TMPDIR": str(self.tmp)}
+               "TMPDIR": str(self.tmp), "BORING_ROLLBACK_WAIT": str(wait)}
         if root:
             env["BORING_TEST_ROOT"] = str(self.root)
         return subprocess.run(["/bin/sh", str(SCRIPT), *map(str, args)], env=env,
@@ -105,6 +106,54 @@ class InstallUpdate(unittest.TestCase):
         # the sig is checked on the script's own copy, not the caller's path
         verify = [l for l in self.log.read_text().splitlines() if "--boring-verify-package" in l][0]
         self.assertNotIn(str(self.tmp / "pkg-"), verify)
+
+    def support(self, name):
+        return self.root / "Library/Application Support/Boring Remote" / name
+
+    def wait_for(self, cond, secs=10):
+        end = time.time() + secs
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_unhealthy_new_app_is_rolled_back(self):
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.wait_for(lambda: self.support("update-failed").exists()
+                                      and self.support("update-failed").read_text()), "no rollback")
+        prev = pathlib.Path(str(self.app) + ".previous")
+        self.assertTrue(self.wait_for(lambda: not prev.exists()))
+        self.assertEqual(self.marker(self.app), "old")
+        self.assertEqual(self.support("update-failed").read_text(), "1.6.0\n")
+        self.assertFalse(self.support("update-pending").exists())
+        self.assertEqual(self.calls("pkill"), ["pkill -x BoringRemote"] * 2)
+        self.assertEqual(self.calls("launchctl").count(f"launchctl kickstart -k system/{daemon_label()}"), 2)
+        opens = [c for c in self.calls("launchctl") if c.endswith(f"open {self.app}")]
+        self.assertTrue(len(opens) == 2 or console_is_root(), opens)
+        # the user-run app can clear the failure notice and report health
+        self.assertTrue(os.stat(self.support("update-failed")).st_mode & 0o002)
+        self.assertTrue(os.stat(self.support("update-healthy")).st_mode & 0o002)
+
+    def test_healthy_new_app_keeps_update_and_drops_previous(self):
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.support("update-healthy").write_text("1.6.0\n")  # what the new app writes once healthy
+        prev = pathlib.Path(str(self.app) + ".previous")
+        self.assertTrue(self.wait_for(lambda: not prev.exists()), "previous not removed")
+        self.assertTrue(self.wait_for(lambda: not self.support("update-pending").exists()))
+        self.assertEqual(self.marker(self.app), "new")
+        self.assertFalse(self.support("update-failed").exists() and self.support("update-failed").read_text())
+        self.assertEqual(self.calls("pkill"), ["pkill -x BoringRemote"])
+
+    def test_stale_healthy_marker_does_not_count(self):
+        self.support("update-healthy").parent.mkdir(parents=True)
+        self.support("update-healthy").write_text("1.6.0\n")  # left over from an earlier run
+        self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=1)
+        self.assertTrue(self.wait_for(lambda: self.support("update-failed").exists()
+                                      and self.support("update-failed").read_text()))
+        self.assertTrue(self.wait_for(lambda: self.marker(self.app) == "old"))
 
     def test_bad_sig_leaves_install_untouched(self):
         self.assert_untouched(self.run_script(self.package(), "EVIL", "1.6.0"))
