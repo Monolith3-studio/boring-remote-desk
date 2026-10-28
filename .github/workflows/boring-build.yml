@@ -208,6 +208,8 @@ jobs:
           APP=flutter/build/macos/Build/Products/Release/BoringRemote.app
           test -x "$APP/Contents/MacOS/BoringRemote"
           test -x "$APP/Contents/MacOS/service"
+          # Install update script (ADR 0004), sealed into the bundle with everything else
+          install -m 0755 src/platform/privileges_scripts/install-update.sh "$APP/Contents/Resources/boring-install-update.sh"
           # ad-hoc seal only, so the bundle runs after build.py copied `service` in; not a release signature
           codesign --force --deep -s - "$APP"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" | grep -qx io.boringlabs.remote.agent

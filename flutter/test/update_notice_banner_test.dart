@@ -118,4 +118,75 @@ void main() {
     expect(n.belowMin, isTrue);
     expect(UpdateNotice.fromBridge('{"version":"1.7.0"}')!.belowMin, isFalse);
   });
+
+  // --- Install update (ticket 12) ---
+  UpdateNoticeBanner withKey({
+    bool hasKey = true,
+    bool live = false,
+    Future<String> Function()? install,
+    UpdateNotice notice = const UpdateNotice('1.6.0'),
+  }) =>
+      UpdateNoticeBanner(
+        check: () async => notice,
+        isEnabled: () => true,
+        openUrl: (_) async {},
+        hasKey: () => hasKey,
+        liveSession: () async => live,
+        install: install ?? () async => 'ok',
+      );
+
+  testWidgets('with a key: Install update, no Get update', (tester) async {
+    await tester.pumpWidget(host(withKey()));
+    await tester.pump();
+    expect(find.text('Install update'), findsOneWidget);
+    expect(find.text('Get update'), findsNothing);
+  });
+
+  testWidgets('no key: Get update, no Install update', (tester) async {
+    await tester.pumpWidget(host(withKey(hasKey: false)));
+    await tester.pump();
+    expect(find.text('Get update'), findsOneWidget);
+    expect(find.text('Install update'), findsNothing);
+  });
+
+  testWidgets('live session: button disabled with the reason', (tester) async {
+    var calls = 0;
+    await tester.pumpWidget(host(withKey(live: true, install: () async {
+      calls++;
+      return 'ok';
+    })));
+    await tester.pump();
+    expect(find.text('Finish your session to update'), findsOneWidget);
+    await tester.tap(find.text('Finish your session to update'));
+    await tester.pump();
+    expect(calls, 0);
+  });
+
+  testWidgets('Install update calls the bridge once', (tester) async {
+    var calls = 0;
+    await tester.pumpWidget(host(withKey(install: () async {
+      calls++;
+      return 'ok';
+    })));
+    await tester.pump();
+    await tester.tap(find.text('Install update'));
+    await tester.pump();
+    expect(calls, 1);
+  });
+
+  testWidgets('a failed install shows an error and keeps the button', (tester) async {
+    await tester.pumpWidget(host(withKey(install: () async => 'sha256')));
+    await tester.pump();
+    await tester.tap(find.text('Install update'));
+    await tester.pump();
+    expect(find.text(kBoringInstallErrorText['sha256']!), findsOneWidget);
+    expect(find.text('Install update'), findsOneWidget);
+  });
+
+  testWidgets('below min with a key: Install update and no dismiss', (tester) async {
+    await tester.pumpWidget(host(withKey(notice: const UpdateNotice('1.6.0', belowMin: true))));
+    await tester.pump();
+    expect(find.text('Install update'), findsOneWidget);
+    expect(find.byTooltip('Dismiss'), findsNothing);
+  });
 }

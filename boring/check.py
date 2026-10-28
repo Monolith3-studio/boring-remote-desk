@@ -666,6 +666,11 @@ def run_checks(root):
         ("src/flutter_ffi.rs", "pub fn main_set_license_key("),
         (rebrand.SETTINGS, "LicenseKeyField("),
         (rebrand.SETTINGS, "license_key_field.dart"),
+        ("src/lib.rs", "mod update_install;"), ("src/lib.rs", "mod update_install_run;"),
+        ("src/flutter_ffi.rs", "pub fn main_install_update()"),
+        ("src/core_main.rs", '"--boring-verify-package"'),
+        (rebrand.HOME, "bind.mainInstallUpdate()"),
+        ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),
     ]
     missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
     c.fact("update notice hooks landed in upstream files (ADR 0003)", not missing, "; ".join(missing))

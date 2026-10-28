@@ -16,6 +16,9 @@ pub const KEY_LAST_TRY: &str = "boring-update-last-try";
 pub const KEY_LAST_GOOD: &str = "boring-update-last-good";
 /// Remote `min_version` from the last good fetch ("" when the file had none).
 pub const KEY_LAST_MIN: &str = "boring-update-last-min";
+/// `package_sha256` / `package_sig` from the last good (signed) fetch, for Install update.
+pub const KEY_LAST_PKG_SHA: &str = "boring-update-last-pkg-sha256";
+pub const KEY_LAST_PKG_SIG: &str = "boring-update-last-pkg-sig";
 const GATE_SECS: u64 = 24 * 60 * 60;
 /// The one source of the update public keys ({current, backup}, base64 raw ed25519).
 const PUBKEYS_JSON: &str = include_str!("../boring/update-pubkeys.json");
@@ -48,13 +51,18 @@ pub fn embedded_keys() -> Vec<VerifyingKey> {
 
 /// True when `sig_b64` is a valid signature over the exact bytes of `body` by any of `keys`.
 fn verified(keys: &[VerifyingKey], body: &str, sig_b64: &str) -> bool {
+    verify_bytes(keys, body.as_bytes(), sig_b64)
+}
+
+/// True when `sig_b64` is a valid signature over `bytes` by any of `keys`.
+pub fn verify_bytes(keys: &[VerifyingKey], bytes: &[u8], sig_b64: &str) -> bool {
     let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(sig_b64.trim()) else {
         return false;
     };
     let Ok(sig) = Signature::from_slice(&raw) else {
         return false;
     };
-    keys.iter().any(|k| k.verify_strict(body.as_bytes(), &sig).is_ok())
+    keys.iter().any(|k| k.verify_strict(bytes, &sig).is_ok())
 }
 
 pub trait Fetch {
@@ -97,6 +105,23 @@ fn remote_versions(body: &str) -> Option<(String, String)> {
     Some((s.to_owned(), min))
 }
 
+/// (package_sha256, package_sig), "" for either that is missing.
+fn package_fields(body: &str) -> (String, String) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let f = |k: &str| v.get(k).and_then(|s| s.as_str()).unwrap_or("").to_owned();
+    (f("package_sha256"), f("package_sig"))
+}
+
+/// The package to install, from the last good signed fetch; None when it had no package details.
+pub fn release(store: &dyn Store) -> Option<crate::update_install::Release> {
+    let r = crate::update_install::Release {
+        version: store.get(KEY_LAST_GOOD),
+        package_sha256: store.get(KEY_LAST_PKG_SHA),
+        package_sig: store.get(KEY_LAST_PKG_SIG),
+    };
+    (parse_semver(&r.version).is_some() && !r.package_sha256.is_empty() && !r.package_sig.is_empty()).then_some(r)
+}
+
 fn newer_than(remote: &str, running: &str) -> bool {
     match (parse_semver(remote), parse_semver(running)) {
         (Some(r), Some(l)) => r > l,
@@ -135,8 +160,11 @@ pub fn check_with(
             if let Some((v, min)) = remote_versions(&body) {
                 if let Ok((200, sig)) = fetch.get(&sig_url(), &ua, t) {
                     if verified(keys, &body, &sig) {
+                        let (sha, psig) = package_fields(&body);
                         store.set(KEY_LAST_GOOD, v);
                         store.set(KEY_LAST_MIN, min);
+                        store.set(KEY_LAST_PKG_SHA, sha);
+                        store.set(KEY_LAST_PKG_SIG, psig);
                     }
                 }
             }
@@ -289,6 +317,24 @@ mod tests {
         assert_eq!(k.len(), 2);
         assert_eq!(B64.encode(k[0].to_bytes()), "sJyFBUc4U5I42j4FvNuafMRd4s2rdqQNiQPTfUU8q3o=");
         assert_eq!(B64.encode(k[1].to_bytes()), "fUGKPveLBQfyeExmew6ttY+xlFygkFC02liG1adqZnk=");
+    }
+
+    // --- package details for Install update (ticket 12) ---
+    #[test]
+    fn signed_package_details_are_kept_for_install() {
+        let mut s = Mem::default();
+        assert_eq!(release(&s), None);
+        let b = r#"{"version":"1.6.0","package_sha256":"ab12","package_sig":"c2ln"}"#;
+        run(&Fake::ok(b), &mut s, NOW, "1.5.0");
+        let r = release(&s).unwrap();
+        assert_eq!((r.version.as_str(), r.package_sha256.as_str(), r.package_sig.as_str()), ("1.6.0", "ab12", "c2ln"));
+        // An unsigned file never replaces them.
+        let evil = r#"{"version":"1.7.0","package_sha256":"ff","package_sig":"eA=="}"#;
+        run(&Fake::signed_by(&stranger(), evil), &mut s, NOW + GATE_SECS, "1.5.0");
+        assert_eq!(release(&s).unwrap().package_sha256, "ab12");
+        // A signed file with no package (CI output before signing) clears them.
+        run(&Fake::ok(&body("1.6.1")), &mut s, NOW + 2 * GATE_SECS, "1.5.0");
+        assert_eq!(release(&s), None);
     }
 
     // --- Minimum version (ticket 10) ---

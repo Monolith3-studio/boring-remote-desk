@@ -167,6 +167,9 @@ PATCHES = [
         ("uninstall.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("update.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("update.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        # ours (Install update, slice 6): same label as daemon.plist, from the same constant
+        ("install-update.sh", 'SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{HOSTD_ID}"',
+         "LaunchDaemon label (install update)"),
     )
 ] + [
     # --- servers: none ------------------------------------------------------
@@ -519,6 +522,32 @@ PATCHES += [
      "        ),\n"
      "      if (!isWeb)\n        _OptionCheckBox(context, 'Check for updates', kBoringUpdateCheckOption,\n",
      "license key field in General settings"),
+]
+
+# --- Install update hooks (ADR 0004, spec slices 5-6) ----------------------------
+# src/update_install*.rs and privileges_scripts/install-update.sh are ours; these wire them in.
+PATCHES += [
+    ("src/lib.rs", "mod license_key_run;\n",
+     "mod license_key_run;\nmod update_install; // boring-remote: Install update (ADR 0004)\nmod update_install_run;\n",
+     "install update modules"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: Install update (ADR 0004). Downloads, checks sha256 + sig, then runs the\n"
+     "/// root install script (one admin prompt). Blocking, so not Sync. Returns ok or an error word.\n"
+     "pub fn main_install_update() -> String {\n"
+     "    crate::update_install_run::install_now()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "install update bridge call"),
+    ("src/core_main.rs", '        if args[0] == "--version" {\n',
+     "        // boring-remote: the install script's own sig check (ADR 0004).\n"
+     '        if args[0] == "--boring-verify-package" {\n'
+     "            std::process::exit(crate::update_install::verify_cli(&args[1..]));\n"
+     "        }\n"
+     '        if args[0] == "--version" {\n',
+     "install update --verify mode"),
+    (HOME, NOTICE_IMPORT,
+     NOTICE_IMPORT + "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "license key option name (home banner)"),
 ]
 
 COPIES = [

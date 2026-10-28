@@ -14,6 +14,22 @@ const String kBoringUpdateCheckOption = 'boring-update-check';
 // UI re-check cadence; the Rust side gates the real network fetch to once per 24 h.
 const Duration kBoringUpdateRecheckInterval = Duration(hours: 1);
 
+// Re-read live session state this often while the banner is up.
+const Duration kBoringSessionPoll = Duration(seconds: 5);
+
+// What a failed `main_install_update` word means to the user.
+// TODO(humanizer): run these past the humanizer before ship.
+const Map<String, String> kBoringInstallErrorText = {
+  'no-key': 'Add your License key in Settings first.',
+  'live-session': 'Finish your session to update.',
+  'no-release': 'This update can only be downloaded from your purchase email.',
+  'download': "Couldn't download the update. Try again later.",
+  'timeout': 'The download took too long. Try again later.',
+  'sha256': "The download didn't match. Nothing was changed.",
+  'signature': "The update isn't signed by us. Nothing was changed.",
+  'script': "The update didn't install. Nothing was changed.",
+};
+
 /// One answer from the Rust check: the newer version, and whether this build is
 /// below the version file's Minimum version (then the banner can't be dismissed).
 class UpdateNotice {
@@ -35,20 +51,28 @@ class UpdateNotice {
   }
 }
 
-/// Notice only (ADR 0003): shows "Boring Remote X.Y.Z is out." and a button
-/// that opens a web page. Never downloads or installs anything.
+/// Shows "Boring Remote X.Y.Z is out." With a License key ([hasKey]) the button
+/// is "Install update" ([install] wraps `main_install_update`, ADR 0004); during
+/// a live session it is disabled with "Finish your session to update". Without
+/// a key it is "Get update", which opens a web page (ADR 0003).
 /// [check] wraps the Rust bridge `mainCheckUpdateNotice`; [isEnabled] reads the
 /// `boring-update-check` local option. Both are injected so tests need no bridge.
 class UpdateNoticeBanner extends StatefulWidget {
   final Future<UpdateNotice?> Function() check;
   final bool Function() isEnabled;
   final Future<void> Function(Uri) openUrl;
+  final bool Function()? hasKey;
+  final Future<bool> Function()? liveSession;
+  final Future<String> Function()? install;
 
   const UpdateNoticeBanner({
     super.key,
     required this.check,
     required this.isEnabled,
     required this.openUrl,
+    this.hasKey,
+    this.liveSession,
+    this.install,
   });
 
   @override
@@ -57,7 +81,11 @@ class UpdateNoticeBanner extends StatefulWidget {
 
 class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
   Timer? _timer;
+  Timer? _sessionTimer;
   UpdateNotice? _notice;
+  bool _live = false;
+  bool _installing = false;
+  String? _error;
   // Version the user dismissed this run; a newer one shows again.
   String? _dismissed;
 
@@ -66,6 +94,39 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
     super.initState();
     _run();
     _timer = Timer.periodic(kBoringUpdateRecheckInterval, (_) => _run());
+    if (widget.liveSession != null) {
+      _poll();
+      _sessionTimer = Timer.periodic(kBoringSessionPoll, (_) => _poll());
+    }
+  }
+
+  Future<void> _poll() async {
+    if (_notice == null && _live == false) return;
+    bool live;
+    try {
+      live = await widget.liveSession!();
+    } catch (_) {
+      return;
+    }
+    if (mounted && live != _live) setState(() => _live = live);
+  }
+
+  Future<void> _install() async {
+    setState(() {
+      _installing = true;
+      _error = null;
+    });
+    String r;
+    try {
+      r = await widget.install!();
+    } catch (_) {
+      r = 'script';
+    }
+    if (!mounted) return;
+    setState(() {
+      _installing = false;
+      _error = r == 'ok' ? null : (kBoringInstallErrorText[r] ?? kBoringInstallErrorText['script']);
+    });
   }
 
   Future<void> _run() async {
@@ -80,11 +141,13 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
       return; // keep last good answer
     }
     if (mounted) setState(() => _notice = v);
+    if (v != null && widget.liveSession != null) _poll();
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _sessionTimer?.cancel();
     super.dispose();
   }
 
@@ -95,6 +158,7 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
       return const SizedBox.shrink();
     }
     final v = n.version;
+    final canInstall = widget.install != null && (widget.hasKey?.call() ?? false);
     final onFill = Theme.of(context).colorScheme.onPrimary;
     return Container(
       margin: const EdgeInsets.only(top: 20),
@@ -102,13 +166,24 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
       color: Theme.of(context).colorScheme.primary,
       child: Row(children: [
         Expanded(
-          child: Text('Boring Remote $v is out.',
-              style: TextStyle(color: onFill, fontSize: 14)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Boring Remote $v is out.',
+                style: TextStyle(color: onFill, fontSize: 14)),
+            if (_error != null)
+              Text(_error!, style: TextStyle(color: onFill, fontSize: 13)),
+          ]),
         ),
-        TextButton(
-          onPressed: () => widget.openUrl(Uri.parse(kBoringUpdatePageUrl)),
-          child: Text('Get update', style: TextStyle(color: onFill)),
-        ),
+        if (canInstall)
+          TextButton(
+            onPressed: (_live || _installing) ? null : _install,
+            child: Text(_live ? 'Finish your session to update' : 'Install update',
+                style: TextStyle(color: onFill)),
+          )
+        else
+          TextButton(
+            onPressed: () => widget.openUrl(Uri.parse(kBoringUpdatePageUrl)),
+            child: Text('Get update', style: TextStyle(color: onFill)),
+          ),
         // Below the Minimum version the notice can't be dismissed.
         if (!n.belowMin)
           IconButton(
