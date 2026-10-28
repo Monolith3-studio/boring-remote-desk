@@ -19,12 +19,12 @@ void main() {
 
   testWidgets('Check sends the typed key and shows each status', (t) async {
     const want = {
-      'valid': 'Key is valid.',
-      'revoked': 'This key was revoked.',
-      'refunded': 'This key was refunded.',
-      'unknown': "We don't know this key. Check it against your purchase email.",
-      'busy': 'Too many checks. Try again in a minute.',
-      'network': "Couldn't reach the store. Your key is saved; check your connection.",
+      'valid': "Key's good.",
+      'revoked': 'This key has been revoked.',
+      'refunded': "This key was refunded, so it can't update.",
+      'unknown': "We don't recognize that key. Check it against your purchase email.",
+      'busy': 'Too many checks. Try again in an hour.',
+      'network': "Couldn't reach the store. Your key's saved. Check your connection and try again.",
     };
     for (final e in want.entries) {
       String? sent;
@@ -45,7 +45,7 @@ void main() {
     await t.pumpWidget(host(LicenseKeyField(
         initialKey: '', setKey: (_) async => throw 'boom')));
     await enter(t, 'K');
-    expect(find.text("Couldn't reach the store. Your key is saved; check your connection."),
+    expect(find.text("Couldn't reach the store. Your key's saved. Check your connection and try again."),
         findsOneWidget);
   });
 
@@ -56,6 +56,6 @@ void main() {
     await enter(t, 'K');
     expect(find.text('Checking…'), findsOneWidget);
     await t.pump(const Duration(seconds: 1));
-    expect(find.text('Key is valid.'), findsOneWidget);
+    expect(find.text("Key's good."), findsOneWidget);
   });
 }

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Sign a CI artifact dir for release (spec slice 4, ADR 0004).
 
-Usage:  boring/release/sign-release <dmg-out dir>
+Usage:  boring/release/sign-release [--key-name NAME] <dmg-out dir>
 
-Reads the private seed with `cred get BORING_REMOTE_UPDATE_KEY` (base64 of a
-32-byte raw ed25519 seed). Fills package_sig in the-boring-remote-version.json,
+Reads the private seed with `cred get NAME` (base64 of a 32-byte raw ed25519
+seed). NAME is BORING_REMOTE_UPDATE_KEY (current, the default) or
+BORING_REMOTE_UPDATE_KEY_BACKUP; --key-name wins over env BORING_REMOTE_UPDATE_KEY_NAME. Fills package_sig in the-boring-remote-version.json,
 rewrites it, writes the-boring-remote-version.json.sig over its exact bytes,
 then verifies both against boring/update-pubkeys.json. The seed is never
 printed, logged or written. Exit 0 only when both verify.
@@ -27,15 +28,18 @@ PUBKEYS = pathlib.Path(__file__).resolve().parent.parent / "update-pubkeys.json"
 CRED = pathlib.Path.home() / "Jason-little-brain/Tools/creds/cred"
 
 
+KEY_NAMES = ("BORING_REMOTE_UPDATE_KEY", "BORING_REMOTE_UPDATE_KEY_BACKUP")
+
+
 class SignError(Exception):
     pass
 
 
-def cred_seed():
-    out = subprocess.run([os.environ.get("CRED", str(CRED)), "get", "BORING_REMOTE_UPDATE_KEY"],
+def cred_seed(name=KEY_NAMES[0]):
+    out = subprocess.run([os.environ.get("CRED", str(CRED)), "get", name],
                          capture_output=True, text=True)
     if out.returncode != 0:
-        raise SignError("cred get BORING_REMOTE_UPDATE_KEY failed")
+        raise SignError(f"cred get {name} failed")
     return out.stdout.strip()
 
 
@@ -91,11 +95,15 @@ def sign_release(artifact_dir, seed_source=cred_seed, pubkeys=PUBKEYS):
 
 
 def main(argv):
-    if len(argv) != 2:
+    args = argv[1:]
+    name = os.environ.get("BORING_REMOTE_UPDATE_KEY_NAME") or KEY_NAMES[0]
+    if args[:1] == ["--key-name"] and len(args) >= 2:
+        name, args = args[1], args[2:]
+    if len(args) != 1 or name not in KEY_NAMES:
         print(__doc__, file=sys.stderr)
         return 2
     try:
-        pkg, vf = sign_release(argv[1])
+        pkg, vf = sign_release(args[0], lambda: cred_seed(name), PUBKEYS)
     except (SignError, OSError, KeyError, ValueError) as e:
         print(f"sign-release: {e}", file=sys.stderr)
         return 1

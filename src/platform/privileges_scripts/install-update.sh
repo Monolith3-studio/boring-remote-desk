@@ -70,37 +70,37 @@ GOT=$(bundle_version "$NEW") || fail "cannot read new version"
 [ "$GOT" = "$VERSION" ] || fail "package is $GOT, expected $VERSION"
 [ -z "$ROOT" ] && chown -R root:wheel "$NEW"
 
-# Rollback state (spec slice 7). Root writes update-pending. The user-run app
-# writes its version into update-healthy once healthy, and empties update-failed
-# after showing it; those two are world-writable files in a root-owned dir.
+# Rollback state (spec slice 7). Root writes update-pending. The app writes its
+# version into update-healthy once its main window is up, and empties update-failed
+# after showing it. Both belong to the console user, mode 600, in a root-owned
+# dir: no other local user can write or replace them (ticket 13 Comments).
+CONSOLE_USER=$(stat -f %Su /dev/console)
+CONSOLE_UID=$(stat -f %u /dev/console)
 mkdir -p "$SUPPORT"
 HEALTHY="$SUPPORT/update-healthy" FAILED="$SUPPORT/update-failed"
-: > "$HEALTHY"; chmod 666 "$HEALTHY"
-: > "$FAILED"; chmod 666 "$FAILED"
+for f in "$HEALTHY" "$FAILED"; do
+  rm -f "$f"; : > "$f"; chmod 600 "$f"
+  [ "$CONSOLE_USER" != root ] && chown "$CONSOLE_USER" "$f"
+done
 printf 'from=%s\nto=%s\ntime=%s\n' "$FROM" "$VERSION" "$(date +%s)" > "$SUPPORT/update-pending"
-
-rm -rf "$PREV"
-mv "$APP" "$PREV"
-mv "$NEW" "$APP" || { mv "$PREV" "$APP"; rm -f "$SUPPORT/update-pending"; fail "cannot move new app into place"; }
-xattr -cr "$APP"
 
 restart() {
   launchctl kickstart -k "system/$SERVICE_LABEL" || true
   pkill -x "$APP_NAME" || true
-  user=$(stat -f %Su /dev/console)
-  uid=$(stat -f %u /dev/console)
-  if [ -n "$user" ] && [ "$user" != root ]; then
-    launchctl asuser "$uid" sudo -u "$user" open "$APP" || true
+  if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != root ]; then
+    launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" open "$APP" || true
   fi
 }
 
-# Healthy within $WAIT s: keep the update, drop .previous and the pending marker.
-# Else: kill the new app, put .previous back, restart, and leave update-failed.
+# Healthy = the app wrote $VERSION into update-healthy AND root sees the service
+# loaded itself. Within $WAIT s: keep the update, drop .previous and the pending
+# marker. Else: kill the new app, put .previous back, restart, leave update-failed.
 rollback_watchdog() {
   i=0
   while [ "$i" -lt "$WAIT" ]; do
     sleep 1; i=$((i + 1))
-    if [ "$(cat "$HEALTHY" 2>/dev/null)" = "$VERSION" ]; then
+    if [ "$(cat "$HEALTHY" 2>/dev/null)" = "$VERSION" ] &&
+       launchctl print "system/$SERVICE_LABEL" >/dev/null 2>&1; then
       rm -rf "$PREV"; rm -f "$SUPPORT/update-pending"
       return
     fi
@@ -113,7 +113,12 @@ rollback_watchdog() {
   restart
 }
 
-restart
+rm -rf "$PREV"
+mv "$APP" "$PREV"
+mv "$NEW" "$APP" || { mv "$PREV" "$APP"; rm -f "$SUPPORT/update-pending"; fail "cannot move new app into place"; }
+# The watchdog starts right after the swap, so any later failure still rolls back.
 # Detached so osascript returns; it outlives this script.
 ( trap '' HUP; rollback_watchdog ) </dev/null >/dev/null 2>&1 &
+xattr -cr "$APP" || echo "install-update: xattr -cr failed" >&2
+restart
 echo "install-update: $FROM -> $VERSION"

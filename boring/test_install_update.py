@@ -128,13 +128,17 @@ class InstallUpdate(unittest.TestCase):
         self.assertEqual(self.marker(self.app), "old")
         self.assertEqual(self.support("update-failed").read_text(), "1.6.0\n")
         self.assertFalse(self.support("update-pending").exists())
-        self.assertEqual(self.calls("pkill"), ["pkill -x BoringRemote"] * 2)
+        # install restart + rollback kill + rollback restart
+        self.assertTrue(self.wait_for(lambda: len(self.calls("pkill")) == 3), self.calls("pkill"))
+        self.assertTrue(self.wait_for(lambda: len([c for c in self.calls("launchctl") if c.endswith(f"open {self.app}")]) == 2) or console_is_root())
         self.assertEqual(self.calls("launchctl").count(f"launchctl kickstart -k system/{daemon_label()}"), 2)
         opens = [c for c in self.calls("launchctl") if c.endswith(f"open {self.app}")]
         self.assertTrue(len(opens) == 2 or console_is_root(), opens)
-        # the user-run app can clear the failure notice and report health
-        self.assertTrue(os.stat(self.support("update-failed")).st_mode & 0o002)
-        self.assertTrue(os.stat(self.support("update-healthy")).st_mode & 0o002)
+        # only the console user (who runs the app) can write them; no other local user
+        for f in ("update-failed", "update-healthy"):
+            self.assertEqual(os.stat(self.support(f)).st_mode & 0o077, 0, f)
+            if not console_is_root():
+                self.assertIn(f"chown {console_user()} {self.support(f)}", self.log.read_text())
 
     def test_healthy_new_app_keeps_update_and_drops_previous(self):
         r = self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=10)
@@ -153,6 +157,26 @@ class InstallUpdate(unittest.TestCase):
         self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=1)
         self.assertTrue(self.wait_for(lambda: self.support("update-failed").exists()
                                       and self.support("update-failed").read_text()))
+        self.assertTrue(self.wait_for(lambda: self.marker(self.app) == "old"))
+
+    def stub(self, name, body):
+        p = self.stubs / name
+        p.write_text(STUB + body)
+        p.chmod(0o755)
+
+    def test_failing_xattr_after_swap_still_rolls_back(self):
+        self.stub("xattr", "exit 1\n")
+        self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=1)
+        self.assertTrue(self.wait_for(lambda: self.support("update-failed").exists()
+                                      and self.support("update-failed").read_text()), "no rollback")
+        self.assertTrue(self.wait_for(lambda: self.marker(self.app) == "old"))
+
+    def test_healthy_marker_without_a_running_service_rolls_back(self):
+        self.stub("launchctl", '[ "$1" = print ] && exit 1\n')
+        self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=2)
+        self.support("update-healthy").write_text("1.6.0\n")
+        self.assertTrue(self.wait_for(lambda: self.support("update-failed").exists()
+                                      and self.support("update-failed").read_text()), "no rollback")
         self.assertTrue(self.wait_for(lambda: self.marker(self.app) == "old"))
 
     def test_bad_sig_leaves_install_untouched(self):
@@ -194,6 +218,10 @@ class InstallUpdate(unittest.TestCase):
 def daemon_label():
     t = (SCRIPTS / "daemon.plist").read_text()
     return re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", t).group(1)
+
+
+def console_user():
+    return subprocess.run(["stat", "-f", "%Su", "/dev/console"], capture_output=True, text=True).stdout.strip()
 
 
 def console_is_root():

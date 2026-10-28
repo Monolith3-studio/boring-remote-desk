@@ -6,12 +6,12 @@ const String kBoringLicenseKeyOption = 'boring-license-key';
 /// Status word from the Rust bridge `mainSetLicenseKey` → what the buyer reads.
 /// "network" and "busy" say the key's state is not known; they never call it invalid.
 const Map<String, String> kLicenseKeyStatusText = {
-  'valid': 'Key is valid.',
-  'revoked': 'This key was revoked.',
-  'refunded': 'This key was refunded.',
-  'unknown': "We don't know this key. Check it against your purchase email.",
-  'busy': 'Too many checks. Try again in a minute.',
-  'network': "Couldn't reach the store. Your key is saved; check your connection.",
+  'valid': "Key's good.",
+  'revoked': 'This key has been revoked.',
+  'refunded': "This key was refunded, so it can't update.",
+  'unknown': "We don't recognize that key. Check it against your purchase email.",
+  'busy': 'Too many checks. Try again in an hour.',
+  'network': "Couldn't reach the store. Your key's saved. Check your connection and try again.",
   'none': 'No key saved.',
 };
 

@@ -24,5 +24,5 @@ impl Post for Http {
 pub fn set_and_check(key: &str) -> String {
     let key = key.trim();
     LocalConfig::set_option(KEY_OPTION.to_owned(), key.to_owned());
-    check(&Http, key).to_owned()
+    check(&Http, key).as_str().to_owned()
 }

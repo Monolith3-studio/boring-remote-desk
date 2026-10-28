@@ -28,7 +28,7 @@ void main() {
     expect(find.text('Get update'), findsNothing);
   });
 
-  testWidgets('switch off: bridge is never called, no banner', (tester) async {
+  testWidgets('switch off: one launch call (health report), no banner', (tester) async {
     var calls = 0;
     await tester.pumpWidget(host(UpdateNoticeBanner(
       check: () async {
@@ -39,8 +39,19 @@ void main() {
       openUrl: (_) async {},
     )));
     await tester.pump();
-    expect(calls, 0);
+    expect(calls, 1);
     expect(find.textContaining('is out.'), findsNothing);
+  });
+
+  testWidgets('switch off: a rolled-back update still shows', (tester) async {
+    await tester.pumpWidget(host(UpdateNoticeBanner(
+      check: () async =>
+          UpdateNotice.fromBridge('{"failed":"1.6.0","running":"1.5.0"}'),
+      isEnabled: () => false,
+      openUrl: (_) async {},
+    )));
+    await tester.pump();
+    expect(find.textContaining('1.5.0'), findsOneWidget);
   });
 
   testWidgets('hourly timer re-checks', (tester) async {
@@ -200,10 +211,10 @@ void main() {
       install: () async => 'ok',
     )));
     await tester.pump();
-    expect(find.text('Update failed, still on 1.5.0.'), findsOneWidget);
+    expect(find.text("That update didn't take. You're still on 1.5.0."), findsOneWidget);
     expect(find.text('Install update'), findsNothing);
     await tester.tap(find.byTooltip('Dismiss'));
     await tester.pump();
-    expect(find.textContaining('Update failed'), findsNothing);
+    expect(find.textContaining("didn't take"), findsNothing);
   });
 }

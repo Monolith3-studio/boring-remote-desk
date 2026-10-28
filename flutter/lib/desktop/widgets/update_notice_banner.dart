@@ -18,16 +18,15 @@ const Duration kBoringUpdateRecheckInterval = Duration(hours: 1);
 const Duration kBoringSessionPoll = Duration(seconds: 5);
 
 // What a failed `main_install_update` word means to the user.
-// TODO(humanizer): run these past the humanizer before ship.
 const Map<String, String> kBoringInstallErrorText = {
   'no-key': 'Add your License key in Settings first.',
   'live-session': 'Finish your session to update.',
-  'no-release': 'This update can only be downloaded from your purchase email.',
+  'no-release': 'Get this one from the link in your purchase email.',
   'download': "Couldn't download the update. Try again later.",
   'timeout': 'The download took too long. Try again later.',
-  'sha256': "The download didn't match. Nothing was changed.",
-  'signature': "The update isn't signed by us. Nothing was changed.",
-  'script': "The update didn't install. Nothing was changed.",
+  'sha256': "The download didn't check out. Nothing changed.",
+  'signature': "That update isn't signed by us. Nothing changed.",
+  'script': "The update didn't install. You're still on the version you had.",
 };
 
 /// One answer from the Rust check: the newer version, and whether this build is
@@ -98,7 +97,7 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
   @override
   void initState() {
     super.initState();
-    _run();
+    _run(launch: true);
     _timer = Timer.periodic(kBoringUpdateRecheckInterval, (_) => _run());
     if (widget.liveSession != null) {
       _poll();
@@ -135,8 +134,12 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
     });
   }
 
-  Future<void> _run() async {
-    if (!widget.isEnabled()) {
+  // The launch run always calls the bridge, even with the switch off: that call is
+  // what tells the root rollback watchdog the main window is up (spec slice 7), and
+  // Rust skips the network fetch itself when the switch is off.
+  Future<void> _run({bool launch = false}) async {
+    final enabled = widget.isEnabled();
+    if (!enabled && !launch) {
       if (_notice != null && mounted) setState(() => _notice = null);
       return;
     }
@@ -146,6 +149,7 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
     } catch (_) {
       return; // keep last good answer
     }
+    if (!enabled && v?.failedTo == null) v = null;
     if (mounted) setState(() => _notice = v);
     if (v != null && widget.liveSession != null) _poll();
   }
@@ -166,14 +170,13 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
     final v = n.version;
     final onFill = Theme.of(context).colorScheme.onPrimary;
     if (n.failedTo != null) {
-      // TODO(humanizer): run past the humanizer before ship.
       return Container(
         margin: const EdgeInsets.only(top: 20),
         padding: const EdgeInsets.all(20),
         color: Theme.of(context).colorScheme.primary,
         child: Row(children: [
           Expanded(
-              child: Text('Update failed, still on $v.',
+              child: Text("That update didn't take. You're still on $v.",
                   style: TextStyle(color: onFill, fontSize: 14))),
           IconButton(
             tooltip: 'Dismiss',

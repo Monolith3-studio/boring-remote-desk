@@ -6,35 +6,58 @@ pub const KEY_OPTION: &str = "boring-license-key";
 pub const UPDATE_ENDPOINT: &str = "https://store-fulfillment.boringstories.workers.dev/update";
 
 pub trait Post {
-    /// POST JSON `body` to `url`; Ok((status, body)) or Err on any transport failure.
     fn post_json(&self, url: &str, body: &str, timeout: Duration) -> Result<(u16, String), String>;
 }
 
-/// One word for the Settings field: "valid", "revoked", "refunded", "unknown"
-/// (fulfillment has no such key), "busy" (rate limited), "network" (no usable
-/// answer, so the key's state is not known), or "none" (blank key, no request).
-pub fn check(post: &dyn Post, key: &str) -> &'static str {
+/// The Settings field's word for a key. `Unknown`: fulfillment has no such key.
+/// `Network`: no usable answer, so the key's state is not known. `None`: blank key, no request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    Valid,
+    Revoked,
+    Refunded,
+    Unknown,
+    Busy,
+    Network,
+    None,
+}
+
+impl KeyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Revoked => "revoked",
+            Self::Refunded => "refunded",
+            Self::Unknown => "unknown",
+            Self::Busy => "busy",
+            Self::Network => "network",
+            Self::None => "none",
+        }
+    }
+}
+
+pub fn check(post: &dyn Post, key: &str) -> KeyStatus {
     let key = key.trim();
     if key.is_empty() {
-        return "none";
+        return KeyStatus::None;
     }
     let body = serde_json::json!({"license_key": key, "check": true}).to_string();
     let (status, text) = match post.post_json(UPDATE_ENDPOINT, &body, Duration::from_secs(10)) {
         Ok(r) => r,
-        Err(_) => return "network",
+        Err(_) => return KeyStatus::Network,
     };
     if status == 429 {
-        return "busy";
+        return KeyStatus::Busy;
     }
     let Some(v) = (status == 200).then(|| serde_json::from_str::<serde_json::Value>(&text).ok()).flatten() else {
-        return "network";
+        return KeyStatus::Network;
     };
     match (v.get("valid").and_then(|b| b.as_bool()), v.get("reason").and_then(|r| r.as_str())) {
-        (Some(true), _) => "valid",
-        (Some(false), Some("revoked")) => "revoked",
-        (Some(false), Some("refunded")) => "refunded",
-        (Some(false), _) => "unknown",
-        _ => "network",
+        (Some(true), _) => KeyStatus::Valid,
+        (Some(false), Some("revoked")) => KeyStatus::Revoked,
+        (Some(false), Some("refunded")) => KeyStatus::Refunded,
+        (Some(false), _) => KeyStatus::Unknown,
+        _ => KeyStatus::Network,
     }
 }
 
@@ -63,7 +86,7 @@ mod tests {
     #[test]
     fn valid_key() {
         let f = fake(Ok((200, r#"{"valid":true,"reason":null}"#)));
-        assert_eq!(check(&f, "ABC-123"), "valid");
+        assert_eq!(check(&f, "ABC-123").as_str(), "valid");
         let (url, body) = f.sent.borrow()[0].clone();
         assert_eq!(url, "https://store-fulfillment.boringstories.workers.dev/update");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -74,22 +97,22 @@ mod tests {
     fn revoked_refunded_unknown() {
         for (reason, want) in [("revoked", "revoked"), ("refunded", "refunded"), ("not found", "unknown")] {
             let body = format!(r#"{{"valid":false,"reason":"{reason}"}}"#);
-            assert_eq!(check(&fake(Ok((200, &body))), "k"), want);
+            assert_eq!(check(&fake(Ok((200, &body))), "k").as_str(), want);
         }
     }
 
     #[test]
     fn network_failures_are_not_invalid() {
-        assert_eq!(check(&fake(Err("dns")), "k"), "network");
-        assert_eq!(check(&fake(Ok((500, "oops"))), "k"), "network");
-        assert_eq!(check(&fake(Ok((200, "<html>"))), "k"), "network");
-        assert_eq!(check(&fake(Ok((429, r#"{"reason":"too many requests"}"#))), "k"), "busy");
+        assert_eq!(check(&fake(Err("dns")), "k").as_str(), "network");
+        assert_eq!(check(&fake(Ok((500, "oops"))), "k").as_str(), "network");
+        assert_eq!(check(&fake(Ok((200, "<html>"))), "k").as_str(), "network");
+        assert_eq!(check(&fake(Ok((429, r#"{"reason":"too many requests"}"#))), "k").as_str(), "busy");
     }
 
     #[test]
     fn empty_key_never_hits_network() {
         let f = fake(Ok((200, r#"{"valid":true,"reason":null}"#)));
-        assert_eq!(check(&f, "  "), "none");
+        assert_eq!(check(&f, "  ").as_str(), "none");
         assert!(f.sent.borrow().is_empty());
     }
 }

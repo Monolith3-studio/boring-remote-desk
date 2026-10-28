@@ -1,20 +1,20 @@
 //! App side of the update rollback (ADR 0004, spec slice 7). install-update.sh
-//! leaves `update-pending` (root-owned) plus two world-writable files in
-//! `/Library/Application Support/Boring Remote`: the app writes its version into
-//! `update-healthy` once healthy (the root watchdog then deletes `.previous` and
-//! the pending marker), and empties `update-failed` after showing it once.
+//! leaves `update-pending` (root-owned) plus two files owned by the console user,
+//! mode 600, in root-owned `/Library/Application Support/Boring Remote`: the app
+//! writes its version into `update-healthy` once its main window is up and the
+//! service answers (the root watchdog checks the service too, then deletes
+//! `.previous`), and empties `update-failed` after showing it once.
 use std::path::Path;
 
 pub const SUPPORT_DIR: &str = "/Library/Application Support/Boring Remote";
 
-/// Call once the main window is up. Returns the version the update tried to reach
-/// if it failed and was rolled back (show "Update failed, still on <running>"
-/// once). Reports health when an update to `running` is pending and `healthy`.
+/// Call once the main window is up. Returns the version a rolled-back update
+/// tried to reach, once. Reports health when an update to `running` is pending and `healthy`.
 pub fn on_launch(dir: &Path, running: &str, healthy: bool) -> Option<String> {
     let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
     let failed = read("update-failed").trim().to_owned();
     if !failed.is_empty() {
-        // Truncate, not delete: the dir is root-owned, the file is 0666.
+        // Truncate, not delete: the dir is root-owned.
         let _ = std::fs::write(dir.join("update-failed"), "");
         return Some(failed);
     }

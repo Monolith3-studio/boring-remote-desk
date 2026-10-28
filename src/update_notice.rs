@@ -49,6 +49,12 @@ pub fn embedded_keys() -> Vec<VerifyingKey> {
         .collect()
 }
 
+/// The HTTP body as a String with exactly the bytes that came off the wire, so the
+/// signature is checked over the same bytes the JSON is parsed from. Not UTF-8 → Err.
+pub fn body_text(bytes: Vec<u8>) -> Result<String, String> {
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
 /// True when `sig_b64` is a valid signature over the exact bytes of `body` by any of `keys`.
 fn verified(keys: &[VerifyingKey], body: &str, sig_b64: &str) -> bool {
     verify_bytes(keys, body.as_bytes(), sig_b64)
@@ -179,6 +185,13 @@ pub fn check_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn body_text_keeps_the_exact_signed_bytes() {
+        let bom = b"\xEF\xBB\xBF{\"version\":\"1.0.0\"}".to_vec();
+        assert_eq!(super::body_text(bom.clone()).unwrap().as_bytes(), &bom[..]);
+        assert!(super::body_text(b"{\"v\":\"\xFF\"}".to_vec()).is_err());
+    }
+
     use super::*;
     use hbb_common::base64::{self, Engine as _};
     use ed25519_dalek::{Signer, SigningKey};

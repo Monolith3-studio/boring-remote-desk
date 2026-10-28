@@ -34,8 +34,7 @@ pub enum InstallError {
 }
 
 impl InstallError {
-    /// One word for the bridge / banner.
-    pub fn code(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::NoKey => "no-key",
             Self::LiveSession => "live-session",

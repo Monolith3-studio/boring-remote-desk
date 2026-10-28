@@ -1,7 +1,7 @@
 //! Real wiring for `update_install`: HTTP download, monotonic clock, live
 //! session count, and the root install script through osascript. Blocking:
 //! call off the UI thread.
-use crate::update_install::{install, Clock, Deps, Fetcher, Runner, SessionCount};
+use crate::update_install::{install, Clock, Deps, Fetcher, InstallError, Runner, SessionCount};
 use hbb_common::config::LocalConfig;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ impl SessionCount for Live {
 
 /// One admin prompt naming Boring Remote and the version; argv is quoted, never spliced.
 const OSA: &str = r#"on run argv
-  do shell script (quoted form of item 1 of argv) & " " & (quoted form of item 2 of argv) & " " & (quoted form of item 3 of argv) & " " & (quoted form of item 4 of argv) with prompt ("Boring Remote wants to install version " & (item 4 of argv) & ".") with administrator privileges
+  do shell script (quoted form of item 1 of argv) & " " & (quoted form of item 2 of argv) & " " & (quoted form of item 3 of argv) & " " & (quoted form of item 4 of argv) with prompt ("Boring Remote needs your password to install version " & (item 4 of argv) & ".") with administrator privileges
 end run"#;
 
 struct Osascript;
@@ -79,7 +79,7 @@ impl crate::update_notice::Store for Local {
     }
 }
 
-/// "ok" or an `InstallError::code()` word.
+/// "ok" or an `InstallError::as_str()` word.
 pub fn install_now() -> String {
     let key = LocalConfig::get_option(crate::license_key::KEY_OPTION);
     let release = crate::update_notice::release(&Local);
@@ -87,7 +87,7 @@ pub fn install_now() -> String {
     let _ = std::fs::remove_dir_all(&dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::error!("install update: temp dir: {e}");
-        return "download".into();
+        return InstallError::Download(e.to_string()).as_str().into();
     }
     let keys = crate::update_notice::embedded_keys();
     let d = Deps {
@@ -104,7 +104,7 @@ pub fn install_now() -> String {
         Ok(()) => "ok".into(),
         Err(e) => {
             log::warn!("install update: {e:?}");
-            e.code().into()
+            e.as_str().into()
         }
     }
 }

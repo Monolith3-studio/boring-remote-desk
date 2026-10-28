@@ -14,7 +14,8 @@ impl Fetch for Http {
             .send()
             .map_err(|e| e.to_string())?;
         let status = r.status().as_u16();
-        Ok((status, r.text().map_err(|e| e.to_string())?))
+        let bytes = r.bytes().map_err(|e| e.to_string())?;
+        Ok((status, crate::update_notice::body_text(bytes.to_vec())?))
     }
 }
 

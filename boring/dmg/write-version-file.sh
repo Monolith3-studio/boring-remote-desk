@@ -1,17 +1,17 @@
 #!/bin/bash
 # Write the version file beside a release DMG (docs/version-file.md, ADR 0003/0004).
-#   boring/dmg/write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>
 # version = Cargo.toml's package version; the tag (leading "v" optional) must equal it. min_version
 # comes from the checked-in file (boring/min-version): strict X.Y.Z and <= version. Any failure exits
 # 1 and writes nothing. package_sig stays empty: signing is local (slice 4); no .sig is written here.
 # Writes <out dir>/the-boring-remote-version.json. Uploads nothing.
 set -euo pipefail
-CARGO=${1:?usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>}
-TAG=${2:?usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>}
-DMG=${3:?usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>}
-PKG=${4:?usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>}
-MINF=${5:?usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>}
-OUT=${6:?usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>}
+USAGE="usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>"
+CARGO=${1:?$USAGE}
+TAG=${2:?$USAGE}
+DMG=${3:?$USAGE}
+PKG=${4:?$USAGE}
+MINF=${5:?$USAGE}
+OUT=${6:?$USAGE}
 die() { echo "write-version-file: $*" >&2; exit 1; }
 
 [ -f "$CARGO" ] || die "no $CARGO"

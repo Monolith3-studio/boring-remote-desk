@@ -73,6 +73,44 @@ class SignRelease(unittest.TestCase):
         with self.assertRaises(sr.SignError):
             sr.sign_release(self.tmp, lambda: b64(self.seed), self.keys)
 
+    def fake_cred(self, name):
+        """A `cred` stub that knows only `name`, holding this test's seed."""
+        cred = self.tmp / "cred"
+        cred.write_text(f'#!/bin/sh\n[ "$1 $2" = "get {name}" ] || exit 1\necho {b64(self.seed)}\n')
+        cred.chmod(0o755)
+        return cred
+
+    def run_main(self, argv, env):
+        import os
+        from unittest import mock
+        self.write_keys(b64(self.key.public_key().public_bytes(**RAW)), "")
+        env = {"BORING_REMOTE_UPDATE_KEY_NAME": "", **env}  # unset reads as current
+        with mock.patch.object(sr, "PUBKEYS", self.keys), mock.patch.dict(os.environ, env):
+            return sr.main(argv)
+
+    def test_key_name_flag_reads_the_backup_credential(self):
+        cred = self.fake_cred("BORING_REMOTE_UPDATE_KEY_BACKUP")
+        rc = self.run_main(["sign-release", "--key-name", "BORING_REMOTE_UPDATE_KEY_BACKUP", str(self.tmp)],
+                           {"CRED": str(cred)})
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.tmp / "the-boring-remote-version.json.sig").exists())
+
+    def test_key_name_env_reads_the_backup_credential(self):
+        cred = self.fake_cred("BORING_REMOTE_UPDATE_KEY_BACKUP")
+        rc = self.run_main(["sign-release", str(self.tmp)],
+                           {"CRED": str(cred), "BORING_REMOTE_UPDATE_KEY_NAME": "BORING_REMOTE_UPDATE_KEY_BACKUP"})
+        self.assertEqual(rc, 0)
+
+    def test_default_key_name_is_current(self):
+        cred = self.fake_cred("BORING_REMOTE_UPDATE_KEY")
+        self.assertEqual(self.run_main(["sign-release", str(self.tmp)], {"CRED": str(cred)}), 0)
+
+    def test_other_key_names_are_refused(self):
+        cred = self.fake_cred("GITHUB_TOKEN")
+        rc = self.run_main(["sign-release", "--key-name", "GITHUB_TOKEN", str(self.tmp)], {"CRED": str(cred)})
+        self.assertEqual(rc, 2)
+        self.assertFalse((self.tmp / "the-boring-remote-version.json.sig").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
