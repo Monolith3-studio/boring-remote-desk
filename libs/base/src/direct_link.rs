@@ -36,8 +36,12 @@ pub const IDENTITY_CHANGED: &str =
 /// Controller-side memory of Targets met over an encrypted Direct Link (LocalConfig option).
 pub const KNOWN_OPTION: &str = "boring-direct-link-known";
 
-/// How long the Target's own (non-Tailscale) address gets before the Tailscale path is tried.
+/// How long the Target's own (non-Tailscale) address gets to answer (TCP connect) before the
+/// Tailscale path is tried.
 pub const DIRECT_TIMEOUT_MS: u64 = 1_000;
+
+/// Each read of the encrypted handshake and trust exchange, once a Target has answered.
+pub const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 
 /// Tailscale's ranges: IPv4 CGNAT 100.64.0.0/10 and the IPv6 ULA fd7a:115c:a1e0::/48.
 pub fn is_tailscale(ip: IpAddr) -> bool {
@@ -101,26 +105,34 @@ pub enum Failure {
     Refused(hbb_common::anyhow::Error),
 }
 
-/// Dial `plan.direct`, then `plan.tailscale` if the first gave nothing. A non-Tailscale address
-/// gets `direct_ms`; a Tailscale one `slow_ms` (its first packets may go through a DERP relay).
-/// A [`Failure::Refused`] ends the attempt; the fallback is never contacted.
-pub async fn race<T, F, Fut>(
+/// Dial `plan.direct`, then `plan.tailscale` if the first gave nothing. "Nothing" means TCP didn't
+/// answer within `direct_ms` (a non-Tailscale address) or `slow_ms` (Tailscale: its first packets
+/// may go through a DERP relay), or the handshake found nothing it could talk to. A Target that
+/// answered gets the handshake's own timeouts, not the no-answer budget. A [`Failure::Refused`]
+/// ends the attempt; the fallback is never contacted.
+pub async fn race<S, T, C, CFut, H, HFut>(
     plan: Plan,
     direct_ms: u64,
     slow_ms: u64,
-    mut dial: F,
+    mut connect: C,
+    mut handshake: H,
 ) -> ResultType<(T, SocketAddr)>
 where
-    F: FnMut(SocketAddr) -> Fut,
-    Fut: Future<Output = Result<T, Failure>>,
+    C: FnMut(SocketAddr) -> CFut,
+    CFut: Future<Output = Option<S>>,
+    H: FnMut(S, SocketAddr) -> HFut,
+    HFut: Future<Output = Result<T, Failure>>,
 {
     let tailscale = plan.tailscale.filter(|t| *t != plan.direct);
     for addr in std::iter::once(plan.direct).chain(tailscale) {
         let ms = if is_tailscale(addr.ip()) { slow_ms } else { direct_ms };
-        match hbb_common::timeout(ms, dial(addr)).await {
-            Ok(Ok(t)) => return Ok((t, addr)),
-            Ok(Err(Failure::Refused(e))) => return Err(e),
-            Ok(Err(Failure::Unreachable)) | Err(_) => {}
+        let Ok(Some(s)) = hbb_common::timeout(ms, connect(addr)).await else {
+            continue;
+        };
+        match handshake(s, addr).await {
+            Ok(t) => return Ok((t, addr)),
+            Err(Failure::Refused(e)) => return Err(e),
+            Err(Failure::Unreachable) => {}
         }
     }
     bail!(NOT_ON_THIS_NETWORK)
@@ -176,7 +188,7 @@ async fn read(stream: &mut Stream, ms: u64) -> Result<Message, Failure> {
 ///
 /// Ticket 04 seam: the returned [`Verified`] (pinned id + key) is who a trust token belongs to,
 /// and the stream is already encrypted when the login carrying it goes out.
-pub async fn secure(stream: &mut Stream, known: &Known, ms: u64) -> Result<Verified, Failure> {
+pub async fn secure(stream: &mut Stream, known: &Known, dialled: SocketAddr, ms: u64) -> Result<Verified, Failure> {
     let refused = |why: &str| Failure::Refused(anyhow!("{}", why));
     let (sign_pk, tailscale) = match read(stream, ms).await?.union {
         Some(message::Union::PublicKey(pk)) if pk.asymmetric_value.len() == sign::PUBLICKEYBYTES => {
@@ -196,7 +208,7 @@ pub async fn secure(stream: &mut Stream, known: &Known, ms: u64) -> Result<Verif
         .and_then(|b| IdPk::parse_from_bytes(&b).ok())
         .filter(|p| p.pk.len() == box_::PUBLICKEYBYTES && !p.id.is_empty())
         .ok_or_else(|| refused(PLAINTEXT_REFUSED))?;
-    if !known.pin_ok(&id_pk.id, &sign_pk) {
+    if !known.pin_ok(dialled, &id_pk.id, &sign_pk) {
         return Err(refused(IDENTITY_CHANGED));
     }
     let mut their = [0u8; box_::PUBLICKEYBYTES];
@@ -259,19 +271,20 @@ impl Known {
         LocalConfig::set_option(KNOWN_OPTION.to_owned(), self.to_json());
     }
 
-    /// First sight of an ID pins its key; after that only the same key passes.
-    pub fn pin_ok(&self, id: &str, sign_pk: &[u8]) -> bool {
-        self.0.get(id).map_or(true, |t| t.pk == hex(sign_pk))
+    /// Trust on first use, pinned twice: the address we dialled keeps the Target first met there
+    /// (its ID and key), and a known ID keeps its key wherever it answers. The ID alone proves
+    /// nothing (it is signed by the key that just announced itself), so a new ID with its own key
+    /// at a known address is a changed identity too.
+    pub fn pin_ok(&self, dialled: SocketAddr, id: &str, sign_pk: &[u8]) -> bool {
+        let lan = dialled.to_string();
+        let pk = hex(sign_pk);
+        let at_address = self.0.iter().all(|(known_id, t)| t.lan != lan || (known_id == id && t.pk == pk));
+        at_address && self.0.get(id).map_or(true, |t| t.pk == pk)
     }
 
-    /// Remember who answered at `addr`. An address belongs to one Target at a time.
+    /// Remember who answered at `addr`, after [`Known::pin_ok`] let it in.
     pub fn record(&mut self, who: &Verified, addr: SocketAddr) {
         let lan = addr.to_string();
-        for t in self.0.values_mut() {
-            if t.lan == lan {
-                t.lan.clear();
-            }
-        }
         let t = self.0.entry(who.id.clone()).or_default();
         t.pk = hex(&who.sign_pk);
         t.lan = lan;
@@ -303,7 +316,7 @@ pub async fn plan_for(peer: &str, known: &Known, ms: u64) -> ResultType<Plan> {
         bail!(NOT_FOUND);
     }
     // Same network first: a non-Tailscale address, IPv4 before IPv6.
-    let mut sorted = addrs.clone();
+    let mut sorted = addrs;
     sorted.sort_by_key(|a| (is_tailscale(a.ip()), !a.is_ipv4()));
     let direct = sorted[0];
     let tailscale = known
@@ -319,11 +332,13 @@ pub async fn plan_for(peer: &str, known: &Known, ms: u64) -> ResultType<Plan> {
 pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Option<Vec<u8>>)> {
     let mut known = Known::load();
     let plan = plan_for(peer, &known, slow_ms).await?;
-    let pinned = known.clone();
-    let ((stream, who), addr) = race(plan, DIRECT_TIMEOUT_MS, slow_ms, |addr| {
-        let pinned = &pinned;
-        async move { dial(addr, pinned, slow_ms).await }
-    })
+    let ((stream, who), addr) = race(
+        plan,
+        DIRECT_TIMEOUT_MS,
+        slow_ms,
+        |addr| async move { hbb_common::socket_client::connect_tcp_local(addr, None, slow_ms).await.ok() },
+        |stream, addr| handshake(stream, addr, &known, HANDSHAKE_TIMEOUT_MS),
+    )
     .await?;
     let pk = who.map(|w| {
         known.record(&w, addr);
@@ -333,15 +348,18 @@ pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Opti
     Ok((stream, Path::of(addr), pk))
 }
 
-/// One address: TCP, then the encrypted handshake wherever [`must_encrypt`].
-pub async fn dial(addr: SocketAddr, known: &Known, ms: u64) -> Result<(Stream, Option<Verified>), Failure> {
-    let mut stream = hbb_common::socket_client::connect_tcp_local(addr, None, ms)
-        .await
-        .map_err(|_| Failure::Unreachable)?;
+/// A Target that picked up at `addr`: the encrypted handshake wherever [`must_encrypt`], then
+/// the trust token. Each read gets `ms`.
+pub async fn handshake(
+    mut stream: Stream,
+    addr: SocketAddr,
+    known: &Known,
+    ms: u64,
+) -> Result<(Stream, Option<Verified>), Failure> {
     if !must_encrypt(addr.ip()) {
         return Ok((stream, None));
     }
-    let who = secure(&mut stream, known, ms).await?;
+    let who = secure(&mut stream, known, addr, ms).await?;
     if !stream.is_secured() {
         return Err(Failure::Refused(anyhow!(PLAINTEXT_REFUSED)));
     }
@@ -363,24 +381,28 @@ mod tests {
     const LAN: &str = "192.168.1.20:21118";
     const TS: &str = "100.101.102.103:21118";
 
-    /// A dialer that answers per address: Some(delay) = connects after delay, None = refused
+    /// TCP that answers per address: Some(delay) = connects after delay, None = refused
     /// connection (unreachable). Records every address it was asked for.
     fn dialer(
         answers: Vec<(&'static str, Option<u64>)>,
         seen: Arc<Mutex<Vec<SocketAddr>>>,
-    ) -> impl FnMut(SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = Result<SocketAddr, Failure>>>>
-    {
+    ) -> impl FnMut(SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = Option<SocketAddr>>>> {
         move |addr| {
             seen.lock().unwrap().push(addr);
             let answer = answers.iter().find(|(a, _)| sa(a) == addr).and_then(|(_, d)| *d);
             Box::pin(async move {
-                match answer {
-                    Some(ms) => {
-                        tokio::time::sleep(Duration::from_millis(ms)).await;
-                        Ok(addr)
-                    }
-                    None => Err(Failure::Unreachable),
-                }
+                tokio::time::sleep(Duration::from_millis(answer?)).await;
+                Some(addr)
+            })
+        }
+    }
+
+    /// A handshake that takes `ms` once TCP is up.
+    fn handshake(ms: u64) -> impl FnMut(SocketAddr, SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = Result<SocketAddr, Failure>>>> {
+        move |s, _| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(s)
             })
         }
     }
@@ -390,7 +412,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(vec![]));
         let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
         let (got, addr) =
-            race(plan, 50, 500, dialer(vec![(LAN, Some(5_000)), (TS, Some(1))], seen.clone()))
+            race(plan, 50, 500, dialer(vec![(LAN, Some(5_000)), (TS, Some(1))], seen.clone()), handshake(0))
                 .await
                 .unwrap();
         assert_eq!((got, addr), (sa(TS), sa(TS)));
@@ -403,7 +425,20 @@ mod tests {
         let seen = Arc::new(Mutex::new(vec![]));
         let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
         let (_, addr) =
-            race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()))
+            race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()), handshake(0))
+                .await
+                .unwrap();
+        assert_eq!(Path::of(addr), Path::Local);
+        assert_eq!(*seen.lock().unwrap(), vec![sa(LAN)]);
+    }
+
+    #[tokio::test]
+    async fn a_target_that_answers_in_time_but_handshakes_slowly_stays_local() {
+        // The ~1 s is for "no answer". A Target that picked up gets the handshake's own budget.
+        let seen = Arc::new(Mutex::new(vec![]));
+        let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
+        let (_, addr) =
+            race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()), handshake(200))
                 .await
                 .unwrap();
         assert_eq!(Path::of(addr), Path::Local);
@@ -414,12 +449,12 @@ mod tests {
     async fn nothing_answers_is_not_on_this_network() {
         let seen = Arc::new(Mutex::new(vec![]));
         let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
-        let err = race(plan, 50, 50, dialer(vec![(LAN, None), (TS, Some(5_000))], seen))
+        let err = race(plan, 50, 50, dialer(vec![(LAN, None), (TS, Some(5_000))], seen), handshake(0))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), NOT_ON_THIS_NETWORK);
         let plan = Plan { direct: sa(LAN), tailscale: None };
-        let err = race(plan, 50, 50, dialer(vec![], Default::default())).await.unwrap_err();
+        let err = race(plan, 50, 50, dialer(vec![], Default::default()), handshake(0)).await.unwrap_err();
         assert_eq!(err.to_string(), NOT_ON_THIS_NETWORK);
     }
 
@@ -427,10 +462,8 @@ mod tests {
     async fn a_refused_direct_link_never_falls_back() {
         let seen = Arc::new(Mutex::new(vec![]));
         let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
-        let s2 = seen.clone();
-        let err = race(plan, 50, 500, move |addr| {
-            s2.lock().unwrap().push(addr);
-            async { Err::<(), _>(Failure::Refused(hbb_common::anyhow::anyhow!("plaintext"))) }
+        let err = race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()), |_, _| async {
+            Err::<(), _>(Failure::Refused(hbb_common::anyhow::anyhow!("plaintext")))
         })
         .await
         .unwrap_err();
@@ -441,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn a_typed_tailscale_address_gets_the_slow_timeout() {
         let plan = Plan { direct: sa(TS), tailscale: None };
-        let (_, addr) = race(plan, 10, 500, dialer(vec![(TS, Some(100))], Default::default()))
+        let (_, addr) = race(plan, 10, 500, dialer(vec![(TS, Some(100))], Default::default()), handshake(0))
             .await
             .unwrap();
         assert_eq!(Path::of(addr), Path::ViaInternet);
@@ -504,7 +537,7 @@ mod tests {
         let (mut ctl, srv) = pair().await;
         let (pk, sk) = sign::gen_keypair();
         let t = tokio::spawn(target(srv, sk, pk, "123456789"));
-        let who = secure(&mut ctl, &Known::default(), 2_000).await.unwrap();
+        let who = secure(&mut ctl, &Known::default(), sa(LAN), 2_000).await.unwrap();
         let mut srv = t.await.unwrap();
         assert!(ctl.is_secured() && srv.is_secured());
         assert_eq!((who.id.as_str(), who.sign_pk.as_slice()), ("123456789", &pk.0[..]));
@@ -523,7 +556,7 @@ mod tests {
         let mut hash = Message::new();
         hash.set_hash(crate::message_proto::Hash { salt: "s".into(), challenge: "c".into(), ..Default::default() });
         srv.send(&hash).await.unwrap();
-        match secure(&mut ctl, &Known::default(), 2_000).await {
+        match secure(&mut ctl, &Known::default(), sa(LAN), 2_000).await {
             Err(Failure::Refused(e)) => assert_eq!(e.to_string(), PLAINTEXT_REFUSED),
             other => panic!("not refused: {:?}", other.map(|w| w.id)),
         }
@@ -540,10 +573,37 @@ mod tests {
         let mut known = Known::default();
         known.record(&Verified { id: "123456789".into(), sign_pk: old_pk.0.to_vec(), tailscale: None }, sa(LAN));
         tokio::spawn(target(srv, sk, pk, "123456789"));
-        match secure(&mut ctl, &known, 2_000).await {
+        match secure(&mut ctl, &known, sa(LAN), 2_000).await {
             Err(Failure::Refused(e)) => assert_eq!(e.to_string(), IDENTITY_CHANGED),
             other => panic!("not refused: {:?}", other.map(|w| w.id)),
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_id_with_a_new_key_at_a_known_address_is_refused() {
+        // Someone else on the Wi-Fi answers at a Target's address with an ID and key of its own.
+        let (mut ctl, srv) = pair().await;
+        let (pk, sk) = sign::gen_keypair();
+        let (old_pk, _) = sign::gen_keypair();
+        let mut known = Known::default();
+        known.record(&Verified { id: "123456789".into(), sign_pk: old_pk.0.to_vec(), tailscale: None }, sa(LAN));
+        tokio::spawn(target(srv, sk, pk, "555000111"));
+        match secure(&mut ctl, &known, sa(LAN), 2_000).await {
+            Err(Failure::Refused(e)) => assert_eq!(e.to_string(), IDENTITY_CHANGED),
+            other => panic!("not refused: {:?}", other.map(|w| w.id)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_target_at_a_new_address_still_connects() {
+        let (mut ctl, srv) = pair().await;
+        let (pk, sk) = sign::gen_keypair();
+        let mut known = Known::default();
+        known.record(&Verified { id: "123456789".into(), sign_pk: pk.0.to_vec(), tailscale: None }, sa(LAN));
+        tokio::spawn(target(srv, sk, pk, "123456789"));
+        let who = secure(&mut ctl, &known, sa("192.168.1.77:21118"), 2_000).await.map_err(|_| "refused").unwrap();
+        known.record(&who, sa("192.168.1.77:21118"));
+        assert!(known.pin_ok(sa("192.168.1.77:21118"), "123456789", &pk.0));
     }
 
     // --- what the Controller remembers -----------------------------------------------------
@@ -555,15 +615,9 @@ mod tests {
         known.record(&who, sa(LAN));
         let known = Known::parse(&known.to_json());
         assert_eq!(known.tailscale_for(sa(LAN)), Some(sa(TS)));
-        assert!(known.pin_ok("1", &[7; 32]) && !known.pin_ok("1", &[8; 32]) && known.pin_ok("2", &[8; 32]));
-    }
-
-    #[test]
-    fn an_address_belongs_to_the_last_target_that_answered_there() {
-        let mut known = Known::default();
-        known.record(&Verified { id: "1".into(), sign_pk: vec![1; 32], tailscale: Some("100.64.0.1".parse().unwrap()) }, sa(LAN));
-        known.record(&Verified { id: "2".into(), sign_pk: vec![2; 32], tailscale: None }, sa(LAN));
-        assert_eq!(known.tailscale_for(sa(LAN)), None);
+        let other = sa("192.168.1.30:21118");
+        assert!(known.pin_ok(sa(LAN), "1", &[7; 32]) && !known.pin_ok(other, "1", &[8; 32]));
+        assert!(known.pin_ok(other, "2", &[8; 32]), "a new Target at a new address is met for the first time");
     }
 
     #[tokio::test]
