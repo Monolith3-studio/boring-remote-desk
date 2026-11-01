@@ -117,6 +117,17 @@ impl Trusted {
     }
 }
 
+/// How a Direct Link session got in (src/server/connection.rs maps its sign-in to this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignIn {
+    /// Someone clicked Allow on this Mac.
+    Allowed,
+    /// The Unattended Password.
+    UnattendedPassword,
+    /// Anything else, such as the one-time code: in for this session, asked again next time.
+    ThisSessionOnly,
+}
+
 /// What the Target learned in the exchange: already Trusted, or the hash of the token it just
 /// issued, waiting for approval.
 #[derive(Debug, Clone, Default)]
@@ -131,22 +142,22 @@ impl Admission {
         self.trusted.is_some()
     }
 
-    /// The session was approved here or the Unattended Password was right: the token just
-    /// issued becomes Trusted under `name`.
-    pub fn approve(&mut self, name: &str) {
+    /// The session got in. If someone clicked Allow here or the Unattended Password was right,
+    /// the token just issued becomes Trusted under `name`; any other sign-in leaves it worthless.
+    pub fn approve(&mut self, how: SignIn, name: &str) {
         let mut t = Trusted::load();
-        if self.approve_into(&mut t, name) {
+        if self.approve_into(&mut t, how, name) {
             t.save();
         }
     }
 
-    fn approve_into(&mut self, t: &mut Trusted, name: &str) -> bool {
+    fn approve_into(&mut self, t: &mut Trusted, how: SignIn, name: &str) -> bool {
         match self.pending.take() {
-            Some(key) => {
+            Some(key) if how != SignIn::ThisSessionOnly => {
                 t.add(&key, name);
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 }
@@ -233,7 +244,7 @@ impl Tokens {
     }
 }
 
-/// Controller side, called by `direct_link::dial` once the stream is keyed to `target`.
+/// Controller side, called by `direct_link::handshake` once the stream is keyed to `target`.
 pub async fn present_for(stream: &mut Stream, target: &str, ms: u64) -> ResultType<()> {
     let mut tokens = Tokens::load();
     if let Some(fresh) = present(stream, tokens.get(target).as_deref(), ms).await? {
@@ -282,8 +293,8 @@ mod tests {
         // Not approved yet: presenting the issued token is still a stranger.
         let (b, _) = connect(&trusted, Some(token.clone())).await;
         assert!(!b.is_trusted());
-        assert!(a.approve_into(&mut trusted, "Edit Bay 2"));
-        assert!(!a.approve_into(&mut trusted, "again"), "one approval stores one token");
+        assert!(a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2"));
+        assert!(!a.approve_into(&mut trusted, SignIn::Allowed, "again"), "one approval stores one token");
         let trusted = Trusted::parse(&trusted.to_json());
         assert_eq!(trusted.list().len(), 1);
         assert_eq!(trusted.list()[0].name, "Edit Bay 2");
@@ -294,10 +305,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_one_time_code_lets_a_controller_in_for_that_session_only() {
+        let mut trusted = Trusted::default();
+        let (mut a, issued) = connect(&trusted, None).await;
+        assert!(!a.approve_into(&mut trusted, SignIn::ThisSessionOnly, "Edit Bay 2"));
+        assert!(trusted.list().is_empty());
+        let (next, _) = connect(&trusted, issued).await;
+        assert!(!next.is_trusted(), "asked again next time");
+    }
+
+    #[tokio::test]
     async fn removing_a_trusted_controller_revokes_its_token() {
         let mut trusted = Trusted::default();
         let (mut a, issued) = connect(&trusted, None).await;
-        a.approve_into(&mut trusted, "Stage Left");
+        a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left");
         let key = trusted.list()[0].key.clone();
         assert!(trusted.remove(&key));
         let (again, _) = connect(&trusted, issued).await;
@@ -308,7 +329,7 @@ mod tests {
     async fn a_wrong_or_blank_token_is_never_trusted() {
         let mut trusted = Trusted::default();
         let (mut a, _) = connect(&trusted, None).await;
-        a.approve_into(&mut trusted, "Edit Bay 2");
+        a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2");
         for t in [vec![], vec![0u8; 32], vec![1u8; 31], randombytes(32)] {
             assert!(trusted.check(&t).is_none(), "{:?}", t);
         }
@@ -323,7 +344,7 @@ mod tests {
         // by name or by id, but has no token, is a stranger.
         let mut trusted = Trusted::default();
         let (mut a, _) = connect(&trusted, None).await;
-        a.approve_into(&mut trusted, "Edit Bay 2");
+        a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2");
         for claim in ["Edit Bay 2", "123456789", "hwid-of-edit-bay-2"] {
             let (b, _) = connect(&trusted, Some(claim.as_bytes().to_vec())).await;
             assert!(!b.is_trusted(), "{}", claim);

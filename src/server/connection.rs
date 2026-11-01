@@ -1895,7 +1895,15 @@ impl Connection {
         }
         self.authorized = true;
         self.unauthorized_id = None;
-        self.boring_trust.approve(&self.lr.my_name); // v1.7 t04: approved here = Trusted
+        // v1.7 t04: Allow here or the Unattended Password = Trusted; a one-time code is this session only.
+        self.boring_trust.approve(
+            match self.conn_audit_primary_auth {
+                ConnAuditPrimaryAuth::Click => base::trust::SignIn::Allowed,
+                ConnAuditPrimaryAuth::PermanentPassword => base::trust::SignIn::UnattendedPassword,
+                _ => base::trust::SignIn::ThisSessionOnly,
+            },
+            &self.lr.my_name,
+        );
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
         // session remembers, so they are not affected.
