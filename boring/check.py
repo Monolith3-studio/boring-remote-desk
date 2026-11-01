@@ -715,6 +715,27 @@ def trust_checks(c, cfg):
     c.fact("no default or blank password ships (ADR 0002)", not why, "; ".join(why[:10]))
 
 
+def high_efficiency_checks(c):
+    """v1.7 ticket 05 (ADR 0006): a Local link between two Boring Remotes asks for 60 fps, best
+    quality, best software codec. The Target marks itself, the Controller applies it after the
+    first PeerInfo, and the Link Badge reads the stream_type Rust re-reports. No hardware codec."""
+    he = c.read("libs/base/src/high_efficiency.rs")
+    st = re.search(r'pub const STREAM_TYPE: &str = "([^"]+)";', he)
+    hooks = [("src/server/connection.rs",
+              "platform_additions.insert(base::high_efficiency::MARKER.into(), json!(crate::VERSION));"),
+             ("src/client/io_loop.rs", "base::high_efficiency::choose(path, pi, &ours)"),
+             ("src/client/io_loop.rs", "self.apply_high_efficiency(link, &pi, peer).await;"),
+             ("flutter/lib/desktop/kit/session_toolbar.dart",
+              f"'{st.group(1) if st else '?'}' => LinkState.localHighEfficiency,")]
+    missing = [f"{rel}: {n}" for rel, n in hooks if n not in c.read(rel)]
+    if not st:
+        missing.append("high_efficiency.rs: STREAM_TYPE")
+    if re.search(r"PreferCodec::H26[45]", he):
+        missing.append("high_efficiency.rs prefers a hardware codec (ADR 0006)")
+    c.fact("High Efficiency wired: Target marks itself, Controller applies it, badge reads it",
+           not missing, "; ".join(missing))
+
+
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
     plist = c.read("flutter/macos/Runner/Info.plist")
@@ -915,6 +936,7 @@ def run_checks(root):
     activate_link_checks(c)
     simple_settings_checks(c)  # v1.7 t09
     trust_checks(c, cfg)  # v1.7 t04
+    high_efficiency_checks(c)  # v1.7 t05
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")

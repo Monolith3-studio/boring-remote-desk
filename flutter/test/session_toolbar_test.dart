@@ -37,6 +37,8 @@ void main() {
   test('Link Badge follows the path the session actually took (Rust stream_type)', () {
     expect(linkStateFor('Local'), LinkState.local);
     expect(linkStateFor('Tailscale'), LinkState.viaInternet);
+    // v1.7 t05: Rust re-reports a Local session once High Efficiency is actually applied.
+    expect(linkStateFor('LocalHighEfficiency'), LinkState.localHighEfficiency);
     for (final other in ['', 'TCP', 'UDP', 'WebRTC/IPv6', 'other']) {
       expect(linkStateFor(other), LinkState.unknown, reason: other);
     }

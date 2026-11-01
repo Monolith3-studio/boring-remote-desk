@@ -2,13 +2,15 @@ import 'package:flutter/material.dart';
 
 import 'kit.dart';
 
-/// How this session reaches the other Mac. Ticket 03 feeds Local / Via internet; ticket 05 the codec.
+/// How this session reaches the other Mac. Ticket 03 feeds Local / Via internet; ticket 05 High Efficiency.
 enum LinkState { unknown, local, localHighEfficiency, viaInternet }
 
 /// The badge for the session's `stream_type` as Rust reports it (base::direct_link::Path):
 /// "Local" = Direct Link on this network, "Tailscale" = via internet. Anything else is unknown.
+/// "LocalHighEfficiency" = Local, and Rust applied High Efficiency (base::high_efficiency, t05).
 LinkState linkStateFor(String streamType) => switch (streamType) {
       'Local' => LinkState.local,
+      'LocalHighEfficiency' => LinkState.localHighEfficiency,
       'Tailscale' => LinkState.viaInternet,
       _ => LinkState.unknown,
     };

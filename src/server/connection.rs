@@ -2013,6 +2013,10 @@ impl Connection {
             platform_additions.insert("support_view_camera".into(), json!(true));
         }
 
+        // boring-remote (v1.7 t05): tells a Boring Remote Controller this Target is one too
+        // (base::high_efficiency::MARKER); upstream RustDesk never sends the key.
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        platform_additions.insert(base::high_efficiency::MARKER.into(), json!(crate::VERSION));
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if !platform_additions.is_empty() {
             pi.platform_additions = serde_json::to_string(&platform_additions).unwrap_or("".into());
