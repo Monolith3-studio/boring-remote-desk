@@ -706,6 +706,85 @@ PATCHES += [
     ("flutter/lib/main.dart", '  debugPrint("launch args: $args");\n', "", "don't log launch args (may be a link)"),
 ]
 
+# --- Multi-window sessions, each full screen (v1.7 ticket 11) ---------------------
+# New sessions open in their own window: the tabs option defaults off (new installs and
+# upgrades; a stored "Y" from someone who ticked it keeps tabs). The checkbox stays on the
+# settings page (kOptionOpenNewConnInTabs), which ticket 09 moves under Advanced.
+# A full-screen session remembers its monitor per Target: desktop/kit/session_window.dart is
+# the bridge-free decision, these hooks feed it the live frame and screens, and restore moves
+# the window to that monitor before going full screen on Mac too.
+T11_TABS_OPTION = "enable-open-new-connections-in-tabs"
+DEFAULTS_LOCAL = {  # DEFAULT_LOCAL_SETTINGS: user can change
+    T11_TABS_OPTION: "N",
+}
+T11_COMMON = "flutter/lib/common.dart"
+PATCHES += [
+    (HBB, "pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+     "pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = "
+     + _rust_map(DEFAULTS_LOCAL) + ";", "new sessions open in windows, not tabs"),
+    (T11_COMMON, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/session_window.dart';\n",
+     "session window kit import"),
+    (T11_COMMON,
+     "      final wc = WindowController.fromWindowId(windowId!);\n"
+     "      isMaximized = await wc.isMaximized();\n",
+     "      final wc = WindowController.fromWindowId(windowId!);\n"
+     "      isMaximized = await wc.isMaximized();\n"
+     "      // boring-remote: the live frame says which monitor a full-screen window is on.\n"
+     "      try {\n"
+     "        _boringLiveFrame = await wc.getFrame();\n"
+     "      } catch (_) {\n"
+     "        _boringLiveFrame = null;\n"
+     "      }\n",
+     "full-screen session saves its live frame"),
+    (T11_COMMON,
+     "Future _saveSessionWindowPosition(WindowType windowType, int windowId,\n",
+     "Rect? _boringLiveFrame;\n\n"
+     "Future _saveSessionWindowPosition(WindowType windowType, int windowId,\n",
+     "live frame holder"),
+    (T11_COMMON,
+     "  final remoteList = await DesktopMultiWindow.invokeMethod(\n"
+     "      windowId, kWindowEventGetRemoteList, null);\n",
+     "  final remoteList = await DesktopMultiWindow.invokeMethod(\n"
+     "      windowId, kWindowEventGetRemoteList, null);\n"
+     "  final screens = (isMaximized || isFullscreen)\n"
+     "      ? (await window_size.getScreenList()).map((s) => s.frame).toList()\n"
+     "      : const <Rect>[];\n",
+     "screens for the full-screen monitor"),
+    (T11_COMMON,
+     "    if (isMaximized || isFullscreen) {\n"
+     "      final peerPos = bind.mainGetPeerFlutterOptionSync(\n"
+     "          id: peerId, k: windowFramePrefix + windowType.name);\n"
+     "      var lpos = LastWindowPosition.loadFromString(peerPos);\n"
+     "      return LastWindowPosition(\n"
+     "              lpos?.width ?? pos.offsetWidth,\n"
+     "              lpos?.height ?? pos.offsetHeight,\n"
+     "              lpos?.offsetWidth ?? pos.offsetWidth,\n"
+     "              lpos?.offsetHeight ?? pos.offsetHeight,\n"
+     "              isMaximized,\n"
+     "              isFullscreen)\n"
+     "          .toString();\n",
+     "    if (isMaximized || isFullscreen) {\n"
+     "      // boring-remote: remember the monitor this Target is full screen on.\n"
+     "      return peerFrameWhileFull(\n"
+     "          peerSaved: bind.mainGetPeerFlutterOptionSync(\n"
+     "              id: peerId, k: windowFramePrefix + windowType.name),\n"
+     "          live: _boringLiveFrame,\n"
+     "          screens: screens,\n"
+     "          fallback: pos.toJson(),\n"
+     "          fullscreen: isFullscreen,\n"
+     "          maximized: isMaximized);\n",
+     "full-screen Target keeps its monitor"),
+    (T11_COMMON,
+     "        if (!isMacOS) {\n"
+     "          await restoreFrame();\n"
+     "        }\n",
+     "        // boring-remote: Mac too, so full screen lands on the Target's monitor.\n"
+     "        await restoreFrame();\n",
+     "reopen a Target on its monitor before full screen"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

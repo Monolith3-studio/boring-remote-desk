@@ -349,6 +349,21 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, rf"FAIL {NOT_FOUND_TRANSLATED}: .*fr.rs")
 
+    def test_tabs_back_as_the_default_fails_check(self):  # v1.7 t11
+        self.rebrand()
+        self.edit("libs/hbb_common/src/config.rs",
+                  '("enable-open-new-connections-in-tabs", "N")',
+                  '("enable-open-new-connections-in-tabs", "Y")')
+        self.assert_check_fails("new sessions open in windows (tabs option off by default)")
+
+    def test_mac_full_screen_restore_skipping_the_monitor_fails_check(self):  # v1.7 t11
+        self.rebrand()
+        self.edit("flutter/lib/common.dart",
+                  "        // boring-remote: Mac too, so full screen lands on the Target's monitor.\n"
+                  "        await restoreFrame();\n",
+                  "        if (!isMacOS) {\n          await restoreFrame();\n        }\n")
+        self.assert_check_fails("restore moves the window to its monitor before full screen on Mac")
+
     def test_moved_patch_target_stops_the_script_and_writes_nothing(self):
         cfg = self.root / "libs/hbb_common/src/config.rs"
         cfg.write_text(cfg.read_text().replace('&["rs-ny.rustdesk.com"]', '&["rs-sg.rustdesk.com"]'))

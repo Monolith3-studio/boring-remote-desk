@@ -583,6 +583,23 @@ def shipped_files(c, suffixes):
                 yield p.relative_to(c.root).as_posix(), p.read_text(encoding="utf-8", errors="replace")
 
 
+def multi_window_checks(c, cfg):
+    """v1.7 ticket 11: sessions open in windows; a full-screen Target remembers its monitor."""
+    c.fact("new sessions open in windows (tabs option off by default)",
+           rust_map(cfg, "DEFAULT_LOCAL_SETTINGS").get(rebrand.T11_TABS_OPTION) == "N")
+    # Ticket 09 moves this checkbox under Advanced; it must stay reachable on the settings page.
+    c.fact("tabs option still on the settings page (Advanced)",
+           "kOptionOpenNewConnInTabs" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
+    common = c.read(rebrand.T11_COMMON)
+    hooks = ["import 'package:flutter_hbb/desktop/kit/session_window.dart';",
+             "_boringLiveFrame = await wc.getFrame();", "return peerFrameWhileFull(",
+             "window_size.getScreenList()).map((s) => s.frame)"]
+    missing = [h for h in hooks if h not in common]
+    c.fact("full-screen Target remembers its monitor (hooks landed)", not missing, "; ".join(missing))
+    c.fact("restore moves the window to its monitor before full screen on Mac",
+           "if (!isMacOS) {\n          await restoreFrame();" not in common)
+
+
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
     plist = c.read("flutter/macos/Runner/Info.plist")
@@ -774,6 +791,7 @@ def run_checks(root):
     bar = c.read("flutter/lib/desktop/kit/session_toolbar.dart")  # v1.7 t07
     c.fact("Session Toolbar uses kit tokens only",
            not re.search(r"\bColors\.|Color\(|MyTheme", bar))
+    multi_window_checks(c, cfg)  # v1.7 t11
     activate_link_checks(c)
 
     hits, index = [], []
