@@ -1100,12 +1100,16 @@ T04_PROMPT = (
     "      );\n"
     "    }\n")
 CM_PAGE = "flutter/lib/desktop/pages/server_page.dart"
+# t09 left a marked hook line in its Settings method; t04 fills it inside that same patch, so a
+# second rebrand run still finds t09's text and stays a no-op.
+PATCHES[:] = [(rel, old, new.replace(T04_HOOK, T04_SETTINGS_LINK) if rel == SETTINGS and isinstance(new, str) else new, why)
+              for rel, old, new, why in PATCHES]
+assert any(T04_SETTINGS_LINK in new for rel, _, new, _ in PATCHES if rel == SETTINGS), "t09's t04 hook line moved"
 PATCHES += [
     (SETTINGS, "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n",
      "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/trust.dart';\n",
      "Trusted Controllers import"),
-    (SETTINGS, T04_HOOK, T04_SETTINGS_LINK, "Trusted Controllers under Advanced"),
     (CM_PAGE, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
      "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
