@@ -86,9 +86,6 @@ pub struct Remote<T: InvokeUiSession> {
     last_update_jobs_status: (Instant, HashMap<i32, u64>),
     // Set after PeerInfo for this round, not when the transport connects.
     is_connected: bool,
-    // boring-remote (v1.7 t05): the path this round took and its secure/direct flags, until
-    // the first PeerInfo decides High Efficiency.
-    boring_link: Option<(base::direct_link::Path, bool, bool)>,
     // Whether the scheduled initial snapshot may still be sent.
     // The connection loop clears this when handling its result or a live clipboard update.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -141,7 +138,6 @@ impl<T: InvokeUiSession> Remote<T> {
             timer: crate::rustdesk_interval(time::interval(SEC30)),
             last_update_jobs_status: (Instant::now(), Default::default()),
             is_connected: false,
-            boring_link: None,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             initial_clipboard_pending: false,
             first_frame: false,
@@ -221,12 +217,6 @@ impl<T: InvokeUiSession> Remote<T> {
                 };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
-                let path = if stream_type == base::direct_link::Path::Local.stream_type() {
-                    base::direct_link::Path::Local
-                } else {
-                    base::direct_link::Path::ViaInternet
-                };
-                self.boring_link = Some((path, is_secured, direct)); // v1.7 t05
                 if !is_secured
                     && !crate::common::is_direct_ip_access(&self.handler.get_id())
                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
@@ -1534,32 +1524,6 @@ impl<T: InvokeUiSession> Remote<T> {
         return false;
     }
 
-    /// boring-remote (v1.7 t05, ADR 0006): on a Local Direct Link to another Boring Remote, ask
-    /// the Target for 60 fps, best quality and the best shared software codec for this session
-    /// (base::high_efficiency), then re-report the link so the badge says High Efficiency.
-    /// Via internet, or to anything else, nothing is sent and the adaptive defaults stay.
-    async fn apply_high_efficiency(
-        &self,
-        (path, secured, direct): (base::direct_link::Path, bool, bool),
-        pi: &PeerInfo,
-        peer: &mut Stream,
-    ) {
-        if !self.handler.is_default() {
-            return;
-        }
-        let ours = self.handler.lc.read().unwrap().get_supported_decoding();
-        let Some(settings) = base::high_efficiency::choose(path, pi, &ours) else {
-            return;
-        };
-        if let Err(e) = peer.send(&settings.message(ours)).await {
-            log::warn!("High Efficiency not applied: {}", e);
-            return;
-        }
-        log::info!("High Efficiency applied: {:?}", settings);
-        self.handler
-            .set_connection_type(secured, direct, base::high_efficiency::STREAM_TYPE);
-    }
-
     async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {
         if let Ok(msg_in) = Message::parse_from_bytes(&data) {
             match msg_in.union {
@@ -1629,9 +1593,6 @@ impl<T: InvokeUiSession> Remote<T> {
                                 self.handler.lc.write().unwrap().handle_peer_info(&pi);
                                 return false;
                             }
-                        }
-                        if let Some(link) = self.boring_link.take() {
-                            self.apply_high_efficiency(link, &pi, peer).await; // v1.7 t05
                         }
                         self.handler.handle_peer_info(pi);
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]

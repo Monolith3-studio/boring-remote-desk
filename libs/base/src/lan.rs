@@ -1,5 +1,5 @@
 use hbb_common::config::DiscoveryPeer;
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Mutex};
 
 /// Tailscale, RFC 1918 and IPv6 ULA / link-local: the addresses a Target
 /// accepts and the Home list shows (ADR 0003). Public addresses never pass.
@@ -20,9 +20,17 @@ pub fn is_allowed(ip: IpAddr) -> bool {
     }
 }
 
-/// The address Home shows and connects to: an allowed one, IPv4 first.
-/// Empty when the peer only answered from addresses a Target would refuse.
+/// Who answered the last finished discovery cycle (see [`end_cycle`]).
+static ON_NETWORK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The address Home shows and connects to: an allowed one, IPv4 first. Empty when the peer only
+/// answered from addresses a Target would refuse, or has left the network: it answered neither
+/// the cycle running now nor the last finished one.
 pub fn peer_ip(peer: &DiscoveryPeer) -> String {
+    let answered = peer.online || ON_NETWORK.lock().map_or(false, |on| on.contains(&peer.id));
+    if !answered {
+        return String::new();
+    }
     let mut ips: Vec<IpAddr> = peer
         .ip_mac
         .keys()
@@ -33,10 +41,13 @@ pub fn peer_ip(peer: &DiscoveryPeer) -> String {
     ips.first().map(|ip| ip.to_string()).unwrap_or_default()
 }
 
-/// A discovery cycle marks every stored peer offline and back online as it
-/// answers; whoever stayed offline has left the network.
-pub fn drop_stale(peers: &mut Vec<DiscoveryPeer>) {
-    peers.retain(|p| p.online);
+/// The end of a discovery cycle, which marks every stored peer offline and back online as it
+/// answers. Whoever stayed offline has left: Home drops it, while the stored list keeps it for
+/// the old LAN tab and wake-on-LAN.
+pub fn end_cycle(peers: &[DiscoveryPeer]) {
+    if let Ok(mut on) = ON_NETWORK.lock() {
+        *on = peers.iter().filter(|p| p.online).map(|p| p.id.clone()).collect();
+    }
 }
 
 /// The name this Mac was given in Setup / Settings (v1.7 t09 writes it).
@@ -74,10 +85,17 @@ mod tests {
     }
 
     #[test]
-    fn peers_that_did_not_answer_this_cycle_drop_off() {
-        let mut peers = vec![peer("a", true, &["10.0.0.2"]), peer("b", false, &["10.0.0.3"])];
-        drop_stale(&mut peers);
-        assert_eq!(peers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["a"]);
+    fn a_mac_that_left_drops_off_home_but_stays_in_the_stored_list() {
+        let mut peers = vec![peer("left-a", true, &["10.0.0.2"]), peer("left-b", true, &["10.0.0.3"])];
+        end_cycle(&peers);
+        // Next cycle: everyone is offline until they answer. "a" answers, "b" has left.
+        peers[0].online = true;
+        peers[1].online = false;
+        assert_eq!(peer_ip(&peers[1]), "10.0.0.3", "still listed while the cycle runs");
+        end_cycle(&peers);
+        assert_eq!(peer_ip(&peers[0]), "10.0.0.2");
+        assert_eq!(peer_ip(&peers[1]), "", "gone from Home after one cycle");
+        assert_eq!(peers.len(), 2, "the LAN tab and wake-on-LAN keep it");
     }
 
     #[test]

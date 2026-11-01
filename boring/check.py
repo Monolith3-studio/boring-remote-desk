@@ -558,31 +558,43 @@ def connect_checks(c):
         if need not in is_ts:
             why.append(f"Tailscale test is not {need}")
     race = fn_body(link, "pub async fn race<") or ""
-    if "bail!(NOT_ON_THIS_NETWORK)" not in race or "Ok(Err(Failure::Refused(e))) => return Err(e)," not in race:
+    if "bail!(NOT_ON_THIS_NETWORK)" not in race or "Err(Failure::Refused(e)) => return Err(e)," not in race:
         why.append("race no longer ends in Not on this network, or falls back past a refusal")
+    if "hbb_common::timeout(ms, connect(addr)).await" not in race or "match handshake(s, addr).await {" not in race:
+        why.append("the ~1 s no-answer budget no longer covers the TCP connect only")
     c.fact("connect box dials only Tailscale or private-LAN addresses, else the plain error", not why, "; ".join(why))
 
-    dial = fn_body(link, "pub async fn dial(") or ""
+    dial = fn_body(link, "pub async fn handshake(") or ""
     must = fn_body(link, "pub fn must_encrypt(ip: IpAddr) -> bool {") or ""
     server = c.read("src/server.rs")
     mediator = c.read("src/rendezvous_mediator.rs")
     why = []
     if must.strip() != "!is_tailscale(ip)":
         why.append(f"must_encrypt is not exactly !is_tailscale: {must.strip()!r}")
-    if "if !must_encrypt(addr.ip()) {\n        return Ok((stream, None));\n    }\n    let who = secure(&mut stream, known, ms).await?;\n" \
+    if "if !must_encrypt(addr.ip()) {\n        return Ok((stream, None));\n    }\n    let who = secure(&mut stream, known, addr, ms).await?;\n" \
             "    if !stream.is_secured() {\n        return Err(Failure::Refused(" not in dial:
         why.append("controller: a non-Tailscale dial is not handshake-then-is_secured")
-    if "if direct_link {\n        base::direct_link::require_encrypted(addr.ip(), &stream)?;\n    }" not in server:
+    if rebrand.T03_HANDSHAKE_CALL not in server:
         why.append("target: create_tcp_connection does not refuse an unkeyed Direct Link")
-    if "let encrypt = base::direct_link::must_encrypt(hbb_common::try_into_v4(addr).ip());" not in mediator \
-            or "direct_link: encrypt," not in mediator:
+    if rebrand.T03_LISTENER not in mediator:
         why.append("target: the direct listener does not ask for encryption off Tailscale")
     c.fact("Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)", not why, "; ".join(why))
 
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [f"{p.name}: {name}" for p in langs for name, text in rebrand.CONNECT_ERRORS.items()
                if p.read_text(encoding="utf-8").count(f'("{text}", ') != 1]
-    c.fact("plain not-found error is in every translation file", langs and not missing, ", ".join(missing[:10]))
+    c.fact("every connect error (not found, not on this network, refused, identity changed) is in every translation file",
+           langs and not missing, ", ".join(missing[:10]))
+
+    secure = fn_body(link, "pub async fn secure(") or ""
+    pin = fn_body(link, "pub fn pin_ok(") or ""
+    why = []
+    if "if !known.pin_ok(dialled, &id_pk.id, &sign_pk) {\n        return Err(refused(IDENTITY_CHANGED));" not in secure:
+        why.append("secure() does not check the pin for the address it dialled")
+    if "t.lan != lan || (known_id == id && t.pk == pk)" not in pin or "self.0.get(id).map_or(true, |t| t.pk == pk)" not in pin:
+        why.append("pin_ok no longer keeps an address's Target and an ID's key")
+    c.fact("Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)",
+           not why, "; ".join(why))
 
 
 # ADR 0004 (docs/adr/0004-in-app-updater.md, supersedes 0003): the app may fetch
@@ -632,7 +644,8 @@ def multi_window_checks(c, cfg):
     missing = [h for h in hooks if h not in common]
     c.fact("full-screen Target remembers its monitor (hooks landed)", not missing, "; ".join(missing))
     c.fact("restore moves the window to its monitor before full screen on Mac",
-           "if (!isMacOS) {\n          await restoreFrame();" not in common)
+           "        // boring-remote: Mac too, so full screen lands on the Target's monitor.\n"
+           "        await restoreFrame();\n" in common and "if (!isMacOS) {\n          await restoreFrame();" not in common)
 
 
 # Colours an extras screen may not use once rebranded: upstream theme statics and raw colours.
@@ -742,20 +755,19 @@ def trust_checks(c, cfg):
     a token this Target issued and still trusts. Nothing ships a default password."""
     hooks = [
         (DIRECT_LINK, "crate::trust::present_for(&mut stream, &who.id, ms)"),
-        ("src/server.rs", "return base::trust::answer(stream, &base::trust::Trusted::load(), CONNECT_TIMEOUT).await;"),
-        ("src/server.rs", "handshake = boring_direct_link_handshake(&mut stream, secure, direct_link) => meta.trust = handshake?,"),
-        ("src/server/connection.rs", "trust: boring_trust,"),
-        ("src/server/connection.rs", "if self.boring_trust.is_trusted() {"),
-        ("src/server/connection.rs", "self.boring_trust.approve(&self.lr.my_name);"),
+        ("src/server.rs", rebrand.T03_HANDSHAKE_FN),
+        ("src/server.rs", rebrand.T03_HANDSHAKE_CALL),
+        ("src/server/connection.rs", rebrand.T04_TRUSTED_SKIP),
+        ("src/server/connection.rs", rebrand.T04_GRANT),
         (rebrand.SETTINGS, "label: 'Trusted Controllers',"),
         (rebrand.SETTINGS, "TrustedControllersPage("),
         (rebrand.CM_PAGE, "ApprovalPrompt("),
     ]
-    missing = [f"{rel}: {n}" for rel, n in hooks if n not in c.read(rel)]
+    missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
     conn = c.read("src/server/connection.rs")
-    # The trusted skip must sit inside the login decision, before the approve-mode ask.
-    i, j = conn.find("if self.boring_trust.is_trusted() {"), conn.find("if (password::approve_mode() == ApproveMode::Click")
-    if not (0 <= i < j):
+    # The trusted skip must sit inside the login decision, right before the approve-mode ask.
+    i, j = conn.find(rebrand.T04_TRUSTED_SKIP), conn.find("if (password::approve_mode() == ApproveMode::Click")
+    if i < 0 or conn[i + len(rebrand.T04_TRUSTED_SKIP):j].strip():
         missing.append("connection.rs: trusted skip is not right before the approve-mode ask")
     c.fact("LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)",
            not missing, "; ".join(missing))
@@ -769,9 +781,19 @@ def trust_checks(c, cfg):
         d = re.search(rf"const {dname} = '([^']+)';", dart)
         if not r or not d or r.group(1) != d.group(1):
             off.append(f"{rname} vs {dname}")
-    if "const TOKEN_LEN: usize = 32;" not in rs or "randombytes(TOKEN_LEN)" not in rs or "memcmp(" not in rs:
+    check = fn_body(rs, "    pub fn check(&self, token: &[u8]) -> Option<&TrustedController> {") or ""
+    if "const TOKEN_LEN: usize = 32;" not in rs or "randombytes(TOKEN_LEN)" not in (fn_body(rs, "pub async fn answer(") or "") \
+            or "if token.len() != TOKEN_LEN {" not in check or "memcmp(&k, &d)" not in check:
         off.append("token is not 256 random bits compared in constant time")
     c.fact("trust tokens: 256-bit, constant-time, option names agree in Rust and Dart", not off, "; ".join(off))
+
+    grant = fn_body(rs, "    fn approve_into(") or ""
+    once = [n for n, ok in [
+        ("Allow and the Unattended Password map to lasting trust, everything else to this session",
+         rebrand.T04_GRANT in conn and "_ => base::trust::SignIn::ThisSessionOnly," in rebrand.T04_GRANT),
+        ("approve_into stores nothing for ThisSessionOnly", "Some(key) if how != SignIn::ThisSessionOnly => {" in grant),
+    ] if not ok]
+    c.fact("a one-time code lets a Controller in for that session only (ADR 0005)", not once, "; ".join(once))
 
     why = [f"rebrand map sets {k}" for d in (rebrand.LOCKED, rebrand.DEFAULTS, rebrand.LOCKED_LOCAL)
            for k in d if PASSWORDISH.search(k)]
@@ -799,18 +821,33 @@ def high_efficiency_checks(c):
     first PeerInfo, and the Link Badge reads the stream_type Rust re-reports. No hardware codec."""
     he = c.read("libs/base/src/high_efficiency.rs")
     st = re.search(r'pub const STREAM_TYPE: &str = "([^"]+)";', he)
-    hooks = [("src/server/connection.rs",
-              "platform_additions.insert(base::high_efficiency::MARKER.into(), json!(crate::VERSION));"),
-             ("src/client/io_loop.rs", "base::high_efficiency::choose(path, pi, &ours)"),
-             ("src/client/io_loop.rs", "self.apply_high_efficiency(link, &pi, peer).await;"),
+    hooks = [("src/server/connection.rs", rebrand.T05_MARKER), ("src/server/connection.rs", rebrand.T05_ANSWER),
+             ("src/client/io_loop.rs", rebrand.T05_LINK_SET), ("src/client/io_loop.rs", rebrand.T05_ASK_FN),
+             ("src/client/io_loop.rs", rebrand.T05_ASK_CALL), ("src/client/io_loop.rs", rebrand.T05_BADGE),
              ("flutter/lib/desktop/kit/session_toolbar.dart",
               f"'{st.group(1) if st else '?'}' => LinkState.localHighEfficiency,")]
-    missing = [f"{rel}: {n}" for rel, n in hooks if n not in c.read(rel)]
+    missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
     if not st:
         missing.append("high_efficiency.rs: STREAM_TYPE")
     if re.search(r"PreferCodec::H26[45]", he):
         missing.append("high_efficiency.rs prefers a hardware codec (ADR 0006)")
-    c.fact("High Efficiency wired: Target marks itself, Controller applies it, badge reads it",
+    c.fact("High Efficiency wired: Target marks itself and answers the ask, badge waits for the answer",
+           not missing, "; ".join(missing))
+
+
+def rust_hook_checks(c):
+    """v1.7: our Rust lives in new files under libs/base/src; upstream files only get these hooks,
+    through rebrand.py. On a raw checkout every one of them is missing."""
+    hooks = [
+        (rebrand.BASE_LIB, rebrand.BASE_MODS),
+        (rebrand.SERVER, rebrand.T03_META_FIELDS),
+        (rebrand.MEDIATOR, "        ..Default::default() // boring-remote: Direct Link fields stay off here (v1.7 t03)\n"),
+        ("src/lan.rs", rebrand.T02_END_CYCLE),
+        ("src/ui_interface.rs", rebrand.T02_HOME_IP),
+        ("src/client.rs", rebrand.CONTROLLER_NAME),
+    ]
+    missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
+    c.fact("v1.7 Rust hooks landed: base modules, Direct Link meta, LAN end of cycle, Controller name",
            not missing, "; ".join(missing))
 
 
@@ -997,7 +1034,7 @@ def run_checks(root):
         (rebrand.HOME, "MacHome("), (rebrand.HOME, "Kit.theme()"),
         (rebrand.HOME, "lan: lanMacs.macs,"), (rebrand.HOME, "discover: () => bind.mainDiscover(),"),  # v1.7 t02
         ("libs/base/src/lan.rs", f'DEVICE_NAME_OPTION: &str = "{rebrand.BORING_MAC_NAME_OPTION}";'),
-        ("src/lan.rs", "base::lan::advertised_name("),  # LAN pong names this Mac as Settings does
+        ("src/lan.rs", rebrand.T02_PONG_NAME),  # LAN pong names this Mac as Settings does
         (rebrand.T07_TOOLBAR, "..add(buildBoringSessionToolbar(context, more));"),  # v1.7 t07
         (rebrand.T07_TOOLBAR, "SessionToolbar("),
         (rebrand.T07_TOOLBAR, "final link = linkStateFor(linkType.stream_type.value);"),  # v1.7 t03 Link Badge
@@ -1017,6 +1054,7 @@ def run_checks(root):
     setup_checks(c)  # v1.7 t06
     windows_checks(c)  # v1.7 t12
     high_efficiency_checks(c)  # v1.7 t05
+    rust_hook_checks(c)  # v1.7 t02-t05
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")

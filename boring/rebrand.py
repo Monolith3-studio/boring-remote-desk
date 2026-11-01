@@ -562,6 +562,245 @@ PATCHES += [
      "license key option name (home banner)"),
 ]
 
+# --- Rust hooks for v1.7 (tickets 02-05; ADRs 0003-0006) ---------------------------
+# Our logic lives in new files in libs/base/src (direct_link, trust, lan, high_efficiency,
+# update_feed; their tests run from libs/base/tests/boring.rs). These patches only wire it into
+# upstream: base's mod lines, the Direct Link listener and handshake (server side), the trust
+# skip and grant, the High Efficiency marker and answer, the Controller's ask and badge, LAN
+# Discovery's name and end of cycle. check.py asserts each hook text below landed.
+BASE_LIB = "libs/base/src/lib.rs"
+SERVER = "src/server.rs"
+CONN = "src/server/connection.rs"
+IO_LOOP = "src/client/io_loop.rs"
+MEDIATOR = "src/rendezvous_mediator.rs"
+BASE_MODS = ("// boring-remote (v1.7): ours, see libs/base/tests/boring.rs\n"
+             "pub mod direct_link;\npub mod high_efficiency;\npub mod lan;\npub mod trust;\npub mod update_feed;\n")
+# Target: the direct listener asks for encryption off Tailscale (ADR 0005) and marks the Direct Link.
+T03_LISTENER = (
+    "                // boring-remote: encrypted everywhere but Tailscale (v1.7 t03, ADR 0005).\n"
+    "                let encrypt = base::direct_link::must_encrypt(hbb_common::try_into_v4(addr).ip());\n"
+    "                tokio::spawn(async move {\n"
+    "                    allow_err!(\n"
+    "                        crate::server::create_tcp_connection(\n"
+    "                            server,\n"
+    "                            hbb_common::Stream::from(stream, local_addr),\n"
+    "                            addr,\n"
+    "                            encrypt,\n"
+    "                            ConnectionMeta {\n"
+    "                                direct_link: encrypt,\n"
+    "                                ..Default::default()\n"
+    "                            }, // Direct connections don't have server-side user context.\n")
+T03_META_FIELDS = (
+    "    /// boring-remote: an encrypted Direct Link (v1.7 t03, ADR 0005), see base::direct_link.\n"
+    "    pub direct_link: bool,\n"
+    "    /// boring-remote: what the Direct Link trust exchange found (v1.7 t04), see base::trust.\n"
+    "    pub trust: base::trust::Admission,\n")
+# Target: announce + signed handshake + trust exchange, raced against eviction as upstream's was.
+T03_HANDSHAKE_CALL = (
+    "    let direct_link = meta.direct_link;\n"
+    "    let trust = tokio::select! {\n"
+    "        handshake = boring_direct_link_handshake(&mut stream, secure, direct_link) => handshake?,\n"
+    "        _ = unauthorized.evicted() => {\n"
+    "            bail!(\"evicted to make room for a newer unauthenticated connection\");\n"
+    "        }\n"
+    "    };\n"
+    "    if direct_link {\n"
+    "        base::direct_link::require_encrypted(addr.ip(), &stream)?;\n"
+    "    }\n"
+    "    let meta = ConnectionMeta { trust, ..meta };\n")
+T03_HANDSHAKE_FN = (
+    "/// boring-remote (v1.7 t03): a Direct Link first announces our identity key and Tailscale\n"
+    "/// address (base::direct_link::announce), then runs the usual signed handshake, then the trust\n"
+    "/// exchange inside the keyed stream (v1.7 t04, base::trust).\n"
+    "async fn boring_direct_link_handshake(\n"
+    "    stream: &mut Stream,\n"
+    "    secure: bool,\n"
+    "    direct_link: bool,\n"
+    ") -> ResultType<base::trust::Admission> {\n"
+    "    if direct_link {\n"
+    "        // Listing interfaces blocks: off the async path, once per Direct Link.\n"
+    "        let tailscale = tokio::task::spawn_blocking(boring_tailscale_ip).await.unwrap_or_default();\n"
+    "        base::direct_link::announce(stream, &Config::get_key_pair().1, tailscale).await?;\n"
+    "    }\n"
+    "    identity_handshake(stream, secure).await?;\n"
+    "    if direct_link && stream.is_secured() {\n"
+    "        return base::trust::answer(stream, &base::trust::Trusted::load(), CONNECT_TIMEOUT).await;\n"
+    "    }\n"
+    "    Ok(Default::default())\n"
+    "}\n"
+    "\n"
+    "fn boring_tailscale_ip() -> Option<std::net::IpAddr> {\n"
+    "    default_net::get_interfaces()\n"
+    "        .iter()\n"
+    "        .flat_map(|i| i.ipv4.iter().map(|a| std::net::IpAddr::V4(a.addr)))\n"
+    "        .find(|ip| base::direct_link::is_tailscale(*ip))\n"
+    "}\n"
+    "\n")
+T04_TRUSTED_SKIP = (
+    "            // boring-remote (v1.7 t04): only a token this Mac issued skips the ask (ADR 0005).\n"
+    "            if self.boring_trust.is_trusted() {\n"
+    "                if !self.send_logon_response_and_keep_alive().await {\n"
+    "                    return false;\n"
+    "                }\n"
+    "                self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n"
+    "                return true;\n"
+    "            }\n")
+# ADR 0005: Allow here or the Unattended Password makes a Controller Trusted; a one-time code
+# (or the recent-session password) lets it in for this session only.
+T04_GRANT = (
+    "        // boring-remote (v1.7 t04): Allow or the Unattended Password = Trusted; a one-time code\n"
+    "        // is this session only (ADR 0005).\n"
+    "        self.boring_trust.approve(\n"
+    "            match self.conn_audit_primary_auth {\n"
+    "                ConnAuditPrimaryAuth::Click => base::trust::SignIn::Allowed,\n"
+    "                ConnAuditPrimaryAuth::PermanentPassword => base::trust::SignIn::UnattendedPassword,\n"
+    "                _ => base::trust::SignIn::ThisSessionOnly,\n"
+    "            },\n"
+    "            &self.lr.my_name,\n"
+    "        );\n")
+T05_MARKER = (
+    "        // boring-remote (v1.7 t05): tells a Boring Remote Controller this Target is one too\n"
+    "        // (base::high_efficiency::MARKER); upstream RustDesk never sends the key.\n"
+    "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+    "        platform_additions.insert(base::high_efficiency::MARKER.into(), json!(crate::VERSION));\n")
+T05_ANSWER = (
+    "                            // boring-remote (v1.7 t05): tell a Boring Remote Controller its\n"
+    "                            // High Efficiency ask took; only then does its badge say so.\n"
+    "                            if let Some(answer) = base::high_efficiency::ack_for(&o) {\n"
+    "                                self.send(answer).await;\n"
+    "                            }\n")
+T05_LINK_FIELD = (
+    "    // boring-remote (v1.7 t05): this round's path until the Target answers High Efficiency.\n"
+    "    boring_link: Option<base::high_efficiency::Link>,\n")
+T05_LINK_SET = "                self.boring_link = Some(base::high_efficiency::Link::new(stream_type, is_secured, direct)); // v1.7 t05\n"
+T05_ASK_FN = (
+    "    /// boring-remote (v1.7 t05, ADR 0006): on a Local Direct Link to another Boring Remote, ask\n"
+    "    /// the Target for 60 fps, best quality and the best shared software codec for this session\n"
+    "    /// (base::high_efficiency). The badge waits for the Target's answer.\n"
+    "    async fn ask_high_efficiency(&mut self, pi: &PeerInfo, peer: &mut Stream) {\n"
+    "        let ours = self.handler.lc.read().unwrap().get_supported_decoding();\n"
+    "        let ask = match self.boring_link.as_mut() {\n"
+    "            Some(link) if self.handler.is_default() => link.ask(pi, ours),\n"
+    "            _ => None,\n"
+    "        };\n"
+    "        if let Some(ask) = ask {\n"
+    "            if let Err(e) = peer.send(&ask).await {\n"
+    "                log::warn!(\"High Efficiency not asked: {}\", e);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "\n")
+T05_ASK_CALL = "                        self.ask_high_efficiency(&pi, peer).await; // v1.7 t05\n"
+T05_BADGE = (
+    "                    Some(misc::Union::Option(o)) => {\n"
+    "                        // boring-remote (v1.7 t05): the Target applied High Efficiency.\n"
+    "                        if let Some(link) = self.boring_link.as_mut() {\n"
+    "                            if link.answered(&o) {\n"
+    "                                self.handler.set_connection_type(\n"
+    "                                    link.secured,\n"
+    "                                    link.direct,\n"
+    "                                    base::high_efficiency::STREAM_TYPE,\n"
+    "                                );\n"
+    "                            }\n"
+    "                        }\n"
+    "                    }\n")
+T02_PONG_NAME = (
+    "                                    hostname: base::lan::advertised_name(\n"
+    "                                        &Config::get_option(base::lan::DEVICE_NAME_OPTION),\n"
+    "                                        hostname,\n"
+    "                                    ),\n")
+T02_END_CYCLE = "    base::lan::end_cycle(&peers); // v1.7 t02: Home drops Macs that left; the list keeps them\n"
+T02_HOME_IP = "                (\"ip\", base::lan::peer_ip(peer)), // v1.7 t02: Home's address, \"\" once it left\n"
+CONTROLLER_NAME = (
+    "        // boring-remote (v1.7): the Target's approval prompt names this computer, as Setup named it.\n"
+    "        let mut display_name = base::lan::advertised_name(\n"
+    "            &crate::ui_interface::get_option(base::lan::DEVICE_NAME_OPTION),\n"
+    "            crate::common::hostname(),\n"
+    "        );\n")
+PATCHES += [
+    (BASE_LIB, "pub mod protos;\n", "pub mod protos;\n" + BASE_MODS, "base: our v1.7 modules"),
+    (MEDIATOR,
+     "    ConnectionMeta {\n        control_permissions,\n        controlled_context,\n    }\n",
+     "    ConnectionMeta {\n        control_permissions,\n        controlled_context,\n"
+     "        ..Default::default() // boring-remote: Direct Link fields stay off here (v1.7 t03)\n    }\n",
+     "rendezvous sessions are never a Direct Link"),
+    (MEDIATOR,
+     "                tokio::spawn(async move {\n"
+     "                    allow_err!(\n"
+     "                        crate::server::create_tcp_connection(\n"
+     "                            server,\n"
+     "                            hbb_common::Stream::from(stream, local_addr),\n"
+     "                            addr,\n"
+     "                            false,\n"
+     "                            ConnectionMeta::default(), // Direct connections don't have server-side user context.\n",
+     T03_LISTENER, "direct listener: encrypted Direct Link off Tailscale (ADR 0005)"),
+    (SERVER, "    pub controlled_context: Option<ControlledContext>,\n",
+     "    pub controlled_context: Option<ControlledContext>,\n" + T03_META_FIELDS, "Direct Link + trust on ConnectionMeta"),
+    (SERVER,
+     "    tokio::select! {\n"
+     "        handshake = identity_handshake(&mut stream, secure) => handshake?,\n"
+     "        _ = unauthorized.evicted() => {\n"
+     "            bail!(\"evicted to make room for a newer unauthenticated connection\");\n"
+     "        }\n"
+     "    }\n",
+     T03_HANDSHAKE_CALL, "Direct Link handshake + trust exchange, still raced against eviction"),
+    (SERVER, "/// Our signed identity goes out and, when `secure`, the controller's reply keys `stream`.\n",
+     T03_HANDSHAKE_FN + "/// Our signed identity goes out and, when `secure`, the controller's reply keys `stream`.\n",
+     "Direct Link handshake (announce, sign, trust)"),
+    (CONN, "    tx_to_cm: mpsc::UnboundedSender<ipc::Data>,\n    authorized: bool,\n",
+     "    tx_to_cm: mpsc::UnboundedSender<ipc::Data>,\n    authorized: bool,\n"
+     "    // boring-remote: the Direct Link trust exchange (v1.7 t04, base::trust).\n"
+     "    boring_trust: base::trust::Admission,\n", "trust on the connection"),
+    (CONN, "            control_permissions,\n            controlled_context,\n        } = meta;\n",
+     "            control_permissions,\n            controlled_context,\n            trust: boring_trust,\n            ..\n        } = meta;\n",
+     "trust from ConnectionMeta"),
+    (CONN, "            controlled_context,\n            lr: Default::default(),\n",
+     "            controlled_context,\n            boring_trust,\n            lr: Default::default(),\n", "trust on the connection"),
+    (CONN, "        self.authorized = true;\n        self.unauthorized_id = None;\n",
+     "        self.authorized = true;\n        self.unauthorized_id = None;\n" + T04_GRANT, "Trusted by Allow or the Unattended Password only"),
+    (CONN, "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+           "        if !platform_additions.is_empty() {\n",
+     T05_MARKER + "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+                  "        if !platform_additions.is_empty() {\n", "Boring Remote marker in PeerInfo"),
+    (CONN, "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
+     T04_TRUSTED_SKIP + "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
+     "a Trusted Controller skips the ask"),
+    (CONN, "                    Some(misc::Union::Option(o)) => {\n"
+           "                        if self.authed_conn_type() == Some(AuthConnType::Remote) {\n"
+           "                            self.update_options(&o).await;\n",
+     "                    Some(misc::Union::Option(o)) => {\n"
+     "                        if self.authed_conn_type() == Some(AuthConnType::Remote) {\n"
+     "                            self.update_options(&o).await;\n" + T05_ANSWER, "answer the High Efficiency ask"),
+    (IO_LOOP, "    is_connected: bool,\n", "    is_connected: bool,\n" + T05_LINK_FIELD, "High Efficiency link state"),
+    (IO_LOOP, "            is_connected: false,\n", "            is_connected: false,\n            boring_link: None,\n",
+     "High Efficiency link state"),
+    (IO_LOOP, "                    .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready\n",
+     "                    .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready\n" + T05_LINK_SET,
+     "remember this round's path"),
+    (IO_LOOP, "    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {\n",
+     T05_ASK_FN + "    async fn handle_msg_from_peer(&mut self, data: &[u8], peer: &mut Stream) -> bool {\n",
+     "High Efficiency ask"),
+    (IO_LOOP, "                        self.handler.handle_peer_info(pi);\n",
+     T05_ASK_CALL + "                        self.handler.handle_peer_info(pi);\n", "ask on the first PeerInfo"),
+    (IO_LOOP, "                    Some(misc::Union::FollowCurrentDisplay(d_idx)) => {\n"
+              "                        self.handler.set_current_display(d_idx);\n"
+              "                    }\n",
+     "                    Some(misc::Union::FollowCurrentDisplay(d_idx)) => {\n"
+     "                        self.handler.set_current_display(d_idx);\n"
+     "                    }\n" + T05_BADGE, "badge once the Target answered"),
+    ("src/lan.rs", "                                    hostname,\n                                    username: crate::platform::get_active_username(),\n",
+     T02_PONG_NAME + "                                    username: crate::platform::get_active_username(),\n",
+     "LAN Discovery answers with this Mac's name"),
+    ("src/lan.rs", "\n    config::LanPeers::store(&peers);\n    #[cfg(feature = \"flutter\")]\n"
+                   "    crate::flutter_ffi::main_load_lan_peers();\n    Ok(())\n}\n",
+     "\n" + T02_END_CYCLE + "    config::LanPeers::store(&peers);\n    #[cfg(feature = \"flutter\")]\n"
+     "    crate::flutter_ffi::main_load_lan_peers();\n    Ok(())\n}\n", "end of a discovery cycle"),
+    ("src/ui_interface.rs", "                (\"platform\", peer.platform.clone()),\n            ])\n",
+     "                (\"platform\", peer.platform.clone()),\n" + T02_HOME_IP + "            ])\n", "Home's address for a LAN Mac"),
+    ("src/client.rs", "        let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);\n",
+     CONTROLLER_NAME, "the approval prompt names the Controller computer"),
+]
+
 # --- Mac Home (v1.7 ticket 01) ----------------------------------------------------
 # The kit (desktop/kit/kit.dart) and Mac Home (desktop/kit/mac_home.dart) are ours and
 # bridge-free; these wire them to bind. Mac only: other platforms keep the old home for now.
@@ -1100,11 +1339,8 @@ T04_PROMPT = (
     "      );\n"
     "    }\n")
 CM_PAGE = "flutter/lib/desktop/pages/server_page.dart"
-# t09 left a marked hook line in its Settings method; t04 fills it inside that same patch, so a
-# second rebrand run still finds t09's text and stays a no-op.
-PATCHES[:] = [(rel, old, new.replace(T04_HOOK, T04_SETTINGS_LINK) if rel == SETTINGS and isinstance(new, str) else new, why)
-              for rel, old, new, why in PATCHES]
-assert any(T04_SETTINGS_LINK in new for rel, _, new, _ in PATCHES if rel == SETTINGS), "t09's t04 hook line moved"
+# t09 left a marked hook line in its Settings method; t04 fills it inside that same patch (see
+# _fold_v17), so a second rebrand run still finds t09's text and stays a no-op.
 PATCHES += [
     (SETTINGS, "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n",
      "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n"
@@ -1177,7 +1413,7 @@ T06_RUN_AGAIN = (
     "            ),\n"
     "          )),\n")
 # The import, the first-launch branch and the Settings button land inside t01's and t09's own
-# patches (as t04 did), so a second rebrand still finds their text whole and stays a no-op.
+# patches (as t04 did, see _fold_v17), so a second rebrand still finds their text whole and stays a no-op.
 T06_FOLDS = {
     (HOME, "Mac Home imports"): ("import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n",
                                 "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
@@ -1187,10 +1423,6 @@ T06_FOLDS = {
         T06_FIRST_LAUNCH + "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n"),
     (SETTINGS, "simple Settings wiring"): ("          advanced: [\n", T06_RUN_AGAIN + "          advanced: [\n"),
 }
-PATCHES[:] = [(rel, old, new.replace(*T06_FOLDS[rel, why]) if (rel, why) in T06_FOLDS else new, why)
-              for rel, old, new, why in PATCHES]
-assert all(any(r == rel and w == why and T06_FOLDS[rel, why][1] in new for r, _, new, w in PATCHES)
-           for rel, why in T06_FOLDS), "t01/t09 patch text moved under t06"
 PATCHES += [
     (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
      T06_SETUP_PAGE + "class _DesktopHomePageState extends State<DesktopHomePage>\n",
@@ -1250,8 +1482,28 @@ def _t12(text):
     return text
 
 
-PATCHES[:] = [(rel, _t12(old), _t12(new), why) for rel, old, new, why in PATCHES]
-assert all(any(b in new for _, _, new, _ in PATCHES) for _, b in T12_EDITS), "a v1.7 Mac gate moved under t12"
+def _require(ok, why):
+    """A structural guard on this script's own patch list; unlike assert, it survives python -O."""
+    if not ok:
+        raise RuntimeError(f"rebrand.py patch list is inconsistent: {why}")
+
+
+def _fold_v17(rel, old, new, why):
+    """The later v1.7 tickets write into earlier blocks' own patch text, in ticket order: t04's
+    Trusted Controllers link into t09's Settings hook line, t06's folds into t01/t09, then t12's
+    Mac-only gates opened to Windows, old and new alike."""
+    if rel == SETTINGS and isinstance(new, str):
+        new = new.replace(T04_HOOK, T04_SETTINGS_LINK)
+    if (rel, why) in T06_FOLDS:
+        new = new.replace(*T06_FOLDS[rel, why])
+    return rel, _t12(old), _t12(new), why
+
+
+PATCHES[:] = [_fold_v17(*p) for p in PATCHES]
+_require(any(T04_SETTINGS_LINK in new for rel, _, new, _ in PATCHES if rel == SETTINGS), "t09's t04 hook line moved")
+_require(all(any(r == rel and w == why and _t12(T06_FOLDS[rel, why][1]) in new for r, _, new, w in PATCHES)
+             for rel, why in T06_FOLDS), "t01/t09 patch text moved under t06")
+_require(all(any(b in new for _, _, new, _ in PATCHES) for _, b in T12_EDITS), "a v1.7 Mac gate moved under t12")
 PATCHES += [
     ("flutter/lib/main.dart", "import 'package:flutter_hbb/common/widgets/overlay.dart';\n",
      "import 'package:flutter_hbb/common/widgets/overlay.dart';\n"

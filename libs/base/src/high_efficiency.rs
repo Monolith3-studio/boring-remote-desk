@@ -53,7 +53,7 @@ pub fn choose(link: Path, peer: &PeerInfo, ours: &SupportedDecoding) -> Option<S
 
 pub const FPS: i32 = 60;
 
-/// The `stream_type` the Controller re-reports once High Efficiency went out, so the Link Badge
+/// The `stream_type` the Controller re-reports once the Target answered the ask, so the Link Badge
 /// reads "Local · High Efficiency" only when it was actually applied (Flutter `linkStateFor`).
 pub const STREAM_TYPE: &str = "LocalHighEfficiency";
 
@@ -74,6 +74,71 @@ impl Settings {
         msg.set_misc(misc);
         msg
     }
+}
+
+/// What the Controller holds for one connection round, from connect until the Target answers
+/// the High Efficiency ask (src/client/io_loop.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    pub path: Path,
+    pub secured: bool,
+    pub direct: bool,
+    asked: bool,
+}
+
+impl Link {
+    pub fn new(stream_type: &str, secured: bool, direct: bool) -> Self {
+        let path = if stream_type == Path::Local.stream_type() { Path::Local } else { Path::ViaInternet };
+        Link { path, secured, direct, asked: false }
+    }
+
+    /// The first PeerInfo of the round: the High Efficiency ask to send, once, if [`choose`] says
+    /// so. `ours` is what this Controller decodes.
+    pub fn ask(&mut self, peer: &PeerInfo, ours: SupportedDecoding) -> Option<Message> {
+        if self.asked {
+            return None;
+        }
+        let settings = choose(self.path, peer, &ours)?;
+        self.asked = true;
+        log::info!("High Efficiency asked: {:?}", settings);
+        Some(settings.message(ours))
+    }
+
+    /// A misc option from the Target. True once, when it is the Target's answer to our ask: only
+    /// then does the badge say High Efficiency (re-report [`STREAM_TYPE`]).
+    pub fn answered(&mut self, o: &OptionMessage) -> bool {
+        if !self.asked || !is_answer(o) {
+            return false;
+        }
+        self.asked = false;
+        true
+    }
+}
+
+fn is_best_at_full_rate(o: &OptionMessage) -> bool {
+    o.image_quality.enum_value() == Ok(ImageQuality::Best) && o.custom_fps == FPS
+}
+
+fn is_answer(o: &OptionMessage) -> bool {
+    is_best_at_full_rate(o) && o.supported_decoding.is_none()
+}
+
+/// Target side, after `update_options` applied `o`: the answer to a High Efficiency ask (best
+/// quality, 60 fps and a codec choice in one message, which only a Boring Remote Controller sends).
+/// Anything else, such as a quality picked by hand, gets `None`.
+pub fn ack_for(o: &OptionMessage) -> Option<Message> {
+    if !is_best_at_full_rate(o) || o.supported_decoding.is_none() {
+        return None;
+    }
+    let mut misc = Misc::new();
+    misc.set_option(OptionMessage {
+        image_quality: ImageQuality::Best.into(),
+        custom_fps: FPS,
+        ..Default::default()
+    });
+    let mut msg = Message::new();
+    msg.set_misc(misc);
+    Some(msg)
 }
 
 #[cfg(test)]
@@ -144,5 +209,31 @@ mod tests {
         assert_eq!(d.prefer.enum_value(), Ok(PreferCodec::AV1));
         assert_eq!((d.ability_vp9, d.ability_av1), (1, 1), "abilities stay what this Mac decodes");
         assert_eq!(STREAM_TYPE, "LocalHighEfficiency", "what Flutter's linkStateFor maps to the badge");
+    }
+
+    fn option(m: &Message) -> OptionMessage {
+        m.misc().option().clone()
+    }
+
+    #[test]
+    fn the_badge_waits_until_the_target_says_high_efficiency_took() {
+        let mut link = Link::new(Path::Local.stream_type(), true, false);
+        let ask = link.ask(&boring_peer(true), decodes(true)).expect("asks on a Local link");
+        assert!(link.ask(&boring_peer(true), decodes(true)).is_none(), "asks once");
+        let pick = OptionMessage { image_quality: ImageQuality::Best.into(), ..Default::default() };
+        assert!(ack_for(&pick).is_none(), "a quality picked by hand gets no answer");
+        assert!(!link.answered(&pick));
+        let answer = ack_for(&option(&ask)).expect("the Target answers the ask");
+        assert!(link.answered(&option(&answer)));
+        assert!(!link.answered(&option(&answer)), "the badge flips once");
+    }
+
+    #[test]
+    fn no_answer_counts_without_an_ask() {
+        let mut link = Link::new(Path::ViaInternet.stream_type(), true, false);
+        assert!(link.ask(&boring_peer(true), decodes(true)).is_none(), "via internet keeps the defaults");
+        let ask = choose(Path::Local, &boring_peer(true), &decodes(true)).unwrap().message(decodes(true));
+        let answer = ack_for(&option(&ask)).unwrap();
+        assert!(!link.answered(&option(&answer)));
     }
 }

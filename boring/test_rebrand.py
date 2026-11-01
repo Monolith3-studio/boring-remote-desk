@@ -27,7 +27,12 @@ WIN_UPDATE = "Windows reads its own signed feed entry and installs the checked M
 CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
 CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
 CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)"
-NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
+NOT_FOUND_TRANSLATED = ("every connect error (not found, not on this network, refused, identity changed) "
+                        "is in every translation file")
+CONNECT_PIN = "Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)"
+ONE_TIME_CODE = "a one-time code lets a Controller in for that session only (ADR 0005)"
+HE_WIRED = "High Efficiency wired: Target marks itself and answers the ask, badge waits for the answer"
+RUST_HOOKS = "v1.7 Rust hooks landed: base modules, Direct Link meta, LAN end of cycle, Controller name"
 NO_DEFAULT_PASSWORD = "no default or blank password ships (ADR 0002)"
 TRUST_WIRED = "LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)"
 TRUST_TOKENS = "trust tokens: 256-bit, constant-time, option names agree in Rust and Dart"
@@ -89,7 +94,8 @@ class RebrandSeam(unittest.TestCase):
                      "no RustDesk in app metadata", "window titles and tray tooltip say Boring Remote",
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
                      "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
-                     CONNECT_DIRECT, NOT_FOUND_TRANSLATED):
+                     CONNECT_DIRECT, NOT_FOUND_TRANSLATED, CONNECT_ENCRYPTED, TRUST_WIRED, ONE_TIME_CODE,
+                     HE_WIRED, RUST_HOOKS):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -406,9 +412,12 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs",
                   "platform_additions.insert(base::high_efficiency::MARKER.into(), json!(crate::VERSION));",
                   "")
-        r = run(CHECK, self.root)
-        self.assertIn("FAIL High Efficiency wired: Target marks itself, Controller applies it, badge reads it",
-                      r.stdout)
+        self.assert_check_fails(HE_WIRED)
+
+    def test_high_efficiency_badge_without_the_targets_answer_fails_check(self):
+        self.rebrand()
+        self.edit("src/client/io_loop.rs", rebrand.T05_BADGE, "")
+        self.assert_check_fails(HE_WIRED)
 
     # --- v1.7 t03: Direct Link, Tailscale fallback, encrypted off Tailscale ----
     def test_ip_branch_back_before_the_direct_link_fails_check(self):
@@ -443,9 +452,20 @@ class RebrandSeam(unittest.TestCase):
 
     def test_fallback_past_a_refusal_fails_check(self):
         self.rebrand()
-        self.edit("libs/base/src/direct_link.rs", "Ok(Err(Failure::Refused(e))) => return Err(e),",
-                  "Ok(Err(Failure::Refused(_))) => {}")
+        self.edit("libs/base/src/direct_link.rs", "Err(Failure::Refused(e)) => return Err(e),",
+                  "Err(Failure::Refused(_)) => {}")
         self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_no_answer_budget_covering_the_handshake_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "match handshake(s, addr).await {",
+                  "match hbb_common::timeout(ms, handshake(s, addr)).await.unwrap_or(Err(Failure::Unreachable)) {")
+        self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_identity_pinned_on_the_id_alone_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "t.lan != lan || (known_id == id && t.pk == pk)", "true")
+        self.assert_check_fails(CONNECT_PIN)
 
     def test_plaintext_direct_link_on_the_lan_fails_check(self):
         self.rebrand()
@@ -487,6 +507,17 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("src/server/connection.rs", "if self.boring_trust.is_trusted() {", "if self.authorized {")
         self.assert_check_fails(TRUST_WIRED)
+
+    def test_one_time_code_granting_lasting_trust_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.T04_GRANT,
+                  "        self.boring_trust.approve(base::trust::SignIn::Allowed, &self.lr.my_name);\n")
+        self.assert_check_fails(ONE_TIME_CODE)
+
+    def test_lan_macs_that_left_deleted_from_the_stored_list_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T02_END_CYCLE, "    peers.retain(|p| p.online);\n")
+        self.assert_check_fails(RUST_HOOKS)
 
     def test_trust_option_renamed_on_one_side_fails_check(self):
         self.rebrand()
