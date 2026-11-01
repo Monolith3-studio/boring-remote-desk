@@ -555,6 +555,56 @@ PATCHES += [
      "license key option name (home banner)"),
 ]
 
+# --- Mac Home (v1.7 ticket 01) ----------------------------------------------------
+# The kit (desktop/kit/kit.dart) and Mac Home (desktop/kit/mac_home.dart) are ours and
+# bridge-free; these wire them to bind. Mac only: other platforms keep the old home for now.
+# The numeric ID shows only in Mac Home's "Connect from outside the building" sheet.
+MAC_HOME_METHOD = (
+    "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n"
+    "  Widget buildBoringHome(BuildContext context) {\n"
+    "    final recents = gFFI.recentPeersModel;\n"
+    "    final id = gFFI.serverModel.serverId;\n"
+    "    String name(Peer p) => p.alias.isNotEmpty\n"
+    "        ? p.alias\n"
+    "        : (p.hostname.isNotEmpty ? p.hostname : 'Unnamed Mac');\n"
+    "    return Theme(\n"
+    "      data: Kit.theme(),\n"
+    "      child: Material(\n"
+    "        color: Kit.ink,\n"
+    "        child: ListenableBuilder(\n"
+    "          listenable: Listenable.merge([recents, id]),\n"
+    "          builder: (context, _) => MacHome(\n"
+    "            macs: [for (final p in recents.peers) MacEntry(name: name(p), target: p.id)],\n"
+    "            myId: id.text,\n"
+    "            onConnect: (t) => connect(context, t),\n"
+    "            notices: [\n"
+    + NOTICE_BANNER +
+    "            ],\n"
+    "          ),\n"
+    "        ),\n"
+    "      ),\n"
+    "    );\n"
+    "  }\n\n")
+PATCHES += [
+    (HOME, "import 'package:flutter_hbb/consts.dart';\n",
+     "import 'package:flutter_hbb/consts.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
+     "import 'package:flutter_hbb/models/peer_model.dart';\n",
+     "Mac Home imports"),
+    (HOME, "    super.build(context);\n",
+     "    super.build(context);\n"
+     "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n",
+     "Mac Home replaces the RustDesk home on Mac"),
+    (HOME, "  Widget _buildBlock({required Widget child}) {\n",
+     MAC_HOME_METHOD + "  Widget _buildBlock({required Widget child}) {\n",
+     "Mac Home wiring"),
+    (HOME, "  void initState() {\n    super.initState();\n",
+     "  void initState() {\n    super.initState();\n"
+     "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",
+     "Mac Home loads recents"),
+]
+
 # --- Activate link (ticket 14) ----------------------------------------------------
 # Rides upstream's URL scheme (already renamed to boringremote above). src/activate_link.rs
 # and activate_link.dart are ours; these wire them in and stop upstream logging incoming

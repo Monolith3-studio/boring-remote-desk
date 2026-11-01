@@ -761,6 +761,8 @@ def run_checks(root):
         ("src/core_main.rs", '"--boring-verify-package"'),
         (rebrand.HOME, "bind.mainInstallUpdate()"),
         (rebrand.HOME, "setKey: (k) => bind.mainSetLicenseKey(key: k),"),  # ticket 15
+        (rebrand.HOME, "if (isMacOS) return _buildBlock(child: buildBoringHome(context));"),  # v1.7 t01
+        (rebrand.HOME, "MacHome("), (rebrand.HOME, "Kit.theme()"),
         ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),        ("src/lib.rs", "mod activate_link;"),
         ("src/flutter_ffi.rs", "pub fn main_activate_link("),
         ("flutter/lib/common.dart", "bind.mainActivateLink(url: url)"),
