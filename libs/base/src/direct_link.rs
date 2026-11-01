@@ -256,7 +256,7 @@ fn hex(b: &[u8]) -> String {
 
 impl Known {
     pub fn parse(json: &str) -> Self {
-        Known(serde_json::from_str(json).unwrap_or_default())
+        Known(crate::trust::parse_or_default(json, "known Targets"))
     }
 
     pub fn to_json(&self) -> String {

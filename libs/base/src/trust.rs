@@ -44,6 +44,20 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
+/// `json` as `T`; an unset option ("") is the default quietly, a corrupt one is the default and a
+/// log line (throttled: the Target reads its list on every Direct Link a peer opens).
+pub(crate) fn parse_or_default<T: Default + serde::de::DeserializeOwned>(json: &str, what: &str) -> T {
+    match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            if !json.trim().is_empty() {
+                hbb_common::throttled_log!(std::time::Duration::from_secs(60), warn, "{} unreadable, using none: {}", what, e);
+            }
+            T::default()
+        }
+    }
+}
+
 fn digest(token: &[u8]) -> Vec<u8> {
     sha256::hash(token).0.to_vec()
 }
@@ -63,8 +77,9 @@ pub struct TrustedController {
 pub struct Trusted(Vec<TrustedController>);
 
 impl Trusted {
+    /// Unreadable JSON counts as no Trusted Controllers (everyone is asked again), and says so.
     pub fn parse(json: &str) -> Self {
-        Trusted(serde_json::from_str(json).unwrap_or_default())
+        Trusted(parse_or_default(json, "Trusted Controllers"))
     }
 
     pub fn to_json(&self) -> String {
@@ -215,7 +230,7 @@ pub struct Tokens(HashMap<String, String>);
 
 impl Tokens {
     pub fn parse(json: &str) -> Self {
-        Tokens(serde_json::from_str(json).unwrap_or_default())
+        Tokens(parse_or_default(json, "trust tokens"))
     }
 
     pub fn to_json(&self) -> String {

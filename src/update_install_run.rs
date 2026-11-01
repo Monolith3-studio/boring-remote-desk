@@ -1,41 +1,23 @@
 //! Real wiring for `update_install`: HTTP download, monotonic clock, live
 //! session count, and the root install script through osascript. Blocking:
 //! call off the UI thread.
-use crate::update_install::{install, Clock, Deps, Fetcher, InstallError, Runner, SessionCount};
+use crate::update_install::{install, Clock, Deps, Fetcher, InstallError, Release, Runner, SessionCount};
 use hbb_common::{config::LocalConfig, log};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "windows"))]
 struct Http;
-#[cfg(not(target_os = "windows"))]
 impl Fetcher for Http {
-    fn post_to_file(&self, url: &str, body: &str, dest: &Path, timeout: Duration) -> Result<u16, String> {
+    fn fetch_to_file(&self, url: &str, body: Option<&str>, dest: &Path, timeout: Duration) -> Result<u16, String> {
         let client = crate::hbbs_http::create_http_client_with_url_strict(url).map_err(|e| e.to_string())?;
-        let mut r = client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, format!("BoringRemote/{}", crate::VERSION))
-            .body(body.to_owned())
-            .timeout(timeout)
-            .send()
-            .map_err(|e| e.to_string())?;
-        let mut f = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-        r.copy_to(&mut f).map_err(|e| e.to_string())?;
-        Ok(r.status().as_u16())
-    }
-}
-
-/// Windows (v1.7 ticket 12): the MSI is a public download named in the signed version file's
-/// Windows entry, so this GETs it; the License key stays on this computer.
-#[cfg(target_os = "windows")]
-struct HttpGet;
-#[cfg(target_os = "windows")]
-impl Fetcher for HttpGet {
-    fn post_to_file(&self, url: &str, _body: &str, dest: &Path, timeout: Duration) -> Result<u16, String> {
-        let client = crate::hbbs_http::create_http_client_with_url_strict(url).map_err(|e| e.to_string())?;
-        let mut r = client
-            .get(url)
+        let req = match body {
+            Some(body) => client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_owned()),
+            None => client.get(url),
+        };
+        let mut r = req
             .header(reqwest::header::USER_AGENT, format!("BoringRemote/{}", crate::VERSION))
             .timeout(timeout)
             .send()
@@ -52,8 +34,9 @@ impl Fetcher for HttpGet {
 struct Msiexec;
 #[cfg(target_os = "windows")]
 impl Runner for Msiexec {
-    fn run(&self, package: &Path, _sig: &str, _version: &str) -> Result<(), String> {
+    fn run(&self, package: &Path, release: &Release) -> Result<(), String> {
         let p = package.to_str().ok_or("package path is not UTF-8")?;
+        log::info!("installing {} with msiexec", release.version);
         crate::platform::update_to(p).map_err(|e| e.to_string())
     }
 }
@@ -82,7 +65,7 @@ end run"#;
 struct Osascript;
 #[cfg(not(target_os = "windows"))]
 impl Runner for Osascript {
-    fn run(&self, package: &Path, sig: &str, version: &str) -> Result<(), String> {
+    fn run(&self, package: &Path, release: &Release) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let script = exe
             .parent()
@@ -94,8 +77,8 @@ impl Runner for Osascript {
             .arg(OSA)
             .arg(&script)
             .arg(package)
-            .arg(sig)
-            .arg(version)
+            .arg(&release.package_sig)
+            .arg(&release.version)
             .output()
             .map_err(|e| e.to_string())?;
         if out.status.success() {
@@ -130,7 +113,7 @@ pub fn install_now() -> String {
     #[cfg(not(target_os = "windows"))]
     let (fetcher, runner, url) = (&Http, &Osascript, crate::license_key::UPDATE_ENDPOINT.to_owned());
     #[cfg(target_os = "windows")]
-    let (fetcher, runner, url) = (&HttpGet, &Msiexec, LocalConfig::get_option(crate::update_notice::KEY_LAST_PKG_URL));
+    let (fetcher, runner, url) = (&Http, &Msiexec, LocalConfig::get_option(crate::update_notice::KEY_LAST_PKG_URL));
     let d = Deps {
         fetcher,
         clock: &Mono(Instant::now()),

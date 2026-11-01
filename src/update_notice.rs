@@ -83,20 +83,6 @@ pub trait Store {
     fn set(&mut self, key: &str, value: String);
 }
 
-/// Strict `X.Y.Z`: three runs of ASCII digits, nothing else.
-pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    let mut it = s.split('.');
-    let mut next = || {
-        let p = it.next()?;
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        p.parse::<u64>().ok()
-    };
-    let v = (next()?, next()?, next()?);
-    it.next().is_none().then_some(v)
-}
-
 /// (version, min_version or "") from a version file; None if either is not strict X.Y.Z.
 /// Reads this platform's entry (v1.7 ticket 12: Windows has its own; Mac keeps the top level).
 fn remote_versions(body: &str) -> Option<(String, String)> {
@@ -124,7 +110,7 @@ pub fn release(store: &dyn Store) -> Option<crate::update_install::Release> {
         package_sha256: store.get(KEY_LAST_PKG_SHA),
         package_sig: store.get(KEY_LAST_PKG_SIG),
     };
-    (parse_semver(&r.version).is_some() && !r.package_sha256.is_empty() && !r.package_sig.is_empty()).then_some(r)
+    (base::update_feed::parse_semver(&r.version).is_some() && !r.package_sha256.is_empty() && !r.package_sig.is_empty()).then_some(r)
 }
 
 fn newer_than(remote: &str, running: &str) -> bool {

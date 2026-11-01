@@ -49,8 +49,9 @@ impl InstallError {
 }
 
 pub trait Fetcher {
-    /// POST JSON `body` to `url`, writing the response body to `dest`. Ok(status) or Err on transport failure.
-    fn post_to_file(&self, url: &str, body: &str, dest: &Path, timeout: Duration) -> Result<u16, String>;
+    /// POST JSON `body` to `url` when there is one, else GET it, writing the response body to
+    /// `dest`. Ok(status) or Err on transport failure.
+    fn fetch_to_file(&self, url: &str, body: Option<&str>, dest: &Path, timeout: Duration) -> Result<u16, String>;
 }
 pub trait Clock {
     /// Monotonic seconds.
@@ -60,8 +61,8 @@ pub trait SessionCount {
     fn live(&self) -> usize;
 }
 pub trait Runner {
-    /// Run the root install script on the checked package. Returns once the script is done.
-    fn run(&self, package: &Path, sig: &str, version: &str) -> Result<(), String>;
+    /// Install the checked package of `release`. Returns once the installer is done.
+    fn run(&self, package: &Path, release: &Release) -> Result<(), String>;
 }
 
 pub struct Deps<'a> {
@@ -82,6 +83,17 @@ pub fn package_path(temp_dir: &Path, version: &str) -> PathBuf {
     temp_dir.join(format!("BoringRemote-{version}-macos-arm64.app.tar.xz"))
 }
 
+/// Mac asks fulfillment for the package with the License key. Windows (v1.7 ticket 12) downloads
+/// the public MSI the signed version file names, so the key stays on this computer.
+#[cfg(not(target_os = "windows"))]
+fn request_body(key: &str, r: &Release) -> Option<String> {
+    Some(serde_json::json!({"license_key": key, "version": r.version}).to_string())
+}
+#[cfg(target_os = "windows")]
+fn request_body(_key: &str, _r: &Release) -> Option<String> {
+    None
+}
+
 /// Refuse during a live session, download, check sha256 and sig, then hand off.
 pub fn install(d: &Deps, url: &str, key: &str, release: Option<&Release>) -> Result<(), InstallError> {
     let key = key.trim();
@@ -98,15 +110,15 @@ pub fn install(d: &Deps, url: &str, key: &str, release: Option<&Release>) -> Res
         let _ = std::fs::remove_file(&dest);
     }
     res?;
-    d.runner.run(&dest, &r.package_sig, &r.version).map_err(InstallError::Script)
+    d.runner.run(&dest, r).map_err(InstallError::Script)
 }
 
 fn download_and_check(d: &Deps, url: &str, key: &str, r: &Release, dest: &Path) -> Result<(), InstallError> {
-    let body = serde_json::json!({"license_key": key, "version": r.version}).to_string();
+    let body = request_body(key, r);
     let start = d.clock.now();
     let status = d
         .fetcher
-        .post_to_file(url, &body, dest, DOWNLOAD_TIMEOUT)
+        .fetch_to_file(url, body.as_deref(), dest, DOWNLOAD_TIMEOUT)
         .map_err(InstallError::Download)?;
     if d.clock.now().saturating_sub(start) > DOWNLOAD_TIMEOUT.as_secs() {
         return Err(InstallError::Timeout);
@@ -169,8 +181,8 @@ mod tests {
         }
     }
     impl Fetcher for Fetch<'_> {
-        fn post_to_file(&self, url: &str, body: &str, dest: &Path, t: Duration) -> Result<u16, String> {
-            self.sent.borrow_mut().push((url.into(), body.into(), t));
+        fn fetch_to_file(&self, url: &str, body: Option<&str>, dest: &Path, t: Duration) -> Result<u16, String> {
+            self.sent.borrow_mut().push((url.into(), body.unwrap_or_default().into(), t));
             if let Some(c) = self.clock {
                 c.0.set(c.0.get() + self.clock_jump);
             }
@@ -195,8 +207,8 @@ mod tests {
         calls: RefCell<Vec<(PathBuf, String, String, Vec<u8>)>>,
     }
     impl Runner for Run {
-        fn run(&self, p: &Path, sig: &str, v: &str) -> Result<(), String> {
-            self.calls.borrow_mut().push((p.into(), sig.into(), v.into(), std::fs::read(p).unwrap()));
+        fn run(&self, p: &Path, r: &Release) -> Result<(), String> {
+            self.calls.borrow_mut().push((p.into(), r.package_sig.clone(), r.version.clone(), std::fs::read(p).unwrap()));
             Ok(())
         }
     }
@@ -311,7 +323,7 @@ mod tests {
     fn script_failure_is_surfaced() {
         struct Bad;
         impl Runner for Bad {
-            fn run(&self, _: &Path, _: &str, _: &str) -> Result<(), String> {
+            fn run(&self, _: &Path, _: &Release) -> Result<(), String> {
                 Err("User canceled.".into())
             }
         }
