@@ -565,12 +565,12 @@ PATCHES += [
 # --- Mac Home (v1.7 ticket 01) ----------------------------------------------------
 # The kit (desktop/kit/kit.dart) and Mac Home (desktop/kit/mac_home.dart) are ours and
 # bridge-free; these wire them to bind. Mac only: other platforms keep the old home for now.
-# The numeric ID shows only in Mac Home's "Connect from outside the building" sheet.
+# No numeric ID on Home: "Connect from outside the building" gives this computer's Tailscale
+# address (ADR 0004; desktop/kit/tailscale.dart reads it from the network interfaces).
 MAC_HOME_METHOD = (
-    "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n"
+    "  // boring-remote: v1.7 Mac Home. Recents by name; outside the building is Tailscale (ADR 0004), never the ID.\n"
     "  Widget buildBoringHome(BuildContext context) {\n"
     "    final recents = gFFI.recentPeersModel;\n"
-    "    final id = gFFI.serverModel.serverId;\n"
     "    String name(Peer p) => p.alias.isNotEmpty\n"
     "        ? p.alias\n"
     "        : (p.hostname.isNotEmpty ? p.hostname : 'Unnamed Mac');\n"
@@ -579,10 +579,10 @@ MAC_HOME_METHOD = (
     "      child: Material(\n"
     "        color: Kit.ink,\n"
     "        child: ListenableBuilder(\n"
-    "          listenable: Listenable.merge([recents, id, lanMacs]),\n"
+    "          listenable: Listenable.merge([recents, lanMacs]),\n"
     "          builder: (context, _) => MacHome(\n"
     "            macs: [for (final p in recents.peers) MacEntry(name: name(p), target: p.id)],\n"
-    "            myId: id.text,\n"
+    "            tailscaleAddress: thisTailscaleAddress,\n"
     "            lan: lanMacs.macs,\n"
     "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
@@ -600,6 +600,7 @@ PATCHES += [
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/lan_macs_model.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/tailscale.dart';\n"
      "import 'package:flutter_hbb/models/peer_model.dart';\n",
      "Mac Home imports"),
     (HOME, "    super.build(context);\n",
@@ -1195,9 +1196,9 @@ PATCHES += [
     (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
      T06_SETUP_PAGE + "class _DesktopHomePageState extends State<DesktopHomePage>\n",
      "Setup wiring"),
-    (HOME, "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n",
+    (HOME, "  // boring-remote: v1.7 Mac Home. Recents by name; outside the building is Tailscale (ADR 0004), never the ID.\n",
      "  bool _boringSetup = false; // v1.7 t06: first launch shows Setup until it is finished\n\n"
-     "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n",
+     "  // boring-remote: v1.7 Mac Home. Recents by name; outside the building is Tailscale (ADR 0004), never the ID.\n",
      "Setup state"),
     (HOME, "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",
      "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n"

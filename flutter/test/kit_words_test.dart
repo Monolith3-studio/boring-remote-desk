@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
 import 'package:flutter_hbb/desktop/kit/file_transfer.dart';
+import 'package:flutter_hbb/desktop/kit/lan_macs.dart';
 import 'package:flutter_hbb/desktop/kit/mac_home.dart';
 import 'package:flutter_hbb/desktop/kit/simple_settings.dart';
 import 'package:flutter_hbb/desktop/kit/trust.dart';
@@ -29,14 +30,22 @@ void main() {
 
   testWidgets('Windows Home says computer, never Mac', (tester) async {
     KitWords.windows();
-    await tester.pumpWidget(host(MacHome(macs: const [], myId: '1', onConnect: (_) {})));
+    await tester.pumpWidget(host(MacHome(macs: const [], tailscaleAddress: () async => null, onConnect: (_) {})));
     expect(find.text('Connect to a computer'), findsOneWidget);
     expect(find.text('Computers'), findsOneWidget);
-    expect(find.text('No computers yet. Type a computer name or IP above.'), findsOneWidget);
+    expect(
+        find.text("No other computers found yet. Open Boring Remote on the other computer. "
+            "You'll see it here once both are on the same network."),
+        findsOneWidget);
     expect(texts(tester).where((s) => s.contains('Mac')), isEmpty);
     await tester.tap(find.text('Connect from outside the building'));
     await tester.pumpAndSettle();
     expect(find.textContaining('pick this computer by name'), findsOneWidget);
+  });
+
+  test('a Windows computer on the network with no name is an Unnamed computer', () {
+    KitWords.windows();
+    expect(lanMacsFromJson('[{"hostname":"","ip":"10.0.4.7"}]').single.name, 'Unnamed computer');
   });
 
   testWidgets('Windows file transfer panes are This computer / That computer', (tester) async {

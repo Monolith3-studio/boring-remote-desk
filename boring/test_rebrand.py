@@ -534,6 +534,20 @@ class RebrandSeam(unittest.TestCase):
             self.assertNotIn(b"\r", (self.root / rel).read_bytes(), rel)
         self.assertIn("rebrand: 0 changed, 0 moved", self.rebrand().stdout)
 
+    # --- v1.7 review: Home, Settings, copy -------------------------------------------
+    HOME_OUTSIDE = "Home's outside-the-building sheet gives this computer's Tailscale address, never the ID (ADR 0004)"
+
+    def test_numeric_id_back_in_the_outside_sheet_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "tailscaleAddress: thisTailscaleAddress,",
+                  "tailscaleAddress: () async => gFFI.serverModel.serverId.text,")
+        self.assert_check_fails(self.HOME_OUTSIDE)
+
+    def test_tailscale_range_drifting_from_the_tailnet_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/tailscale.dart", "(b[1] & 0xc0) == 64", "(b[1] & 0x80) == 0")
+        self.assert_check_fails(self.HOME_OUTSIDE)
+
 
 if __name__ == "__main__":
     unittest.main()

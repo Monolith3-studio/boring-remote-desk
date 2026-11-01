@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'kit.dart';
+
 /// A Boring Remote Mac that answered LAN Discovery on this network.
 class LanMac {
   final String name;
@@ -17,7 +19,7 @@ List<LanMac> lanMacsFromJson(String json) {
       for (final p in list.cast<Map<String, dynamic>>())
         if ((p['ip'] ?? '').toString().isNotEmpty)
           LanMac(
-            name: (p['hostname'] ?? '').toString().isNotEmpty ? p['hostname'].toString() : 'Unnamed Mac',
+            name: (p['hostname'] ?? '').toString().isNotEmpty ? p['hostname'].toString() : 'Unnamed ${KitWords.one}',
             ip: p['ip'].toString(),
           ),
     ];
