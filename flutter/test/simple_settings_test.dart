@@ -53,11 +53,15 @@ void main() {
 
   testWidgets('Unattended Password: says whether one is set, never shows it', (tester) async {
     await tester.pumpWidget(host(settings(passwordSet: false)));
+    expect(find.text('Password for when no one is here'), findsOneWidget);
     expect(find.text('Not set. Someone has to be at this Mac to click Allow each time.'), findsOneWidget);
     expect(find.text('Set password'), findsOneWidget);
     await tester.pumpWidget(host(settings(passwordSet: true)));
     expect(find.text('Set. Your other Macs can get in with it when no one is here.'), findsOneWidget);
     expect(find.text('Change password'), findsOneWidget);
+    await tester.tap(find.text('Change password'));
+    await tester.pump();
+    expect(tester.widget<TextField>(find.byKey(SimpleSettings.passwordKey)).decoration?.hintText, 'Type a new password');
   });
 
   Future<void> typePassword(WidgetTester tester, String pw) async {

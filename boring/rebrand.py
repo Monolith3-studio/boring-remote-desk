@@ -1143,6 +1143,8 @@ T06_SETUP_PAGE = (
     "        platform: SetupPlatform.mac,\n"
     "        computerName: name.isNotEmpty\n"
     "            ? Future.value(name)\n"
+    "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n"
+    "                ? Future.value(windowsComputerName(Platform.environment, Platform.localHostname))\n"
     "            : Process.run('scutil', ['--get', 'ComputerName'])\n"
     "                .then((r) => r.exitCode == 0 ? '${r.stdout}'.trim() : '')\n"
     "                .catchError((_) => '')\n"
@@ -1237,9 +1239,9 @@ T12_EDITS = [(g, g.replace("if (isMacOS)", "if (isMacOS || isWindows)", 1)
     ("        platform: SetupPlatform.mac,\n", "        platform: platform,\n"),
     ("        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n",
      "        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n"
-     "        // v1.7 t12 (Windows): the installer's app rule is there; Allow adds it (Windows asks once).\n"
+     "        // v1.7 t12 (Windows): the installer's app rule is there for this exe; Allow adds it (Windows asks once).\n"
      "        canBeReached: () => Process.run('netsh', windowsRuleShowArgs())\n"
-     "            .then((r) => r.exitCode == 0)\n"
+     "            .then((r) => r.exitCode == 0 && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable))\n"
      "            .catchError((_) => false),\n"
      "        allowReach: () => Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))\n"
      "            .then<void>((_) {})\n"

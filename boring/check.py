@@ -874,6 +874,23 @@ def home_checks(c):
     c.fact("File Transfer lists delete jobs too (v1.7 t08 follow-up)", all(n in jobs for n in need),
            "boringTransferList drops delete jobs")
 
+    # Ticket 12 follow-ups: Windows Setup names the computer by its Windows name (scutil is Mac only),
+    # and the reach check counts the installer's rule only when it is for this exe.
+    page = fn_body(c.read(rebrand.HOME), "Widget boringSetupPage({required VoidCallback onDone}) {") or ""
+    named = "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n" \
+            "                ? Future.value(windowsComputerName(Platform.environment, Platform.localHostname))\n" \
+            "            : Process.run('scutil', ['--get', 'ComputerName'])"
+    c.fact("Windows Setup starts from the Windows computer name, never scutil (v1.7 t12 follow-up)", named in page,
+           "boringSetupPage does not branch to windowsComputerName before scutil")
+    kit = c.read(SETUP_DART)
+    why = [] if "Process.run('netsh', windowsRuleShowArgs())\n" \
+                 "            .then((r) => r.exitCode == 0 && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable))" \
+        in page else ["canBeReached does not check the rule's program is this exe"]
+    if "'dir=in', 'verbose']" not in kit:
+        why.append("windowsRuleShowArgs does not ask netsh for the program path (verbose)")
+    c.fact("Windows reach check counts the installer's rule only for this exe (v1.7 t12 follow-up)",
+           not why, "; ".join(why))
+
 
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""

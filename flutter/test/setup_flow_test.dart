@@ -311,7 +311,7 @@ void main() {
 
     test('the rule commands: read without admin, add asks Windows once, path quoted', () {
       expect(windowsRuleShowArgs(),
-          ['advfirewall', 'firewall', 'show', 'rule', 'name=BoringRemote Service', 'dir=in']);
+          ['advfirewall', 'firewall', 'show', 'rule', 'name=BoringRemote Service', 'dir=in', 'verbose']);
       final add = windowsRuleAddArgs(r"C:\Program Files\BoringRemote\BoringRemote.exe");
       expect(add.take(2), ['-NoProfile', '-Command']);
       expect(add.last,
@@ -319,6 +319,29 @@ void main() {
           "'advfirewall firewall add rule name=\"BoringRemote Service\" dir=in action=allow "
           "program=\"C:\\Program Files\\BoringRemote\\BoringRemote.exe\" enable=yes profile=any'");
       expect(windowsRuleAddArgs(r"C:\it's\BoringRemote.exe").last, contains(r"C:\it''s\BoringRemote.exe"));
+    });
+
+    test('the reach check counts the rule only when it is for this copy of Boring Remote', () {
+      // `netsh advfirewall firewall show rule name="BoringRemote Service" dir=in verbose`, trimmed.
+      const installed = 'Rule Name:                            BoringRemote Service\r\n'
+          '----------------------------------------------------------------------\r\n'
+          'Enabled:                              Yes\r\n'
+          'Direction:                            In\r\n'
+          r'Program:                              C:\Program Files\BoringRemote\BoringRemote.exe' '\r\n'
+          'Action:                               Allow\r\n'
+          'Ok.\r\n';
+      expect(windowsRuleAllowsExe(installed, r'c:\program files\boringremote\BoringRemote.EXE'), isTrue);
+      expect(windowsRuleAllowsExe(installed, r'D:\Portable\BoringRemote.exe'), isFalse); // a copy elsewhere
+      expect(windowsRuleAllowsExe('No rules match the specified criteria.', r'C:\x\BoringRemote.exe'), isFalse);
+      // Windows in another language names the line differently; the path is what counts.
+      expect(windowsRuleAllowsExe(r'Programm:   D:\Portable\BoringRemote.exe', r'D:\Portable\BoringRemote.exe'),
+          isTrue);
+    });
+
+    test("screen 1 starts from Windows' own computer name, in the case it was typed", () {
+      expect(windowsComputerName({'COMPUTERNAME': 'FRONT-DESK'}, 'Front-Desk'), 'Front-Desk');
+      expect(windowsComputerName({'COMPUTERNAME': 'FRONT-DESK'}, 'something-else'), 'FRONT-DESK');
+      expect(windowsComputerName({}, 'Front-Desk'), 'Front-Desk');
     });
   });
 
@@ -336,6 +359,11 @@ void main() {
       expect(setupStartStep('-1', 3), 0);
       expect(setupStartStep('x', 3), 0);
     });
+  });
+
+  testWidgets('screen 3 asks for a password in plain words', (tester) async {
+    await tester.pumpWidget(host(flow(startStep: 2)));
+    expect(tester.widget<TextField>(find.byKey(SetupFlow.passwordKey)).decoration?.hintText, 'Type a password');
   });
 
   test('no jargon in what the buyer reads', () {

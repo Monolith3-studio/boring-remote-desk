@@ -113,7 +113,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Unattended Password', style: t.bodySmall),
+        Text('Password for when no one is here', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(isSet
             ? 'Set. Your other ${KitWords.many} can get in with it when no one is here.'
@@ -130,7 +130,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             controller: _password,
             obscureText: true,
             autofocus: true,
-            decoration: const InputDecoration(hintText: 'New Unattended Password'),
+            decoration: const InputDecoration(hintText: 'Type a new password'),
             onSubmitted: (_) => _savePassword(),
           ),
           if (_passwordError != null) ...[

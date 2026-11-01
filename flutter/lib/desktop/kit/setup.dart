@@ -19,8 +19,29 @@ const kAccessibilityPane = 'x-apple.systempreferences:com.apple.preference.secur
 /// every network type, so it covers Direct Link (TCP 21118) and LAN Discovery (UDP 21119). v1.7 t12.
 const kWindowsRuleName = 'BoringRemote Service';
 
-/// `netsh` arguments that read the rule; exit code 0 means it is there. Needs no admin.
-List<String> windowsRuleShowArgs() => ['advfirewall', 'firewall', 'show', 'rule', 'name=$kWindowsRuleName', 'dir=in'];
+/// `netsh` arguments that read the rule, with its program path; exit code 0 means a rule by that
+/// name is there ([windowsRuleAllowsExe] says whether it is for this exe). Needs no admin.
+List<String> windowsRuleShowArgs() =>
+    ['advfirewall', 'firewall', 'show', 'rule', 'name=$kWindowsRuleName', 'dir=in', 'verbose'];
+
+/// True when one of the rules [windowsRuleShowArgs] printed is for [exe], so a copy of Boring Remote
+/// outside the installed folder doesn't read green on someone else's rule. Matches the value, not the
+/// "Program:" label, which Windows translates. Paths compare without case, as Windows does.
+bool windowsRuleAllowsExe(String netshOutput, String exe) {
+  final want = exe.trim().toLowerCase();
+  return netshOutput.split(RegExp(r'\r?\n')).any((line) {
+    final i = line.indexOf(':');
+    return i > 0 && line.substring(i + 1).trim().toLowerCase() == want;
+  });
+}
+
+/// Windows' own computer name for Setup's screen 1 (v1.7 review): COMPUTERNAME, which Windows keeps
+/// in capitals, so the host name stands in when it is the same name in the case it was typed.
+String windowsComputerName(Map<String, String> environment, String hostName) {
+  final name = (environment['COMPUTERNAME'] ?? '').trim();
+  final host = hostName.trim();
+  return name.isEmpty || host.toUpperCase() == name.toUpperCase() ? host : name;
+}
 
 /// `powershell` arguments that add the same rule for [exe] as administrator: Windows asks once.
 List<String> windowsRuleAddArgs(String exe) {
@@ -91,7 +112,7 @@ const setupCopy = <String, String>{
   // Screen 3
   'password.title': 'Set a password for when no one is here',
   'password.body': 'Your other Macs can get in with this password when no one is at this one.',
-  'password.hint': 'Unattended Password',
+  'password.hint': 'Type a password',
   'password.rule': 'At least 8 characters, with a capital, a small letter and a number.',
   'password.failed': "Couldn't save that password. Try again.",
   'password.save': 'Save password',
