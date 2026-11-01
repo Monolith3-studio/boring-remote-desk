@@ -616,6 +616,23 @@ def shipped_files(c, suffixes):
                 yield p.relative_to(c.root).as_posix(), p.read_text(encoding="utf-8", errors="replace")
 
 
+def multi_window_checks(c, cfg):
+    """v1.7 ticket 11: sessions open in windows; a full-screen Target remembers its monitor."""
+    c.fact("new sessions open in windows (tabs option off by default)",
+           rust_map(cfg, "DEFAULT_LOCAL_SETTINGS").get(rebrand.T11_TABS_OPTION) == "N")
+    # Ticket 09: the simple page's Advanced link opens the full page (General tab) holding this checkbox.
+    c.fact("tabs option still on the Advanced settings page",
+           "kOptionOpenNewConnInTabs" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
+    common = c.read(rebrand.T11_COMMON)
+    hooks = ["import 'package:flutter_hbb/desktop/kit/session_window.dart';",
+             "_boringLiveFrame = await wc.getFrame();", "return peerFrameWhileFull(",
+             "window_size.getScreenList()).map((s) => s.frame)"]
+    missing = [h for h in hooks if h not in common]
+    c.fact("full-screen Target remembers its monitor (hooks landed)", not missing, "; ".join(missing))
+    c.fact("restore moves the window to its monitor before full screen on Mac",
+           "if (!isMacOS) {\n          await restoreFrame();" not in common)
+
+
 # Colours an extras screen may not use once rebranded: upstream theme statics and raw colours.
 EXTRAS_OFF_KIT = re.compile(r"MyTheme\.(?!color\(context\))\w+|Colors\.(?!transparent\b)\w+|Color\(0x[0-9A-Fa-f]+\)|kColorCanvas")
 
@@ -833,6 +850,7 @@ def run_checks(root):
     bar = c.read("flutter/lib/desktop/kit/session_toolbar.dart")  # v1.7 t07
     c.fact("Session Toolbar uses kit tokens only",
            not re.search(r"\bColors\.|Color\(|MyTheme", bar))
+    multi_window_checks(c, cfg)  # v1.7 t11
     activate_link_checks(c)
     simple_settings_checks(c)  # v1.7 t09
     ft = rebrand.FILE_MGR  # v1.7 t08
