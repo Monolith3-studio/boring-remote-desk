@@ -776,12 +776,17 @@ def run_checks(root):
         (rebrand.HOME, "if (isMacOS) return _buildBlock(child: buildBoringHome(context));"),  # v1.7 t01
         (rebrand.HOME, "MacHome("), (rebrand.HOME, "Kit.theme()"),
         (rebrand.HOME, "lan: lanMacs.macs,"), (rebrand.HOME, "discover: () => bind.mainDiscover(),"),  # v1.7 t02
+        (rebrand.T07_TOOLBAR, "..add(buildBoringSessionToolbar(context, more));"),  # v1.7 t07
+        (rebrand.T07_TOOLBAR, "SessionToolbar("),
         ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),        ("src/lib.rs", "mod activate_link;"),
         ("src/flutter_ffi.rs", "pub fn main_activate_link("),
         ("flutter/lib/common.dart", "bind.mainActivateLink(url: url)"),
     ]
     missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
     c.fact("update hooks landed in upstream files (ADR 0004)", not missing, "; ".join(missing))
+    bar = c.read("flutter/lib/desktop/kit/session_toolbar.dart")  # v1.7 t07
+    c.fact("Session Toolbar uses kit tokens only",
+           not re.search(r"\bColors\.|Color\(|MyTheme", bar))
     activate_link_checks(c)
 
     hits, index = [], []

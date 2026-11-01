@@ -608,6 +608,69 @@ PATCHES += [
      "Mac Home loads recents"),
 ]
 
+# --- Session Toolbar (v1.7 ticket 07) --------------------------------------------
+# desktop/kit/session_toolbar.dart is ours and bridge-free; this wires it on Mac. Five
+# actions up front (Link Badge, Send files, display, quality, Disconnect); every other
+# RustDesk menu moves behind More. The Link Badge stays hidden until tickets 03/05 pass a link.
+T07_TOOLBAR = "flutter/lib/desktop/widgets/remote_toolbar.dart"
+T07_METHOD = (
+    "  // boring-remote: v1.7 Session Toolbar. Five actions up front, RustDesk's menus behind More.\n"
+    "  Widget buildBoringSessionToolbar(BuildContext context, List<Widget> more) {\n"
+    "    final ffi = widget.ffi;\n"
+    "    final current = CurrentDisplayState.find(widget.id);\n"
+    "    return Obx(() {\n"
+    "      final displays = pi.displaysCount.value;\n"
+    "      final display = current.value < 0 ? 0 : current.value;\n"
+    "      return FutureBuilder<String?>(\n"
+    "        future: bind.sessionGetImageQuality(sessionId: ffi.sessionId),\n"
+    "        builder: (context, q) => SessionToolbar(\n"
+    "          onSendFiles: () => connect(context, widget.id,\n"
+    "              isFileTransfer: true,\n"
+    "              connToken: bind.sessionGetConnToken(sessionId: ffi.sessionId)),\n"
+    "          displays: displays < 1 ? 1 : displays,\n"
+    "          display: display,\n"
+    "          onPickDisplay: (i) {\n"
+    "            if (i != current.value) openMonitorInTheSameTab(i, ffi, pi);\n"
+    "          },\n"
+    "          quality: q.data ?? kRemoteImageQualityBalanced,\n"
+    "          qualities: const {\n"
+    "            kRemoteImageQualityBalanced: 'Auto',\n"
+    "            kRemoteImageQualityBest: 'Best picture',\n"
+    "            kRemoteImageQualityLow: 'Fastest',\n"
+    "          },\n"
+    "          onQuality: (v) async {\n"
+    "            await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: v);\n"
+    "            if (mounted) setState(() {});\n"
+    "          },\n"
+    "          onDisconnect: () async {\n"
+    "            if (await showConnEndAuditDialogCloseCanceled(ffi: ffi)) return;\n"
+    "            closeConnection(id: widget.id);\n"
+    "          },\n"
+    "          more: more,\n"
+    "        ),\n"
+    "      );\n"
+    "    });\n"
+    "  }\n\n")
+PATCHES += [
+    (T07_TOOLBAR, "import 'package:flutter_hbb/consts.dart';\n",
+     "import 'package:flutter_hbb/consts.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/session_toolbar.dart';\n",
+     "Session Toolbar import"),
+    (T07_TOOLBAR, "    toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));\n",
+     "    toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));\n"
+     "    if (isMacOS) {\n"
+     "      // Everything but Close goes behind More; the kit toolbar has its own Disconnect.\n"
+     "      final more = toolbarItems.sublist(0, toolbarItems.length - 1);\n"
+     "      toolbarItems\n"
+     "        ..clear()\n"
+     "        ..add(buildBoringSessionToolbar(context, more));\n"
+     "    }\n",
+     "Session Toolbar replaces the RustDesk toolbar row on Mac"),
+    (T07_TOOLBAR, "  ThemeData themeData() {\n",
+     T07_METHOD + "  ThemeData themeData() {\n",
+     "Session Toolbar wiring"),
+]
+
 # --- Activate link (ticket 14) ----------------------------------------------------
 # Rides upstream's URL scheme (already renamed to boringremote above). src/activate_link.rs
 # and activate_link.dart are ours; these wire them in and stop upstream logging incoming
