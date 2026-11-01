@@ -797,6 +797,11 @@ def run_checks(root):
            not re.search(r"\bColors\.|Color\(|MyTheme", bar))
     activate_link_checks(c)
     simple_settings_checks(c)  # v1.7 t09
+    ft = rebrand.FILE_MGR  # v1.7 t08
+    ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
+                  "_boringSend(model.remoteController)", "_boringSend(model.localController)")
+    ft_missing = [n for n in ft_needles if n not in c.read(ft)]
+    c.fact("v1.7 File Transfer kit wired into the file manager", not ft_missing, "; ".join(ft_missing))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):
