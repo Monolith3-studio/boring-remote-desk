@@ -585,7 +585,7 @@ def connect_checks(c):
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [f"{p.name}: {text[:30]}" for p in langs for text in rebrand.CONNECT_ERROR_KEYS
                if p.read_text(encoding="utf-8").count(f'("{text}", ') != 1]
-    c.fact("every connect error (not found, not on this network, refused, identity changed) is in every translation file",
+    c.fact("every connect error, Mac and Windows wording, is in every translation file",
            langs and not missing, ", ".join(missing[:10]))
 
     secure = fn_body(link, "pub async fn secure(") or ""

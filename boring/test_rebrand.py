@@ -27,8 +27,7 @@ WIN_UPDATE = "Windows reads its own signed feed entry and installs the checked M
 CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
 CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
 CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)"
-NOT_FOUND_TRANSLATED = ("every connect error (not found, not on this network, refused, identity changed) "
-                        "is in every translation file")
+NOT_FOUND_TRANSLATED = "every connect error, Mac and Windows wording, is in every translation file"
 CONNECT_PIN = "Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)"
 ONE_TIME_CODE = "a one-time code lets a Controller in for that session only (ADR 0005)"
 HE_WIRED = "High Efficiency wired: Target marks itself and answers the ask, badge waits for the answer"
