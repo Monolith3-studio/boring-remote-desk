@@ -36,16 +36,27 @@ TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 PRIVATE_LAN = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
 WHITELIST = f"{TAILNET},{PRIVATE_LAN}"
 
-# What the connect box says (v1.7 t03, ADRs 0004/0005). The text lives in
-# libs/base/src/direct_link.rs; these are the translation keys (src/lang/*.rs,
-# English everywhere) and what check.py compares the Rust constants with.
-NOT_FOUND = "Couldn't find that machine. Type its Tailscale name or IP."
-NOT_ON_NETWORK = "Not on this network."
-PLAINTEXT_REFUSED = ("That Mac answered without encryption, so Boring Remote didn't connect. "
-                     "Update it to the latest Boring Remote.")
-IDENTITY_CHANGED = "That Mac's identity changed since you last connected, so Boring Remote didn't connect."
+# What the connect box says (v1.7 t03, ADRs 0004/0005), in plain words with one next step. The
+# text lives in libs/base/src/direct_link.rs, once per platform: the Mac build says "Mac", the
+# Windows build "computer" (as the kit's KitWords do). These are the translation keys
+# (src/lang/*.rs, English everywhere) and what check.py compares the Rust constants with.
+NOT_FOUND = "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again."
+NOT_ON_NETWORK = ("Couldn't reach that Mac. Check that it's turned on and on the same Wi-Fi or network as "
+                  "this one, then try again.")
+PLAINTEXT_REFUSED = "That Mac needs the latest Boring Remote. Update it on that Mac, then try again."
+IDENTITY_CHANGED = ("This isn't the Mac you connected to before, so Boring Remote stopped. If it was "
+                    "reinstalled, open Settings, click Trusted Controllers, click Forget next to it, "
+                    "then try again.")
 CONNECT_ERRORS = {"NOT_FOUND": NOT_FOUND, "NOT_ON_THIS_NETWORK": NOT_ON_NETWORK,
                   "PLAINTEXT_REFUSED": PLAINTEXT_REFUSED, "IDENTITY_CHANGED": IDENTITY_CHANGED}
+
+
+def on_windows(text):
+    """The Windows build's wording of a buyer-facing line: computer, not Mac (KitWords)."""
+    return text.replace("Macs", "computers").replace("Mac", "computer")
+
+
+CONNECT_ERROR_KEYS = [t for v in CONNECT_ERRORS.values() for t in (v, on_windows(v))]
 
 # Replaces _start's IP and domain:port branches in src/client.rs. check.py looks for
 # exactly this block and that nothing before it reaches the ID/rendezvous path.
@@ -1609,7 +1620,7 @@ def plan(root):
             texts[rel] = _read(p)
         text, crlf = texts[rel]
         text2 = LANG_VALUE.sub(_lang_value, text)
-        for msg in CONNECT_ERRORS.values():
+        for msg in CONNECT_ERROR_KEYS:
             if f'("{msg}", ' not in text2:
                 text2 = LANG_END.sub(f'),\n        ("{msg}", ""),\n\\1', text2, count=1)
         if text2 != text:

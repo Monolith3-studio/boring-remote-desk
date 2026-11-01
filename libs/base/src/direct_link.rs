@@ -19,19 +19,36 @@ use hbb_common::{
 use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, net::IpAddr, net::SocketAddr};
 
-/// What the connect box says when neither the Direct Link nor the Tailscale address answers.
-pub const NOT_ON_THIS_NETWORK: &str = "Not on this network.";
+// What the connect box says, in plain words with one next step (boring/rebrand.py keeps the same
+// text as translation keys). The Mac build says "Mac"; the Windows build says "computer".
 
-/// What the connect box says when a name resolves to nothing a Target would accept.
-pub const NOT_FOUND: &str = "Couldn't find that machine. Type its Tailscale name or IP.";
+/// Neither the Direct Link nor the Tailscale address answered.
+#[cfg(not(target_os = "windows"))]
+pub const NOT_ON_THIS_NETWORK: &str =
+    "Couldn't reach that Mac. Check that it's turned on and on the same Wi-Fi or network as this one, then try again.";
+#[cfg(target_os = "windows")]
+pub const NOT_ON_THIS_NETWORK: &str =
+    "Couldn't reach that computer. Check that it's turned on and on the same Wi-Fi or network as this one, then try again.";
+
+/// A name that resolves to nothing a Target would accept.
+#[cfg(not(target_os = "windows"))]
+pub const NOT_FOUND: &str = "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again.";
+#[cfg(target_os = "windows")]
+pub const NOT_FOUND: &str =
+    "Couldn't find a computer with that name. Pick it from the list, or check the spelling and try again.";
 
 /// A non-Tailscale Target that answers without the encrypted Direct Link handshake (ADR 0005).
+#[cfg(not(target_os = "windows"))]
+pub const PLAINTEXT_REFUSED: &str = "That Mac needs the latest Boring Remote. Update it on that Mac, then try again.";
+#[cfg(target_os = "windows")]
 pub const PLAINTEXT_REFUSED: &str =
-    "That Mac answered without encryption, so Boring Remote didn't connect. Update it to the latest Boring Remote.";
+    "That computer needs the latest Boring Remote. Update it on that computer, then try again.";
 
-/// The Target's identity key differs from the one this Mac saw before.
-pub const IDENTITY_CHANGED: &str =
-    "That Mac's identity changed since you last connected, so Boring Remote didn't connect.";
+/// The Target's identity key differs from the one pinned for that address or ID.
+#[cfg(not(target_os = "windows"))]
+pub const IDENTITY_CHANGED: &str = "This isn't the Mac you connected to before, so Boring Remote stopped. If it was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
+#[cfg(target_os = "windows")]
+pub const IDENTITY_CHANGED: &str = "This isn't the computer you connected to before, so Boring Remote stopped. If it was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
 
 /// Controller-side memory of Targets met over an encrypted Direct Link (LocalConfig option).
 pub const KNOWN_OPTION: &str = "boring-direct-link-known";
@@ -364,7 +381,10 @@ pub async fn handshake(
         return Err(Failure::Refused(anyhow!(PLAINTEXT_REFUSED)));
     }
     // v1.7 t04: present this Target's trust token (if any) inside the encrypted stream.
-    crate::trust::present_for(&mut stream, &who.id, ms).await.map_err(Failure::Refused)?;
+    crate::trust::present_for(&mut stream, &who.id, ms).await.map_err(|e| {
+        log::warn!("trust exchange with {} failed: {}", addr, e);
+        Failure::Refused(anyhow!(PLAINTEXT_REFUSED))
+    })?;
     Ok((stream, Some(who)))
 }
 

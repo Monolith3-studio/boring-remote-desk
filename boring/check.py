@@ -548,8 +548,10 @@ def connect_checks(c):
     v4, v6 = tailnet_exprs()
     why = []
     for name, text in rebrand.CONNECT_ERRORS.items():
-        if f'pub const {name}: &str =' not in link or f'"{text}"' not in link.replace('"\n    "', ""):
-            why.append(f"{name} is not rebrand's text")
+        texts = (text, rebrand.on_windows(text))
+        if link.count(f'pub const {name}: &str =') != 2 or any(f'"{t}"' not in link for t in texts) \
+                or f'#[cfg(target_os = "windows")]\npub const {name}: &str =' not in link:
+            why.append(f"{name} is not rebrand's text, Mac and Windows wording")
     for need in ("lookup_host(host)", "_ => bail!(NOT_FOUND),",
                  "if addrs.is_empty() || !addrs.iter().all(|a| crate::lan::is_allowed(a.ip())) {\n        bail!(NOT_FOUND);"):
         if need not in plan:
@@ -581,7 +583,7 @@ def connect_checks(c):
     c.fact("Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)", not why, "; ".join(why))
 
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
-    missing = [f"{p.name}: {name}" for p in langs for name, text in rebrand.CONNECT_ERRORS.items()
+    missing = [f"{p.name}: {text[:30]}" for p in langs for text in rebrand.CONNECT_ERROR_KEYS
                if p.read_text(encoding="utf-8").count(f'("{text}", ') != 1]
     c.fact("every connect error (not found, not on this network, refused, identity changed) is in every translation file",
            langs and not missing, ", ".join(missing[:10]))
