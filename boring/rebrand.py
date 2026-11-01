@@ -1534,6 +1534,349 @@ PATCHES += [
      "the kit says computer on Windows (every window runs main)"),
 ]
 
+# --- v1.7 review: RustDesk look leftovers ------------------------------------------
+# Spec Decision 5: nothing left in the RustDesk look. desktop/kit/kit_look.dart,
+# connection_window.dart and install.dart are ours and bridge-free; these wire them into the
+# upstream surfaces Mac and Windows still show: every overlay dialog (password prompt, connecting,
+# errors in plain words with one next step), the session toolbar and the menus behind More, All
+# settings, the connection window (and Allow no longer minimises it), the Windows install screen.
+# common.dart's boringKit() puts a surface in the kit, with the theme extensions upstream code
+# reads (MyTheme.color, MyTheme.tabbar) in kit tokens. The kit has no light variant, so Mac and
+# Windows always run dark and the Theme card goes. The toolbar's own palette (_ToolbarTheme) moves
+# to kit tokens on every desktop, as the MyTheme palette above does.
+LOOK_TAB_PAGE = "flutter/lib/desktop/pages/desktop_tab_page.dart"
+LOOK_INSTALL = "flutter/lib/desktop/pages/install_page.dart"
+LOOK_DIALOGS = "flutter/lib/common/widgets/dialog.dart"
+LOOK_CHAT = "flutter/lib/common/widgets/chat_page.dart"
+LOOK_REMOTE_PAGES = ("flutter/lib/desktop/pages/remote_page.dart", "flutter/lib/desktop/pages/view_camera_page.dart")
+LOOK_GATE = "(isMacOS || isWindows)"
+LOOK_COMMON = (
+    "// boring-remote: v1.7 review. The kit for the upstream surfaces Mac and Windows still show,\n"
+    "// with the theme extensions upstream code reads (MyTheme.color, MyTheme.tabbar) in kit tokens.\n"
+    "final ThemeData boringKitTheme = kitLook(Kit.theme()).copyWith(extensions: const <ThemeExtension<dynamic>>[\n"
+    "  ColorThemeExtension(\n"
+    "      border: Kit.line,\n"
+    "      border2: Kit.line,\n"
+    "      border3: Kit.line,\n"
+    "      highlight: Kit.glass,\n"
+    "      drag_indicator: Kit.muted,\n"
+    "      shadow: Kit.ink,\n"
+    "      errorBannerBg: Kit.glass,\n"
+    "      me: Kit.ok,\n"
+    "      toastBg: Kit.glass,\n"
+    "      toastText: Kit.paper,\n"
+    "      divider: Kit.line),\n"
+    "  TabbarTheme(\n"
+    "      selectedTabIconColor: Kit.paper,\n"
+    "      unSelectedTabIconColor: Kit.muted,\n"
+    "      selectedTextColor: Kit.paper,\n"
+    "      unSelectedTextColor: Kit.muted,\n"
+    "      selectedIconColor: Kit.paper,\n"
+    "      unSelectedIconColor: Kit.muted,\n"
+    "      dividerColor: Kit.line,\n"
+    "      hoverColor: Kit.glass,\n"
+    "      closeHoverColor: Kit.line,\n"
+    "      selectedTabBackgroundColor: Kit.glass),\n"
+    "]);\n\n"
+    "/// [child] in the kit on Mac and Windows; other platforms keep the upstream look.\n"
+    "Widget boringKit(Widget child, {Key? key}) =>\n"
+    f"    {LOOK_GATE} ? Theme(key: key, data: boringKitTheme, child: child) : child;\n\n")
+LOOK_MESSAGE = (
+    f"  if {LOOK_GATE} {{\n"
+    "    // boring-remote: v1.7 review: plain words, the next step on an error, no RustDesk icons.\n"
+    "    final plain = kitMessageWords(type, title, text);\n"
+    "    return KitMessage(\n"
+    "      title: plain?.title ?? translate(title),\n"
+    "      body: plain?.body ?? translateText(text),\n"
+    "      next: plain?.next,\n"
+    "      waiting: kitMessageWaits(type, text),\n"
+    "    );\n"
+    "  }\n")
+LOOK_CM_HEADER = (
+    f"    if {LOOK_GATE} {{\n"
+    "      // boring-remote: v1.7 review: who is in, in the kit. No ID, no blue card.\n"
+    "      final kind = switch (client.type_()) {\n"
+    "        ClientType.file => ConnectedKind.files,\n"
+    "        ClientType.camera => ConnectedKind.camera,\n"
+    "        ClientType.terminal => ConnectedKind.terminal,\n"
+    "        ClientType.portForward => ConnectedKind.forward,\n"
+    "        ClientType.remote => ConnectedKind.control,\n"
+    "      };\n"
+    "      final canChat = client.authorized &&\n"
+    "          (kind == ConnectedKind.control || kind == ConnectedKind.files || kind == ConnectedKind.camera);\n"
+    "      return Obx(() => ConnectedHeader(\n"
+    "            name: client.name,\n"
+    "            kind: kind,\n"
+    "            allowed: client.authorized,\n"
+    "            ended: client.disconnected,\n"
+    "            connectedFor: Duration(seconds: _time.value),\n"
+    "            chatIsFiles: kind == ConnectedKind.files,\n"
+    "            onChat: !canChat\n"
+    "                ? null\n"
+    "                : () => checkClickTime(client.id, () {\n"
+    "                      if (kind == ConnectedKind.files) {\n"
+    "                        gFFI.chatModel.toggleCMFilePage();\n"
+    "                      } else {\n"
+    "                        gFFI.chatModel.toggleCMChatPage(MessageKey(client.peerId, client.id));\n"
+    "                      }\n"
+    "                    }),\n"
+    "          ));\n"
+    "    }\n")
+LOOK_CM_PERMISSIONS = (
+    "  // boring-remote: v1.7 review: what the other side may do, as plain switches in the kit.\n"
+    "  Widget _boringPermissions(bool canModify) {\n"
+    "    final c = client;\n"
+    "    final values = c.type_() == ClientType.camera\n"
+    "        ? {'audio': c.audio, 'recording': c.recording}\n"
+    "        : {\n"
+    "            'keyboard': c.keyboard,\n"
+    "            'clipboard': c.clipboard,\n"
+    "            'audio': c.audio,\n"
+    "            'file': c.file,\n"
+    "            'restart': c.restart,\n"
+    "            'recording': c.recording,\n"
+    "            if (isWindows) 'block_input': c.blockInput,\n"
+    "            if (bind.mainSupportedPrivacyModeImpls() != '[]') 'privacy_mode': c.privacyMode,\n"
+    "          };\n"
+    "    return PermissionSwitches(\n"
+    "      values: values,\n"
+    "      canChange: canModify,\n"
+    "      onChanged: (name, on) => checkClickTime(c.id, () {\n"
+    "        bind.cmSwitchPermission(connId: c.id, name: name, enabled: on);\n"
+    "        setState(() {\n"
+    "          switch (name) {\n"
+    "            case 'keyboard':\n"
+    "              c.keyboard = on;\n"
+    "            case 'clipboard':\n"
+    "              c.clipboard = on;\n"
+    "            case 'audio':\n"
+    "              c.audio = on;\n"
+    "            case 'file':\n"
+    "              c.file = on;\n"
+    "            case 'restart':\n"
+    "              c.restart = on;\n"
+    "            case 'recording':\n"
+    "              c.recording = on;\n"
+    "            case 'block_input':\n"
+    "              c.blockInput = on;\n"
+    "            case 'privacy_mode':\n"
+    "              c.privacyMode = on;\n"
+    "          }\n"
+    "        });\n"
+    "      }),\n"
+    "    );\n"
+    "  }\n\n")
+LOOK_CM_BUTTON = (
+    f"    if {LOOK_GATE} {{\n"
+    "      // boring-remote: v1.7 review: connection window buttons in the kit.\n"
+    "      final kitButton = CmButton(\n"
+    "        label: translate(text),\n"
+    "        icon: icon is Icon ? icon.icon : null,\n"
+    "        primary: CmButton.primaryKeys.contains(text),\n"
+    "        onTap: () {\n"
+    "          if (onClick != null) checkClickTime(client.id, onClick);\n"
+    "        },\n"
+    "        onTapDown: (details) {\n"
+    "          if (onTapDown != null) checkClickTime(client.id, () => onTapDown(details));\n"
+    "        },\n"
+    "      );\n"
+    "      return tooltip != null ? Tooltip(message: translate(tooltip), child: kitButton) : kitButton;\n"
+    "    }\n")
+LOOK_INSTALL_METHOD = (
+    "  // boring-remote: v1.7 review. The install screen in the kit: plain words, one Install button.\n"
+    "  Widget boringInstallScreen() => Obx(() => InstallScreen(\n"
+    "        path: controller,\n"
+    "        onChangePath: selectInstallPath,\n"
+    "        startMenu: startmenu.value,\n"
+    "        onStartMenu: (v) => startmenu.value = v,\n"
+    "        desktopIcon: desktopicon.value,\n"
+    "        onDesktopIcon: (v) => desktopicon.value = v,\n"
+    "        printer: printer.value,\n"
+    "        onPrinter: (v) => printer.value = v,\n"
+    "        installing: showProgress.value || !btnEnabled.value,\n"
+    "        canTryWithoutInstalling: !bind.installShowRunWithoutInstall(),\n"
+    "        onInstall: install,\n"
+    "        onCancel: () => windowManager.close(),\n"
+    "        onTryWithoutInstalling: () => bind.installRunWithoutInstall(),\n"
+    f"        onLicence: () => launchUrlString('{FORK_URL}'),\n"
+    "      ));\n\n")
+# Allow keeps the connection window up (review: minimising was not asked for). t04's prompt is
+# folded in its own patch, as t04 and t06 did, so a second rebrand still finds it whole.
+LOOK_ALLOW = ("            onAllow: () {\n"
+              "              handleAccept(context);\n"
+              "              windowManager.minimize();\n"
+              "            },\n",
+              "            // Allow keeps this window up: the card shows who is in and how to end it.\n"
+              "            onAllow: () => handleAccept(context),\n")
+PATCHES[:] = [(rel, old, new.replace(*LOOK_ALLOW) if rel == CM_PAGE and isinstance(new, str) else new, why)
+              for rel, old, new, why in PATCHES]
+if not any(rel == CM_PAGE and LOOK_ALLOW[1] in new for rel, _, new, _ in PATCHES):
+    raise SystemExit("rebrand: t04's approval prompt moved; the v1.7 review fold for Allow found nothing")
+PATCHES += [
+    # the kit for upstream surfaces, and Mac and Windows always dark
+    (DART_COMMON, "import 'package:flutter_hbb/desktop/widgets/refresh_wrapper.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/refresh_wrapper.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit_look.dart';\n", "kit look imports"),
+    (DART_COMMON, "class MyTheme {\n  MyTheme._();\n", LOOK_COMMON + "class MyTheme {\n  MyTheme._();\n",
+     "boringKit: an upstream surface in the kit"),
+    (DART_COMMON, "  static ThemeMode getThemeModePreference() {\n    return themeModeFromString(",
+     "  static ThemeMode getThemeModePreference() {\n"
+     f"    if {LOOK_GATE} return ThemeMode.dark; // boring-remote: the kit is dark (v1.7 review)\n"
+     "    return themeModeFromString(", "Mac and Windows always run the dark kit"),
+    (SETTINGS, "  Widget theme() {\n    final current = MyTheme.getThemeModePreference().toShortString();\n",
+     "  Widget theme() {\n"
+     f"    if {LOOK_GATE} return const Offstage(); // boring-remote: the kit is always dark\n"
+     "    final current = MyTheme.getThemeModePreference().toShortString();\n", "no Theme card on Mac and Windows"),
+    # dialogs: every overlay dialog in the kit, connection messages in plain words
+    (DART_COMMON, "                  onPointerUp: (_) => innerClicked = true,\n"
+     "                  child: builder(setState, close, overlayState.context),\n",
+     "                  onPointerUp: (_) => innerClicked = true,\n"
+     "                  // boring-remote: v1.7 review: every dialog in the kit on Mac and Windows.\n"
+     "                  child: boringKit(builder(setState, close, overlayState.context)),\n",
+     "dialogs in the kit"),
+    (DART_COMMON, "  return Row(\n    children: [\n      msgboxIcon(type),\n",
+     LOOK_MESSAGE + "  return Row(\n    children: [\n      msgboxIcon(type),\n", "connection messages in plain words"),
+    (LOOK_DIALOGS, "import 'package:flutter_hbb/models/peer_tab_model.dart';\n",
+     "import 'package:flutter_hbb/models/peer_tab_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit_look.dart';\n", "password prompt words import"),
+    (LOOK_DIALOGS, "      title: Row(\n        mainAxisAlignment: MainAxisAlignment.center,\n        children: [\n"
+     "          Icon(Icons.password_rounded, color: MyTheme.accent),\n"
+     "          Text(translate('Password Required')).paddingOnly(left: 10),\n        ],\n      ),\n",
+     f"      title: {LOOK_GATE}\n"
+     "          ? Text(KitPasswordWords.title) // boring-remote: v1.7 review, plain words\n"
+     "          : Row(\n              mainAxisAlignment: MainAxisAlignment.center,\n              children: [\n"
+     "                Icon(Icons.password_rounded, color: MyTheme.accent),\n"
+     "                Text(translate('Password Required')).paddingOnly(left: 10),\n              ],\n            ),\n",
+     "password prompt title"),
+    (LOOK_DIALOGS, "          descWidget(translate('verify_rustdesk_password_tip')),\n",
+     f"          descWidget({LOOK_GATE}\n"
+     "              ? KitPasswordWords.body\n"
+     "              : translate('verify_rustdesk_password_tip')),\n", "password prompt body"),
+    (LOOK_DIALOGS, "          rememberWidget(\n            translate('Remember password'),\n",
+     "          rememberWidget(\n"
+     f"            {LOOK_GATE} ? KitPasswordWords.remember : translate('Remember password'),\n",
+     "password prompt remember box"),
+    # session toolbar and every menu behind More
+    (T07_TOOLBAR, "import 'package:flutter_hbb/models/state_model.dart';\n",
+     "import 'package:flutter_hbb/models/state_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n", "toolbar palette import"),
+    (T07_TOOLBAR, "  static const Color blueColor = MyTheme.button;\n"
+     "  static const Color hoverBlueColor = MyTheme.accent;\n"
+     "  static Color inactiveColor = Colors.grey[800]!;\n"
+     "  static Color hoverInactiveColor = Colors.grey[850]!;\n\n"
+     "  static const Color redColor = Colors.redAccent;\n"
+     "  static const Color hoverRedColor = Colors.red;\n",
+     "  // boring-remote: v1.7 review: toolbar and More icons in kit tokens (a coral fill marks\n"
+     "  // recording or a call to end; it never sits under text).\n"
+     "  static const Color blueColor = Kit.glass;\n"
+     "  static const Color hoverBlueColor = Kit.line;\n"
+     "  static Color inactiveColor = Kit.panel;\n"
+     "  static Color hoverInactiveColor = Kit.glass;\n\n"
+     "  static const Color redColor = Kit.coral;\n"
+     "  static const Color hoverRedColor = Kit.coral;\n", "toolbar palette in kit tokens"),
+] + [
+    p for page in LOOK_REMOTE_PAGES for p in (
+        (page, "    remoteToolbar(BuildContext context) => RemoteToolbar(\n",
+         "    // boring-remote: v1.7 review: the toolbar and every menu behind More in the kit.\n"
+         "    remoteToolbar(BuildContext context) => boringKit(RemoteToolbar(\n", "toolbar in the kit"),
+        (page, "          setRemoteState: setState,\n        );\n\n    bodyWidget() {\n",
+         "          setRemoteState: setState,\n        ));\n\n    bodyWidget() {\n", "toolbar in the kit (close)"),
+    )
+] + [
+    # All settings: kit theme, kit sections and tab list
+    (LOOK_TAB_PAGE, "          page: DesktopSettingPage(\n            key: const ValueKey(kTabLabelSettingPage),\n"
+     "            initialTabkey: initialPage,\n          )));\n",
+     "          // boring-remote: v1.7 review: All settings in the kit on Mac and Windows.\n"
+     "          page: boringKit(\n              DesktopSettingPage(\n"
+     "                key: const ValueKey(kTabLabelSettingPage),\n                initialTabkey: initialPage,\n"
+     "              ),\n              key: const ValueKey(kTabLabelSettingPage))));\n", "All settings in the kit"),
+    (SETTINGS, "import 'package:flutter_hbb/models/printer_model.dart';\n",
+     "import 'package:flutter_hbb/models/printer_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit_look.dart';\n", "All settings kit import"),
+    (SETTINGS, "Widget _Card(\n    {required String title,\n    required List<Widget> children,\n"
+     "    List<Widget>? title_suffix}) {\n  return Row(\n",
+     "Widget _Card(\n    {required String title,\n    required List<Widget> children,\n"
+     "    List<Widget>? title_suffix}) {\n"
+     f"  if {LOOK_GATE} {{\n"
+     "    // boring-remote: v1.7 review: All settings' sections in the kit.\n"
+     "    return KitSection(title: translate(title), trailing: title_suffix ?? const [], children: children);\n"
+     "  }\n  return Row(\n", "All settings sections in the kit"),
+    (SETTINGS, "      bool selected = tab.key == selectedTab.value;\n      return SizedBox(\n"
+     "        width: _kTabWidth,\n        height: _kTabHeight,\n",
+     "      bool selected = tab.key == selectedTab.value;\n"
+     f"      if {LOOK_GATE} {{\n"
+     "        // boring-remote: v1.7 review: All settings' tab list in the kit.\n"
+     "        return KitTabRow(\n"
+     "          label: translate(tab.label),\n"
+     "          icon: selected ? tab.selected : tab.unselected,\n"
+     "          selected: selected,\n"
+     "          onTap: () {\n"
+     "            if (selectedTab.value != tab.key) {\n"
+     "              final index = DesktopSettingPage.tabKeys.indexOf(tab.key);\n"
+     "              if (index == -1) return;\n"
+     "              controller.jumpToPage(index);\n"
+     "            }\n"
+     "            selectedTab.value = tab.key;\n"
+     "          },\n"
+     "        );\n"
+     "      }\n"
+     "      return SizedBox(\n        width: _kTabWidth,\n        height: _kTabHeight,\n",
+     "All settings tab list in the kit"),
+    # connection window after Allow: who is in, plain switches, kit buttons, kit chat bubbles
+    (CM_PAGE, "import 'package:flutter_hbb/utils/platform_channel.dart';\n",
+     "import 'package:flutter_hbb/utils/platform_channel.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/connection_window.dart';\n", "connection window kit import"),
+    (CM_PAGE, "          final body = Scaffold(\n            backgroundColor: Theme.of(context).colorScheme.background,\n"
+     "            body: ConnectionManager(),\n          );\n",
+     "          // boring-remote: v1.7 review: the connection window in the kit on Mac and Windows.\n"
+     "          final body = boringKit(Scaffold(\n"
+     f"            backgroundColor: {LOOK_GATE} ? Kit.ink : Theme.of(context).colorScheme.background,\n"
+     "            body: ConnectionManager(),\n          ));\n", "connection window in the kit"),
+    (CM_PAGE, "    super.build(context);\n    return Container(\n      decoration: BoxDecoration(\n"
+     "        borderRadius: BorderRadius.circular(10.0),\n        gradient: LinearGradient(\n",
+     "    super.build(context);\n" + LOOK_CM_HEADER + "    return Container(\n      decoration: BoxDecoration(\n"
+     "        borderRadius: BorderRadius.circular(10.0),\n        gradient: LinearGradient(\n",
+     "connection window: who is in"),
+    (CM_PAGE, "  @override\n  Widget build(BuildContext context) {\n    final crossAxisCount = 4;\n",
+     LOOK_CM_PERMISSIONS + "  @override\n  Widget build(BuildContext context) {\n    final crossAxisCount = 4;\n",
+     "connection window: plain permission switches"),
+    (CM_PAGE, "            'N';\n    return Container(\n      width: double.infinity,\n      height: 160.0,\n",
+     "            'N';\n"
+     f"    if {LOOK_GATE} return _boringPermissions(canModifyPermission);\n"
+     "    return Container(\n      width: double.infinity,\n      height: 160.0,\n",
+     "connection window: switches replace the RustDesk grid"),
+    (CM_PAGE, "    assert(!(onClick == null && onTapDown == null));\n    Widget textWidget;\n",
+     "    assert(!(onClick == null && onTapDown == null));\n" + LOOK_CM_BUTTON + "    Widget textWidget;\n",
+     "connection window buttons in the kit"),
+    (LOOK_CHAT, "import 'package:flutter_hbb/models/chat_model.dart';\n",
+     "import 'package:flutter_hbb/models/chat_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n", "chat kit import"),
+    (LOOK_CHAT, "                          color:\n                              isOwnMessage ? MyTheme.button : Colors.blueGrey,\n",
+     f"                          color: {LOOK_GATE} // boring-remote: v1.7 review, kit bubbles\n"
+     "                              ? (isOwnMessage ? Kit.glass : Kit.line)\n"
+     "                              : isOwnMessage ? MyTheme.button : Colors.blueGrey,\n", "chat bubbles in the kit"),
+    (LOOK_CHAT, "                              style: TextStyle(\n                                color: Colors.white,\n"
+     "                                fontSize: 8,\n",
+     "                              style: TextStyle(\n"
+     f"                                color: {LOOK_GATE} ? Kit.muted : Colors.white,\n"
+     f"                                fontSize: {LOOK_GATE} ? 12 : 8,\n", "chat time 12px floor"),
+    # Windows install screen
+    (LOOK_INSTALL, "import 'package:flutter_hbb/models/state_model.dart';\n",
+     "import 'package:flutter_hbb/models/state_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/install.dart';\n", "install screen imports"),
+    (LOOK_INSTALL, "        child: Scaffold(\n            backgroundColor: Theme.of(context).colorScheme.background,\n"
+     "            body: DesktopTab(controller: tabController)),\n",
+     "        child: boringKit(Scaffold(\n"
+     f"            backgroundColor: {LOOK_GATE} ? Kit.ink : Theme.of(context).colorScheme.background,\n"
+     "            body: DesktopTab(controller: tabController))),\n", "install window in the kit"),
+    (LOOK_INSTALL, "  @override\n  Widget build(BuildContext context) {\n    final double em = 13;\n",
+     LOOK_INSTALL_METHOD + "  @override\n  Widget build(BuildContext context) {\n"
+     f"    if {LOOK_GATE} return boringInstallScreen();\n    final double em = 13;\n",
+     "install screen in the kit"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

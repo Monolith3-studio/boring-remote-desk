@@ -605,6 +605,46 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.HOME, " && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable)", "")
         self.assert_check_fails("Windows reach check counts the installer's rule only for this exe (v1.7 t12 follow-up)")
 
+    # --- v1.7 review: nothing left in the RustDesk look ------------------------------
+    def test_more_menus_back_in_rustdesk_colours_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.T07_TOOLBAR, "static const Color blueColor = Kit.glass;",
+                  "static const Color blueColor = MyTheme.button;")
+        self.assert_check_fails("session toolbar and its More menus in the kit on Mac and Windows")
+
+    def test_rustdesk_cards_back_in_all_settings_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "    return KitSection(title: translate(title), trailing: title_suffix ?? const [],"
+                  " children: children);\n", "")
+        self.assert_check_fails("All settings in the kit on Mac and Windows: sections, tab list, buttons, checkboxes")
+
+    def test_connection_window_minimised_on_allow_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CM_PAGE, "onAllow: () => handleAccept(context),",
+                  "onAllow: () {\n              handleAccept(context);\n              windowManager.minimize();\n"
+                  "            },")
+        self.assert_check_fails("connection window in the kit: who is in, plain switches, kit buttons; Allow keeps it open")
+
+    def test_rustdesk_message_icon_back_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/common.dart", "    final plain = kitMessageWords(type, title, text);\n",
+                  "    msgboxIcon(type);\n    final plain = kitMessageWords(type, title, text);\n")
+        r = run(CHECK, self.root)
+        self.assertIn("FAIL dialogs in the kit on Mac and Windows: password prompt, connecting and errors in plain words: "
+                      "msgboxContent shows RustDesk's icon before the kit message", r.stdout)
+
+    def test_rustdesk_install_page_back_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.LOOK_INSTALL, "    if (isMacOS || isWindows) return boringInstallScreen();\n", "")
+        self.assert_check_fails("Windows install screen in the kit, plain words")
+
+    def test_coral_text_in_the_look_kit_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/kit_look.dart", "TextStyle(color: Kit.paper, fontSize: 18",
+                  "TextStyle(color: Kit.coral, fontSize: 18")
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL look kit wired: .*kit_look.dart: coral text")
+
 
 if __name__ == "__main__":
     unittest.main()

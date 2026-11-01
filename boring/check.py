@@ -993,6 +993,86 @@ def updater_checks(c):
     c.fact("both update public keys present and different (ADR 0004)", ok, str(keys))
 
 
+# v1.7 review (spec Decision 5): our kit files for the upstream surfaces, kit tokens only.
+LOOK_KIT = ("flutter/lib/desktop/kit/kit_look.dart", "flutter/lib/desktop/kit/connection_window.dart",
+            "flutter/lib/desktop/kit/install.dart")
+LOOK_OFF_KIT = re.compile(r"MyTheme\.\w+|Colors\.(?!transparent\b)\w+|Color\(0x[0-9A-Fa-f]+\)")
+LOOK_CORAL_TEXT = re.compile(r"(?:TextStyle\(" + ARGS + r"|(?:foreground|label)Color: (?:const )?)Kit\.coral\b")
+
+
+def look_checks(c):
+    """v1.7 review, spec Decision 5 (nothing left in the RustDesk look): the upstream surfaces Mac
+    and Windows still show wear the kit, in the rebranded tree."""
+    common, gate = c.read(rebrand.DART_COMMON), rebrand.LOOK_GATE
+    off = [f"{rel}: {h}" for rel in LOOK_KIT for h in LOOK_OFF_KIT.findall(strip_tests_and_comments(c.read(rel)))]
+    off += [f"{rel}: coral text" for rel in LOOK_KIT if not c.read(rel) or LOOK_CORAL_TEXT.search(c.read(rel))]
+    for needle in ("final ThemeData boringKitTheme = kitLook(Kit.theme())",
+                   f"{gate} ? Theme(key: key, data: boringKitTheme, child: child) : child;",
+                   f"if {gate} return ThemeMode.dark;"):
+        if needle not in common:
+            off.append(f"common.dart: no {needle[:48]}")
+    c.fact("look kit wired: Mac and Windows run the dark kit, kit look files use kit tokens, coral never text",
+           not off, "; ".join(off[:10]))
+
+    # Dialogs: the kit branch of msgboxContent comes before RustDesk's coloured icons.
+    msg = fn_body(common, "Widget msgboxContent(String type, String title, String text) {") or ""
+    i, j = msg.find("return KitMessage("), msg.find("msgboxIcon(type)")
+    dialog = c.read(rebrand.LOOK_DIALOGS)
+    missing = [n for text, n in [
+        (common, "child: boringKit(builder(setState, close, overlayState.context)),"),
+        (msg, "final plain = kitMessageWords(type, title, text);"),
+        (dialog, f"title: {gate}\n          ? Text(KitPasswordWords.title)"),
+        (dialog, "? KitPasswordWords.body"), (dialog, f"{gate} ? KitPasswordWords.remember"),
+    ] if n not in text]
+    if not 0 <= i < j:
+        missing.append("msgboxContent shows RustDesk's icon before the kit message")
+    c.fact("dialogs in the kit on Mac and Windows: password prompt, connecting and errors in plain words",
+           not missing, "; ".join(missing))
+
+    # Session toolbar: every menu behind More inherits the kit; the toolbar's palette is kit tokens.
+    bar = c.read(rebrand.T07_TOOLBAR)
+    palette = fn_body(bar, "class _ToolbarTheme {") or ""
+    missing = [f"{rel}: not wrapped" for rel in rebrand.LOOK_REMOTE_PAGES
+               if "remoteToolbar(BuildContext context) => boringKit(RemoteToolbar(" not in c.read(rel)]
+    missing += [n for n in ("static const Color blueColor = Kit.glass;", "static const Color redColor = Kit.coral;")
+                if n not in palette]
+    missing += [f"_ToolbarTheme: {h}" for h in re.findall(r"MyTheme\.(?:button|accent)\b|Colors\.(?:red|grey)\w*", palette)]
+    c.fact("session toolbar and its More menus in the kit on Mac and Windows", not missing, "; ".join(missing))
+
+    # All settings: the kit theme, kit sections and the kit tab list, no Theme card.
+    settings = c.read(rebrand.SETTINGS)
+    card = fn_body(settings, "    List<Widget>? title_suffix}) {") or ""
+    missing = [n for text, n in [
+        (c.read(rebrand.LOOK_TAB_PAGE), "page: boringKit(\n              DesktopSettingPage("),
+        (card, "return KitSection(title: translate(title)"),
+        (settings, "return KitTabRow("),
+        (settings, f"if {gate} return const Offstage(); // boring-remote: the kit is always dark"),
+    ] if n not in text]
+    if card.find("return KitSection(") > card.find("Card(\n") >= 0:
+        missing.append("_Card builds RustDesk's card before the kit section")
+    c.fact("All settings in the kit on Mac and Windows: sections, tab list, buttons, checkboxes",
+           not missing, "; ".join(missing))
+
+    # Connection window: kit card, plain switches, kit buttons, and Allow leaves the window up.
+    cm = c.read(rebrand.CM_PAGE)
+    prompt = cm[cm.find("ApprovalPrompt("):cm.find("onDeny:", cm.find("ApprovalPrompt("))]
+    missing = [n for n in ("final body = boringKit(Scaffold(", "return Obx(() => ConnectedHeader(",
+                           f"if {gate} return _boringPermissions(canModifyPermission);", "return PermissionSwitches(",
+                           "final kitButton = CmButton(", "onAllow: () => handleAccept(context),") if n not in cm]
+    if "ApprovalPrompt(" not in cm or "minimize" in prompt:
+        missing.append("Allow minimises the connection window")
+    if "? (isOwnMessage ? Kit.glass : Kit.line)" not in c.read(rebrand.LOOK_CHAT):
+        missing.append("chat bubbles not in the kit")
+    c.fact("connection window in the kit: who is in, plain switches, kit buttons; Allow keeps it open",
+           not missing, "; ".join(missing))
+
+    inst = c.read(rebrand.LOOK_INSTALL)
+    missing = [n for n in (f"if {gate} return boringInstallScreen();", "Obx(() => InstallScreen(",
+                           "child: boringKit(Scaffold(", f"onLicence: () => launchUrlString('{rebrand.FORK_URL}'),")
+               if n not in inst]
+    c.fact("Windows install screen in the kit, plain words", not missing, "; ".join(missing))
+
+
 def run_checks(root):
     c = Check(root)
     cfg = c.read(HBB)
@@ -1192,6 +1272,7 @@ def run_checks(root):
     msi_checks(c, workflows)
     branding_checks(c)
     connect_checks(c)
+    look_checks(c)  # v1.7 review: nothing left in the RustDesk look
 
     # protocol untouched: every .proto in the tree is upstream's, byte for byte
     c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))
