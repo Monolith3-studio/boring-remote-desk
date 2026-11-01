@@ -223,6 +223,34 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", "        let addr = hbb_common::try_into_v4(addr);\n", "")
         self.assert_check_fails("whitelist is enforced on incoming connections")
 
+    # --- ADR 0003: private LAN allowed, LAN Discovery on ---------------------
+    WHITELIST_FACT = "whitelist locked to Tailscale + private LAN, nothing public (ADR 0003)"
+    LAN_LISTENER = "LAN discovery listener answers pings (ADR 0003)"
+    LAN_UNLOCKED = "LAN discovery not locked off (ADR 0003)"
+
+    def test_lan_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.WHITELIST_FACT, self.LAN_LISTENER, self.LAN_UNLOCKED):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_public_range_in_whitelist_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HBB, "192.168.0.0/16", "192.168.0.0/16,8.8.8.0/24")
+        self.assert_check_fails(self.WHITELIST_FACT)
+
+    def test_lan_listener_stripped_again_fails_check(self):
+        self.rebrand()
+        sig = "pub(super) fn start_listening() -> ResultType<()> {\n"
+        self.edit("src/lan.rs", sig, f"{sig}    {rebrand.GUARD_OK}\n")
+        self.assert_check_fails(self.LAN_LISTENER)
+
+    def test_lan_discovery_locked_off_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HBB, '("direct-server", "Y")',
+                  '("direct-server", "Y"), ("enable-lan-discovery", "N")')
+        self.assert_check_fails(self.LAN_UNLOCKED)
+
     def test_changed_protocol_file_fails_check(self):
         self.rebrand()
         proto = self.root / "libs/hbb_common/protos/rendezvous.proto"
@@ -310,6 +338,20 @@ class RebrandSeam(unittest.TestCase):
                   "color: MyTheme.accent,")
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*desktop_setting_page.dart:\d+")
+
+    # --- v1.7 t09: extras in the kit, one simple Settings page ------
+    def test_upstream_colour_back_in_an_extras_screen_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/pages/port_forward_page.dart", "color: Kit.line", "color: Colors.red")
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL port forward, terminal and camera use kit tokens only: "
+                                   r".*port_forward_page.dart: Colors.red")
+
+    def test_simple_settings_unwired_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "SimpleSettings(", "Placeholder(")
+        r = run(CHECK, self.root)
+        self.assertIn("FAIL Mac Settings is one simple page with Advanced behind it", r.stdout)
 
     # --- connect by tailnet name ----------------------------------
     def test_domain_port_branch_back_in_connect_fails_check(self):

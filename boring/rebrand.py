@@ -31,6 +31,10 @@ LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Sour
 # MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
+# ADR 0003: the private LAN is allowed too (RFC 1918, IPv6 ULA and link-local),
+# so Macs on the same network connect Direct. Public addresses stay blocked.
+PRIVATE_LAN = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
+WHITELIST = f"{TAILNET},{PRIVATE_LAN}"
 
 # What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
@@ -71,13 +75,12 @@ GUARD = "if true { return; } // boring-remote: stripped"
 GUARD_OK = "if true { return Ok(()); } // boring-remote: stripped"
 
 LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows them fixed
-    "whitelist": TAILNET,
+    "whitelist": WHITELIST,
     "direct-server": "Y",
     "custom-rendezvous-server": "",
     "relay-server": "",
     "api-server": "",
     "allow-auto-update": "N",
-    "enable-lan-discovery": "N",  # no answering LAN pings with ID, hostname, user, MAC
     "rendezvous-servers": "",     # a server list the config file could otherwise carry
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
@@ -230,7 +233,7 @@ PATCHES = [
     # --- locked settings ----------------------------------------------------
     (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(LOCKED) + ";",
-     "whitelist, Direct IP, empty servers, no auto update, no LAN discovery"),
+     "whitelist, Direct IP, empty servers, no auto update"),
     (HBB, "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(DEFAULTS) + ";",
      "allow-only-conn-window-open off by default"),
@@ -251,9 +254,6 @@ PATCHES = [
      f"fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {{\n    {GUARD}\n", "Windows auto-updater"),
     ("src/updater.rs", "pub fn start_auto_update_macos() {\n",
      f"pub fn start_auto_update_macos() {{\n    {GUARD}\n", "Mac auto-updater"),
-    ("src/lan.rs", "pub(super) fn start_listening() -> ResultType<()> {\n",
-     f"pub(super) fn start_listening() -> ResultType<()> {{\n    {GUARD_OK}\n",
-     "LAN discovery listener: never binds UDP 21119"),
     # --- banned codecs: hwcodec / vram --------------------------------------
     ("build.py", "    if args.hwcodec:\n        features.append('hwcodec')\n"
                  "    if args.vram:\n        features.append('vram')\n",
@@ -572,10 +572,12 @@ MAC_HOME_METHOD = (
     "      child: Material(\n"
     "        color: Kit.ink,\n"
     "        child: ListenableBuilder(\n"
-    "          listenable: Listenable.merge([recents, id]),\n"
+    "          listenable: Listenable.merge([recents, id, lanMacs]),\n"
     "          builder: (context, _) => MacHome(\n"
     "            macs: [for (final p in recents.peers) MacEntry(name: name(p), target: p.id)],\n"
     "            myId: id.text,\n"
+    "            lan: lanMacs.macs,\n"
+    "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
     "            notices: [\n"
     + NOTICE_BANNER +
@@ -589,6 +591,7 @@ PATCHES += [
     (HOME, "import 'package:flutter_hbb/consts.dart';\n",
      "import 'package:flutter_hbb/consts.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/lan_macs_model.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
      "import 'package:flutter_hbb/models/peer_model.dart';\n",
      "Mac Home imports"),
@@ -820,7 +823,7 @@ PATCHES += [
 # --- Multi-window sessions, each full screen (v1.7 ticket 11) ---------------------
 # New sessions open in their own window: the tabs option defaults off (new installs and
 # upgrades; a stored "Y" from someone who ticked it keeps tabs). The checkbox stays on the
-# settings page (kOptionOpenNewConnInTabs), which ticket 09 moves under Advanced.
+# full settings page (kOptionOpenNewConnInTabs) = Advanced; ticket 09's simple page links there.
 # A full-screen session remembers its monitor per Target: desktop/kit/session_window.dart is
 # the bridge-free decision, these hooks feed it the live frame and screens, and restore moves
 # the window to that monitor before going full screen on Mac too.
@@ -894,6 +897,146 @@ PATCHES += [
      "        // boring-remote: Mac too, so full screen lands on the Target's monitor.\n"
      "        await restoreFrame();\n",
      "reopen a Target on its monitor before full screen"),
+]
+
+# --- Extras in the kit + one simple Settings page (v1.7 ticket 09) ----------------
+# desktop/kit/simple_settings.dart and kit_extras.dart are ours and bridge-free; these wire them
+# in. Port forward, terminal and camera view get the kit theme and kit tokens (check.py:
+# EXTRAS_PAGES). Settings on Mac opens on SimpleSettings; the full tabs sit behind Advanced.
+PORT_FWD = "flutter/lib/desktop/pages/port_forward_page.dart"
+TERMINAL = "flutter/lib/desktop/pages/terminal_page.dart"
+CAMERA = "flutter/lib/desktop/pages/view_camera_page.dart"
+KIT_IMPORTS = ("import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+               "import 'package:flutter_hbb/desktop/kit/kit_extras.dart';\n")
+BORING_MAC_NAME_OPTION = "boring-device-name"  # server-side: the LAN listener answers with it (t02/t06)
+SIMPLE_SETTINGS_METHOD = (
+    "  // boring-remote: v1.7 Settings. One simple page on Mac; the full tabs are Advanced.\n"
+    "  bool _boringAdvanced = false;\n\n"
+    "  void _boringOpenAdvanced(SettingsTabKey tab) {\n"
+    "    setState(() => _boringAdvanced = true);\n"
+    "    WidgetsBinding.instance.addPostFrameCallback((_) {\n"
+    "      final i = DesktopSettingPage.tabKeys.indexOf(tab);\n"
+    "      if (i >= 0 && controller.hasClients) controller.jumpToPage(i);\n"
+    "    });\n"
+    "  }\n\n"
+    "  Widget buildBoringSettings(BuildContext context) {\n"
+    f"    const nameKey = '{BORING_MAC_NAME_OPTION}';\n"
+    "    final name = bind.mainGetOptionSync(key: nameKey);\n"
+    "    return Theme(\n"
+    "      data: Kit.theme(),\n"
+    "      child: Material(\n"
+    "        color: Kit.ink,\n"
+    "        child: SimpleSettings(\n"
+    "          macName: name.isNotEmpty ? name : Platform.localHostname.replaceAll('.local', ''),\n"
+    "          onRename: (n) => bind.mainSetOption(key: nameKey, value: n),\n"
+    "          passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
+    "          setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
+    "          // Start at login = the LaunchAgent is installed and the service isn't stopped.\n"
+    "          // Off stops the service (it stays off across restarts until turned back on).\n"
+    "          startAtLogin: bind.mainIsInstalledDaemon(prompt: false) &&\n"
+    "              !mainGetBoolOptionSync(kOptionStopService),\n"
+    "          onStartAtLogin: (on) async {\n"
+    "            if (on) bind.mainIsInstalledDaemon(prompt: true);\n"
+    "            await mainSetBoolOption(kOptionStopService, !on);\n"
+    "            setState(() {});\n"
+    "          },\n"
+    "          checkUpdates: mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
+    "          onCheckUpdates: (on) async {\n"
+    "            await mainSetLocalBoolOption(kBoringUpdateCheckOption, on);\n"
+    "            setState(() {});\n"
+    "          },\n"
+    "          advanced: [\n"
+    "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
+    "            SettingsLink(\n"
+    "              label: 'Sessions open in windows or tabs',\n"
+    "              onTap: () => _boringOpenAdvanced(SettingsTabKey.general), // v1.7 t11 owns this choice\n"
+    "            ),\n"
+    "            SettingsLink(\n"
+    "              label: 'All settings',\n"
+    "              onTap: () => _boringOpenAdvanced(DesktopSettingPage.tabKeys.first),\n"
+    "            ),\n"
+    "          ],\n"
+    "        ),\n"
+    "      ),\n"
+    "    );\n"
+    "  }\n\n")
+PATCHES += [
+    # Settings
+    (SETTINGS, "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
+     "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n",
+     "simple Settings imports"),
+    (SETTINGS, "    super.build(context);\n    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).colorScheme.background,\n      body: _buildBlock(\n",
+     "    super.build(context);\n"
+     "    if (isMacOS && !_boringAdvanced) {\n"
+     "      return _buildBlock(children: [Expanded(child: buildBoringSettings(context))]);\n"
+     "    }\n"
+     "    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).colorScheme.background,\n      body: _buildBlock(\n",
+     "Mac Settings opens on the simple page"),
+    (SETTINGS, "  Widget _header(BuildContext context) {\n",
+     SIMPLE_SETTINGS_METHOD + "  Widget _header(BuildContext context) {\n",
+     "simple Settings wiring"),
+    (SETTINGS, "        const Spacer(),\n      ],\n",
+     "        const Spacer(),\n"
+     "        if (isMacOS)\n"
+     "          TextButton(\n"
+     "            onPressed: () => setState(() => _boringAdvanced = false),\n"
+     "            child: const Text('Back to Settings'),\n"
+     "          ).marginOnly(right: 20, top: 10),\n"
+     "      ],\n",
+     "Advanced goes back to the simple page"),
+    # Port forward
+    (PORT_FWD, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n" + KIT_IMPORTS, "port forward: kit imports"),
+    (PORT_FWD, "    super.build(context);\n    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).scaffoldBackgroundColor,\n      body: FutureBuilder(",
+     "    super.build(context);\n    return Theme(\n      data: kitThemeKeeping(context),\n      child: Scaffold(\n"
+     "      backgroundColor: Kit.ink,\n      body: FutureBuilder(",
+     "port forward: kit theme"),
+    (PORT_FWD, "        return const Offstage();\n      }),\n    );\n  }\n",
+     "        return const Offstage();\n      }),\n    ));\n  }\n", "port forward: close kit theme"),
+    (PORT_FWD, "color: MyTheme.border", "color: Kit.line", "port forward: kit border"),
+    (PORT_FWD, "color: const Color(0xFF007F00),", "color: Kit.panel,", "port forward: listening bar"),
+    (PORT_FWD, "style: const TextStyle(fontSize: 16, color: Colors.white),",
+     "style: const TextStyle(fontSize: 16, color: Kit.paper),", "port forward: listening text"),
+    (PORT_FWD, "fontSize: 10, color: Color(0xFFDDDDDD), height: 1.2),",
+     "fontSize: 12, color: Kit.muted, height: 1.2),", "port forward: listening tip, 12px floor"),
+    (PORT_FWD, "              ? MyTheme.currentThemeMode() == ThemeMode.dark\n"
+     "                  ? const Color(0xFF202020)\n                  : const Color(0xFFF4F5F6)\n"
+     "              : Theme.of(context).colorScheme.background),",
+     "              ? Kit.glass\n              : Kit.panel),", "port forward: kit row stripes"),
+    # Terminal
+    (TERMINAL, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n" + KIT_IMPORTS, "terminal: kit imports"),
+    (TERMINAL, "    super.build(context);\n    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).scaffoldBackgroundColor,\n      body: LayoutBuilder(",
+     "    super.build(context);\n    return Theme(\n      data: kitThemeKeeping(context),\n      child: Scaffold(\n"
+     "      backgroundColor: Kit.ink,\n      body: LayoutBuilder(",
+     "terminal: kit theme"),
+    (TERMINAL, "        },\n      ),\n    );\n  }\n\n  @override\n  bool get wantKeepAlive => true;",
+     "        },\n      ),\n    ));\n  }\n\n  @override\n  bool get wantKeepAlive => true;",
+     "terminal: close kit theme"),
+    ("flutter/lib/models/terminal_mouse_handler.dart", "import 'package:xterm/xterm.dart';\n",
+     "import 'package:xterm/xterm.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit_extras.dart';\n", "terminal: kit terminal theme import"),
+    ("flutter/lib/models/terminal_mouse_handler.dart", "        backgroundOpacity: widget.backgroundOpacity,\n",
+     "        theme: kitTerminalTheme,\n        backgroundOpacity: widget.backgroundOpacity,\n",
+     "terminal: kit terminal colours"),
+    # Camera view
+    (CAMERA, "import '../widgets/tabbar_widget.dart';\n",
+     "import '../widgets/tabbar_widget.dart';\n" + KIT_IMPORTS, "camera: kit imports"),
+    (CAMERA, "    return Scaffold(\n      backgroundColor: Theme.of(context).colorScheme.background,\n"
+     "      body: Obx(() {\n",
+     "    return Theme(\n      data: kitThemeKeeping(context),\n      child: Scaffold(\n"
+     "      backgroundColor: Kit.ink,\n      body: Obx(() {\n",
+     "camera: kit theme"),
+    (CAMERA, "          return bodyWidget();\n        }\n      }),\n    );\n  }\n",
+     "          return bodyWidget();\n        }\n      }),\n    ));\n  }\n", "camera: close kit theme"),
+    (CAMERA, "color: kColorCanvas,", "color: Kit.ink,", "camera: kit canvas"),
+    (CAMERA, "thumbColor: Colors.grey,", "thumbColor: Kit.muted,", "camera: kit scrollbars"),
 ]
 
 COPIES = [

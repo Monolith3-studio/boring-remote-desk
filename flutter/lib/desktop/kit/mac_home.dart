@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'kit.dart';
+import 'lan_macs.dart';
 
 /// One Mac on Home: the name a buyer sees, and the opaque target the caller connects to.
 class MacEntry {
@@ -13,7 +16,16 @@ class MacEntry {
 class MacHome extends StatefulWidget {
   static const addressKey = Key('mac-home-address');
 
+  /// One LAN Discovery cycle listens ~3 s; asking again every 6 s keeps the list live.
+  static const discoverEvery = Duration(seconds: 6);
+
   final List<MacEntry> macs;
+
+  /// Macs that answered LAN Discovery on this network.
+  final List<LanMac> lan;
+
+  /// Starts a LAN Discovery cycle; called on open and every [discoverEvery].
+  final VoidCallback? discover;
   final String myId;
   final void Function(String target) onConnect;
 
@@ -26,6 +38,8 @@ class MacHome extends StatefulWidget {
     required this.myId,
     required this.onConnect,
     this.notices = const [],
+    this.lan = const [],
+    this.discover,
   });
 
   @override
@@ -34,9 +48,21 @@ class MacHome extends StatefulWidget {
 
 class _MacHomeState extends State<MacHome> {
   final _address = TextEditingController();
+  Timer? _discovery;
+
+  @override
+  void initState() {
+    super.initState();
+    final discover = widget.discover;
+    if (discover != null) {
+      discover();
+      _discovery = Timer.periodic(MacHome.discoverEvery, (_) => discover());
+    }
+  }
 
   @override
   void dispose() {
+    _discovery?.cancel();
     _address.dispose();
     super.dispose();
   }
@@ -53,6 +79,8 @@ class _MacHomeState extends State<MacHome> {
   Widget build(BuildContext context) {
     final q = _address.text.trim().toLowerCase();
     final shown = widget.macs.where((m) => m.name.toLowerCase().contains(q)).toList();
+    final here = filterLanMacs(widget.lan, q);
+    final typedIp = isBareIp(q) && !widget.lan.any((m) => m.ip == q) ? q : null;
     return Padding(
       padding: const EdgeInsets.all(Kit.s6),
       child: Column(
@@ -78,7 +106,27 @@ class _MacHomeState extends State<MacHome> {
           Expanded(
             child: ListView(
               children: [
-                if (widget.macs.isEmpty)
+                if (typedIp != null)
+                  ListTile(
+                    leading: const Icon(Icons.arrow_forward),
+                    title: Text('Connect to $typedIp'),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Kit.radius)),
+                    hoverColor: Kit.glass,
+                    onTap: () => widget.onConnect(typedIp),
+                  ),
+                if (here.isNotEmpty) ...[
+                  Text('On this network', style: Theme.of(context).textTheme.bodySmall),
+                  for (final m in here)
+                    ListTile(
+                      leading: const Icon(Icons.lan_outlined),
+                      title: Text(m.name),
+                      subtitle: Text(m.ip, style: const TextStyle(color: Kit.muted)),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Kit.radius)),
+                      hoverColor: Kit.glass,
+                      onTap: () => widget.onConnect(m.ip),
+                    ),
+                ],
+                if (widget.macs.isEmpty && widget.lan.isEmpty)
                   Text('No Macs yet. Type a Mac name or IP above.',
                       style: Theme.of(context).textTheme.bodySmall),
                 for (final m in shown)

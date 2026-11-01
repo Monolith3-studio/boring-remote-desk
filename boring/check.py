@@ -4,9 +4,9 @@
 Usage:  python3 boring/check.py [ROOT]
 
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
-for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
+for: name, bundle IDs, empty servers, Direct IP on, tailnet + private-LAN whitelist (ADR 0003), listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
-test / updater / LAN discovery unreachable (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
+test / updater unreachable, LAN discovery on (ADR 0003) (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
@@ -115,6 +115,17 @@ def whitelist_enforced(conn, hbb_lib):
     if 'Config::get_option("whitelist")' not in check or "contains(addr.ip())" not in check:
         return False, "check_whitelist no longer matches the peer against the whitelist option"
     return True, ""
+
+
+def whitelist_is_private(value):
+    """The locked whitelist is exactly ADR 0003's set, and none of it is a public range."""
+    import ipaddress
+    want = {ipaddress.ip_network(n) for n in rebrand.WHITELIST.split(",")}
+    try:
+        got = {ipaddress.ip_network(n.strip()) for n in value.split(",") if n.strip()}
+    except ValueError:
+        return False
+    return got == want and not any(n.is_global for n in got)
 
 
 def strip_tests_and_comments(text):
@@ -587,8 +598,8 @@ def multi_window_checks(c, cfg):
     """v1.7 ticket 11: sessions open in windows; a full-screen Target remembers its monitor."""
     c.fact("new sessions open in windows (tabs option off by default)",
            rust_map(cfg, "DEFAULT_LOCAL_SETTINGS").get(rebrand.T11_TABS_OPTION) == "N")
-    # Ticket 09 moves this checkbox under Advanced; it must stay reachable on the settings page.
-    c.fact("tabs option still on the settings page (Advanced)",
+    # Ticket 09: the simple page's Advanced link opens the full page (General tab) holding this checkbox.
+    c.fact("tabs option still on the Advanced settings page",
            "kOptionOpenNewConnInTabs" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
     common = c.read(rebrand.T11_COMMON)
     hooks = ["import 'package:flutter_hbb/desktop/kit/session_window.dart';",
@@ -598,6 +609,27 @@ def multi_window_checks(c, cfg):
     c.fact("full-screen Target remembers its monitor (hooks landed)", not missing, "; ".join(missing))
     c.fact("restore moves the window to its monitor before full screen on Mac",
            "if (!isMacOS) {\n          await restoreFrame();" not in common)
+
+
+# Colours an extras screen may not use once rebranded: upstream theme statics and raw colours.
+EXTRAS_OFF_KIT = re.compile(r"MyTheme\.(?!color\(context\))\w+|Colors\.(?!transparent\b)\w+|Color\(0x[0-9A-Fa-f]+\)|kColorCanvas")
+
+
+def simple_settings_checks(c):
+    """v1.7 ticket 09: extras in the kit, Mac Settings = one simple page + Advanced."""
+    pages = (rebrand.PORT_FWD, rebrand.TERMINAL, rebrand.CAMERA)
+    off = [f"{rel}: {h}" for rel in pages
+           for h in EXTRAS_OFF_KIT.findall(strip_tests_and_comments(c.read(rel)))]
+    off += [f"{rel}: no kit theme" for rel in pages if "data: kitThemeKeeping(context)," not in c.read(rel)]
+    if "theme: kitTerminalTheme," not in c.read("flutter/lib/models/terminal_mouse_handler.dart"):
+        off.append("terminal_mouse_handler.dart: no kit terminal theme")
+    c.fact("port forward, terminal and camera use kit tokens only", not off, "; ".join(off[:10]))
+    settings = c.read(rebrand.SETTINGS)
+    needles = ["simple_settings.dart", "if (isMacOS && !_boringAdvanced) {", "SimpleSettings(",
+               "setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),",
+               "label: 'All settings',", "child: const Text('Back to Settings'),"]
+    missing = [n for n in needles if n not in settings]
+    c.fact("Mac Settings is one simple page with Advanced behind it", not missing, "; ".join(missing))
 
 
 def activate_link_checks(c):
@@ -707,9 +739,8 @@ def run_checks(root):
     locked = rust_map(cfg, "OVERWRITE_SETTINGS")
     for key in ("custom-rendezvous-server", "relay-server", "api-server"):
         c.fact(f"{key} locked empty", key in locked and locked[key] == "", locked.get(key))
-    c.fact("whitelist locked to the tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48)",
-           sorted(locked.get("whitelist", "").split(",")) == ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
-           locked.get("whitelist"))
+    c.fact("whitelist locked to Tailscale + private LAN, nothing public (ADR 0003)",
+           whitelist_is_private(locked.get("whitelist", "")), locked.get("whitelist"))
     c.fact("Direct IP locked on", locked.get("direct-server") == "Y")
     conn = c.read("src/server/connection.rs")
     ok, why = whitelist_enforced(conn, c.read("libs/hbb_common/src/lib.rs"))
@@ -734,7 +765,6 @@ def run_checks(root):
         ("src/hbbs_http/sync.rs", "async fn start_hbbs_sync_async() {", "stats sync"),
         ("src/updater.rs", "fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {", "Windows updater"),
         ("src/updater.rs", "pub fn start_auto_update_macos() {", "Mac updater"),
-        ("src/lan.rs", "pub(super) fn start_listening() -> ResultType<()> {", "LAN discovery listener"),
         # lock bypasses: each of these writes past OVERWRITE_SETTINGS
         ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {",
          "Windows exe-name license (sets rendezvous and API server)"),
@@ -752,8 +782,11 @@ def run_checks(root):
     c.fact("no rendezvous server read from the config file",
            body and "rendezvous_server = CONFIG2" not in body and "get_rendezvous_servers()" in body)
     c.fact("auto update locked off", locked.get("allow-auto-update") == "N")
-    c.fact("LAN discovery locked off", locked.get("enable-lan-discovery") == "N",
+    c.fact("LAN discovery not locked off (ADR 0003)", locked.get("enable-lan-discovery", "Y") == "Y",
            locked.get("enable-lan-discovery"))
+    first = first_statement(c.read("src/lan.rs"), "pub(super) fn start_listening() -> ResultType<()> {")
+    c.fact("LAN discovery listener answers pings (ADR 0003)",
+           first is not None and not re.match(r"(if true \{ )?(return\b|bail!)", first), repr(first))
     c.fact("update check locked off", rust_map(cfg, "OVERWRITE_LOCAL_SETTINGS").get("enable-check-update") == "N")
     lib = c.read("libs/hbb_common/src/lib.rs")
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
@@ -780,6 +813,9 @@ def run_checks(root):
         (rebrand.HOME, "setKey: (k) => bind.mainSetLicenseKey(key: k),"),  # ticket 15
         (rebrand.HOME, "if (isMacOS) return _buildBlock(child: buildBoringHome(context));"),  # v1.7 t01
         (rebrand.HOME, "MacHome("), (rebrand.HOME, "Kit.theme()"),
+        (rebrand.HOME, "lan: lanMacs.macs,"), (rebrand.HOME, "discover: () => bind.mainDiscover(),"),  # v1.7 t02
+        ("libs/base/src/lan.rs", f'DEVICE_NAME_OPTION: &str = "{rebrand.BORING_MAC_NAME_OPTION}";'),
+        ("src/lan.rs", "base::lan::advertised_name("),  # LAN pong names this Mac as Settings does
         (rebrand.T07_TOOLBAR, "..add(buildBoringSessionToolbar(context, more));"),  # v1.7 t07
         (rebrand.T07_TOOLBAR, "SessionToolbar("),
         ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),        ("src/lib.rs", "mod activate_link;"),
@@ -793,6 +829,7 @@ def run_checks(root):
            not re.search(r"\bColors\.|Color\(|MyTheme", bar))
     multi_window_checks(c, cfg)  # v1.7 t11
     activate_link_checks(c)
+    simple_settings_checks(c)  # v1.7 t09
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")

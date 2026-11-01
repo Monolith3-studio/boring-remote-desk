@@ -56,7 +56,10 @@ pub(super) fn start_listening() -> ResultType<()> {
                                     cmd: "pong".to_owned(),
                                     mac: get_mac(&self_addr),
                                     id,
-                                    hostname,
+                                    hostname: base::lan::advertised_name(
+                                        &Config::get_option(base::lan::DEVICE_NAME_OPTION),
+                                        hostname,
+                                    ),
                                     username: crate::platform::get_active_username(),
                                     platform: whoami::platform().to_string(),
                                     ..Default::default()
@@ -345,6 +348,7 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
         }
     }
 
+    base::lan::drop_stale(&mut peers);
     config::LanPeers::store(&peers);
     #[cfg(feature = "flutter")]
     crate::flutter_ffi::main_load_lan_peers();
