@@ -278,6 +278,10 @@ const _byText = <String, (String, String?, String?)>{
       (_couldNot, null, null),
   "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again.":
       (_couldNot, null, null),
+  "Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, then try again.":
+      (_couldNot, null, null),
+  "Boring Remote doesn't know where that computer is yet. Type its name or address in the box, then try again.":
+      (_couldNot, null, null),
   "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again.":
       (_couldNot, null, null),
   "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again.":

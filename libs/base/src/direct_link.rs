@@ -2,7 +2,8 @@
 //!
 //! Connecting to a name or IP dials the Target's own address first. No answer in about a second
 //! means the Target's Tailscale address, if one is known; neither answering is the plain
-//! [`NOT_ON_THIS_NETWORK`]. There is no ID / rendezvous / relay path at all.
+//! [`NOT_ON_THIS_NETWORK`]. There is no ID / rendezvous / relay path at all: a recent on Home,
+//! stored by Target ID, is dialled at the address it was last met on ([`plan_for_recent`]).
 
 use crate::message_proto::{message, Message, PublicKey};
 use hbb_common::{
@@ -36,6 +37,14 @@ pub const NOT_FOUND: &str = "Couldn't find a Mac with that name. Pick it from th
 #[cfg(target_os = "windows")]
 pub const NOT_FOUND: &str =
     "Couldn't find a computer with that name. Pick it from the list, or check the spelling and try again.";
+
+/// A recent on Home that Boring Remote has no address for (never met over a Direct Link).
+#[cfg(not(target_os = "windows"))]
+pub const NO_ADDRESS: &str =
+    "Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, then try again.";
+#[cfg(target_os = "windows")]
+pub const NO_ADDRESS: &str =
+    "Boring Remote doesn't know where that computer is yet. Type its name or address in the box, then try again.";
 
 /// A non-Tailscale Target that answers without the encrypted Direct Link handshake (ADR 0005).
 #[cfg(not(target_os = "windows"))]
@@ -343,12 +352,49 @@ pub async fn plan_for(peer: &str, known: &Known, ms: u64) -> ResultType<Plan> {
     Ok(Plan { direct, tailscale })
 }
 
+/// A recent on Home (a stored peer) is kept by its Target ID, which nothing can dial: it goes to
+/// the address Known last met that ID on, else its name (`name`, then `name.local` for a bare
+/// host name), then its known Tailscale address. The pin still holds, keyed on the dialled
+/// address and the ID. No address to try is the plain [`NO_ADDRESS`].
+pub async fn plan_for_recent(id: &str, name: &str, known: &Known, ms: u64) -> ResultType<Plan> {
+    let t = known.0.get(id);
+    let mut tailscale = t.and_then(|t| t.tailscale.parse::<SocketAddr>().ok());
+    let mut direct = t.and_then(|t| t.lan.parse::<SocketAddr>().ok());
+    if direct.is_none() && !name.is_empty() {
+        let bare = !name.contains('.') && !name.contains(':');
+        let local = format!("{}.local", name);
+        for n in std::iter::once(name).chain(bare.then_some(local.as_str())) {
+            if let Ok(plan) = plan_for(n, known, ms).await {
+                direct = Some(plan.direct);
+                tailscale = tailscale.or(plan.tailscale);
+                break;
+            }
+        }
+    }
+    match (direct, tailscale) {
+        (Some(direct), ts) => Ok(Plan { direct, tailscale: ts.filter(|t| *t != direct) }),
+        (None, Some(ts)) => Ok(Plan { direct: ts, tailscale: None }),
+        (None, None) => bail!(NO_ADDRESS),
+    }
+}
+
+/// Home's recents are stored by Target ID (digits); the connect box takes names and addresses.
+pub fn is_target_id(peer: &str) -> bool {
+    !peer.is_empty() && peer.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// The connect box (src/client.rs `_start`): Direct Link first, then Tailscale, else
-/// [`NOT_ON_THIS_NETWORK`]. Non-Tailscale sessions come back encrypted or not at all. Returns the
+/// [`NOT_ON_THIS_NETWORK`]. A recent from Home (a Target ID) goes by [`plan_for_recent`].
+/// Non-Tailscale sessions come back encrypted or not at all. Returns the
 /// stream, the path it took and the Target's identity key (the session fingerprint) when known.
 pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Option<Vec<u8>>)> {
     let mut known = Known::load();
-    let plan = plan_for(peer, &known, slow_ms).await?;
+    let plan = if is_target_id(peer) {
+        let name = hbb_common::config::PeerConfig::load(peer).info.hostname;
+        plan_for_recent(peer, &name, &known, slow_ms).await?
+    } else {
+        plan_for(peer, &known, slow_ms).await?
+    };
     let ((stream, who), addr) = race(
         plan,
         DIRECT_TIMEOUT_MS,
@@ -638,6 +684,45 @@ mod tests {
         let other = sa("192.168.1.30:21118");
         assert!(known.pin_ok(sa(LAN), "1", &[7; 32]) && !known.pin_ok(other, "1", &[8; 32]));
         assert!(known.pin_ok(other, "2", &[8; 32]), "a new Target at a new address is met for the first time");
+    }
+
+    // --- Home's recents: stored by Target ID, dialled by what Known remembers --------------
+
+    #[tokio::test]
+    async fn a_recent_dials_its_last_lan_address_then_its_tailscale_address() {
+        let mut known = Known::default();
+        known.record(&Verified { id: "123456789".into(), sign_pk: vec![1; 32], tailscale: Some("100.101.102.103".parse().unwrap()) }, sa(LAN));
+        let plan = plan_for_recent("123456789", "", &known, 1_000).await.unwrap();
+        assert_eq!(plan, Plan { direct: sa(LAN), tailscale: Some(sa(TS)) });
+    }
+
+    #[tokio::test]
+    async fn a_recent_with_no_known_address_says_what_to_do_next() {
+        let err = plan_for_recent("123456789", "", &Known::default(), 1_000).await.unwrap_err();
+        assert_eq!(err.to_string(), NO_ADDRESS);
+    }
+
+    #[tokio::test]
+    async fn a_recent_never_met_over_a_direct_link_tries_its_name() {
+        let plan = plan_for_recent("123456789", "192.168.1.20", &Known::default(), 1_000).await.unwrap();
+        assert_eq!(plan, Plan { direct: sa(LAN), tailscale: None });
+        let err = plan_for_recent("123456789", "8.8.8.8", &Known::default(), 1_000).await.unwrap_err();
+        assert_eq!(err.to_string(), NO_ADDRESS, "a name that leads nowhere it may dial");
+    }
+
+    #[test]
+    fn home_hands_the_connect_box_a_target_id_for_a_recent() {
+        assert!(is_target_id("123456789"));
+        for typed in ["", "192.168.1.20", "studio-mac", "studio-mac.local", "fd7a:115c:a1e0::1"] {
+            assert!(!is_target_id(typed), "{}", typed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recent_whose_lan_address_was_lost_goes_over_tailscale() {
+        let known = Known::parse(r#"{"123456789":{"pk":"01","lan":"","tailscale":"100.101.102.103:21118"}}"#);
+        let plan = plan_for_recent("123456789", "", &known, 1_000).await.unwrap();
+        assert_eq!(plan, Plan { direct: sa(TS), tailscale: None });
     }
 
     #[tokio::test]

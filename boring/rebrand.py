@@ -46,7 +46,9 @@ PLAINTEXT_REFUSED = "That Mac needs the latest Boring Remote. Update Boring Remo
 IDENTITY_CHANGED = ("This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was "
                     "reinstalled, open Settings, click Trusted Controllers, click Forget next to it, "
                     "then try again.")
-CONNECT_ERRORS = {"NOT_FOUND": NOT_FOUND, "NOT_ON_THIS_NETWORK": NOT_ON_NETWORK,
+NO_ADDRESS = ("Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, "
+              "then try again.")
+CONNECT_ERRORS = {"NOT_FOUND": NOT_FOUND, "NOT_ON_THIS_NETWORK": NOT_ON_NETWORK, "NO_ADDRESS": NO_ADDRESS,
                   "PLAINTEXT_REFUSED": PLAINTEXT_REFUSED, "IDENTITY_CHANGED": IDENTITY_CHANGED}
 
 
