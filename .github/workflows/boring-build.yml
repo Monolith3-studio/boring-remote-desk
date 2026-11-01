@@ -122,8 +122,10 @@ jobs:
 
   build-macos:
     needs: bridge
-    # Same image as upstream's arm64 job: macos-latest moved on, and the toolchain pins assume 14.
-    runs-on: macos-14 # arm64
+    # macos-14 is retired 2026-11-02 (actions/runner-images#13518). macos-15 is arm64 like 14 and
+    # keeps the default Xcode (16.x): Flutter 3.24.5, Rust 1.81, LLVM from brew and the 12.3
+    # deployment target below need nothing pinned to the image. Upstream's arm64 job is still on 14.
+    runs-on: macos-15 # arm64
     steps:
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
