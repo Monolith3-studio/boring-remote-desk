@@ -52,6 +52,15 @@ void main() {
     expect(kitMessageWords('info', 'Prompt', 'no_audio_input_device_tip'), isNull);
   });
 
+  test("Direct Link's own errors keep their words and their one next step", () {
+    const notReached =
+        "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again.";
+    final w = kitMessageWords('error', 'Connection Error', notReached)!;
+    expect(w.title, "Couldn't connect");
+    expect(w.body, isNull, reason: 'the Rust text is shown as it is');
+    expect(w.next, isNull, reason: 'it already says what to do next');
+  });
+
   test('on Windows the words say computer', () {
     KitWords.windows();
     expect(kitMessageWords('error', 'Connection Error', 'Remote desktop is offline')!.body,

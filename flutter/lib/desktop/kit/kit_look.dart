@@ -246,7 +246,7 @@ class KitMessageWords {
 String _w(String s) => s.replaceAll('{Mac}', KitWords.one).replaceAll('{Macs}', KitWords.many);
 
 const _couldNot = "Couldn't connect";
-const _checkOn = "Check that {Mac} is on and Boring Remote is open on it, then try again.";
+const _checkOn = "Make sure that {Mac} is awake and Boring Remote is open on it, then try again.";
 
 /// Keyed by the text Rust sends (src/client.rs, src/client/io_loop.rs, src/server/connection.rs,
 /// libs/base/src/direct_link.rs). "{Mac}" is KitWords.one when shown.
@@ -268,16 +268,24 @@ const _byText = <String, (String, String?, String?)>{
       ('Too many tries', 'That {Mac} stopped taking passwords for a minute.', 'Wait a minute, then try again.'),
   'Please try 1 minute later':
       ('Too many tries', 'That {Mac} stopped taking passwords for a minute.', 'Wait a minute, then try again.'),
-  // Direct Link's own errors (v1.7 t03) are already plain; these add the next step where they lack one.
-  "Couldn't find that machine. Type its Tailscale name or IP.": (_couldNot, null, null),
-  'Not on this network.': (_couldNot, null, 'Put both {Macs} on the same network, then try again.'),
-  "That Mac answered without encryption, so Boring Remote didn't connect. Update it to the latest Boring Remote.":
+  // Direct Link's own errors (libs/base/src/direct_link.rs, Mac and Windows wording) already say
+  // what to do next: shown as they are, under a plain title. check.py keeps this list in step.
+  "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again.":
       (_couldNot, null, null),
-  "That Mac's identity changed since you last connected, so Boring Remote didn't connect.": (
-    _couldNot,
-    null,
-    "If it was reinstalled, open Settings on this {Mac}, then Trusted Controllers, and forget its key. Then connect again."
-  ),
+  "Couldn't find a computer with that name. Pick it from the list, or check the spelling and try again.":
+      (_couldNot, null, null),
+  "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again.":
+      (_couldNot, null, null),
+  "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again.":
+      (_couldNot, null, null),
+  "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again.":
+      (_couldNot, null, null),
+  "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again.":
+      (_couldNot, null, null),
+  "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.":
+      (_couldNot, null, null),
+  "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.":
+      (_couldNot, null, null),
 };
 
 /// Plain words for a message box a Controller sees while connecting (Dumb-proof standard). Null

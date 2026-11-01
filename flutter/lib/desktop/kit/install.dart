@@ -14,8 +14,8 @@ class InstallWords {
   static const desktopIcon = 'Put an icon on the desktop';
   static const printer = 'Add the Boring Remote printer';
   static const printerWhy = 'Someone controlling this computer can print on the printer where they sit.';
-  static const licence = 'Installing means you agree to the licence.';
-  static const readLicence = 'Read the licence';
+  static const licence = 'Installing means you agree to the license.';
+  static const readLicence = 'Read the license';
   static const install = 'Install';
   static const cancel = 'Cancel';
   static const tryIt = 'Try it without installing';

@@ -587,6 +587,10 @@ def connect_checks(c):
                if p.read_text(encoding="utf-8").count(f'("{text}", ') != 1]
     c.fact("every connect error, Mac and Windows wording, is in every translation file",
            langs and not missing, ", ".join(missing[:10]))
+    look = c.read("flutter/lib/desktop/kit/kit_look.dart")
+    unmapped = [t[:40] for t in rebrand.CONNECT_ERROR_KEYS if f'  "{t}":\n      (_couldNot, null, null),' not in look]
+    c.fact("the kit's message box shows each connect error as it is, with no second next step",
+           not unmapped, "; ".join(unmapped))
 
     secure = fn_body(link, "pub async fn secure(") or ""
     pin = fn_body(link, "pub fn pin_ok(") or ""
