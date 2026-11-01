@@ -815,6 +815,7 @@ def high_efficiency_checks(c):
 
 
 T07_KIT = "flutter/lib/desktop/kit/session_toolbar.dart"
+SIMPLE_SETTINGS_KIT = "flutter/lib/desktop/kit/simple_settings.dart"
 
 
 def tailnet_dart():
@@ -853,6 +854,17 @@ def home_checks(c):
         why.append("session_toolbar.dart does not map Rust's High Efficiency stream type back to Local")
     c.fact("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)",
            not why, "; ".join(why))
+
+    # Ticket 15, app side: Settings links to the download page and says how to set up another computer.
+    settings = fn_body(c.read(rebrand.SETTINGS), "  Widget buildBoringSettings(BuildContext context) {") or ""
+    kit = c.read(SIMPLE_SETTINGS_KIT)
+    why = [] if "SimpleSettings(" in settings and "openUrl: (u) => launchUrlString(u)," in settings \
+        else ["Settings does not hand SimpleSettings a way to open the download page"]
+    why += [f"simple_settings.dart lost {n}" for n in (
+        "const kDownloadUrl = 'https://theboringremote.com/download';",
+        "onPressed: () => widget.openUrl!(kDownloadUrl)",
+        "Clipboard.setData(const ClipboardData(text: kDownloadUrl))") if n not in kit]
+    c.fact("Settings: Download Boring Remote and set up another computer (ticket 15)", not why, "; ".join(why))
 
 
 def activate_link_checks(c):

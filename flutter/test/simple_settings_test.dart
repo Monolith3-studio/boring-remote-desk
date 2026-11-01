@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
 import 'package:flutter_hbb/desktop/kit/simple_settings.dart';
@@ -16,6 +17,7 @@ SimpleSettings settings({
   void Function(bool)? onCheckUpdates,
   List<SettingsLink> advanced = const [],
   VoidCallback? onRunSetup,
+  void Function(String)? openUrl,
 }) =>
     SimpleSettings(
       macName: macName,
@@ -28,6 +30,7 @@ SimpleSettings settings({
       onCheckUpdates: onCheckUpdates ?? (_) {},
       advanced: advanced,
       onRunSetup: onRunSetup,
+      openUrl: openUrl,
     );
 
 void main() {
@@ -50,10 +53,10 @@ void main() {
 
   testWidgets('Unattended Password: says whether one is set, never shows it', (tester) async {
     await tester.pumpWidget(host(settings(passwordSet: false)));
-    expect(find.text('Not set. Someone has to approve each connection here.'), findsOneWidget);
+    expect(find.text('Not set. Someone has to be at this Mac to click Allow each time.'), findsOneWidget);
     expect(find.text('Set password'), findsOneWidget);
     await tester.pumpWidget(host(settings(passwordSet: true)));
-    expect(find.text('Set. Trusted people can get in with no one here.'), findsOneWidget);
+    expect(find.text('Set. Your other Macs can get in with it when no one is here.'), findsOneWidget);
     expect(find.text('Change password'), findsOneWidget);
   });
 
@@ -114,9 +117,59 @@ void main() {
     expect(updates, [false]);
   });
 
+  testWidgets('turning Start at login off says what it stops first, and only then turns it off',
+      (tester) async {
+    final login = <bool>[];
+    const why = "If you turn this off, your other Macs can't get into this one any more, starting now. "
+        'Turn it back on to let them in again. Your Mac may ask you to confirm, and Boring Remote may '
+        'close and open again.';
+    await tester.pumpWidget(host(settings(startAtLogin: true, onStartAtLogin: login.add)));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Start at login'));
+    await tester.pump();
+    expect(find.text(why), findsOneWidget);
+    expect(login, isEmpty);
+    await tester.tap(find.text('Keep it on'));
+    await tester.pump();
+    expect(find.text(why), findsNothing);
+    expect(login, isEmpty);
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Start at login'));
+    await tester.pump();
+    await tester.tap(find.text('Turn off'));
+    await tester.pump();
+    expect(login, [false]);
+    expect(find.text(why), findsNothing);
+  });
+
+  testWidgets('set up another Mac: download link, copy the link, three plain steps', (tester) async {
+    tester.view.physicalSize = const Size(1200, 2400);
+    addTearDown(tester.view.resetPhysicalSize);
+    final opened = <String>[], copied = <String>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') copied.add((call.arguments as Map)['text'] as String);
+      return null;
+    });
+    addTearDown(() => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
+    await tester.pumpWidget(host(settings(openUrl: opened.add)));
+    expect(find.text('Set up another Mac'), findsOneWidget);
+    expect(find.text('1. On the other Mac, open theboringremote.com/download and download Boring Remote.'),
+        findsOneWidget);
+    expect(find.text('2. Open it and follow the three setup steps.'), findsOneWidget);
+    expect(find.text("3. You'll see it by name on this Mac's Home screen when both are on the same network."), findsOneWidget);
+    await tester.ensureVisible(find.text('Download Boring Remote'));
+    await tester.pump();
+    await tester.tap(find.text('Download Boring Remote'));
+    expect(opened, ['https://theboringremote.com/download']);
+    await tester.ensureVisible(find.text('Copy the link'));
+    await tester.pump();
+    await tester.tap(find.text('Copy the link'));
+    await tester.pump();
+    expect(find.text('Link copied.'), findsOneWidget);
+    expect(copied, ['https://theboringremote.com/download']);
+  });
+
   testWidgets('Advanced lists every entry the page passes', (tester) async {
     final opened = <String>[];
-    tester.view.physicalSize = const Size(1200, 2400);
+    tester.view.physicalSize = const Size(1200, 4800);
     addTearDown(tester.view.resetPhysicalSize);
     await tester.pumpWidget(host(settings(advanced: [
       SettingsLink(label: 'All settings', onTap: () => opened.add('all')),

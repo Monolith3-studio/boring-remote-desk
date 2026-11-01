@@ -57,7 +57,7 @@ String removeTrusted(String json, String key) {
 /// A Target this Mac pinned the key of on its first encrypted Direct Link.
 class KnownMac {
   final String id;
-  final String address; // where it last answered, without the port
+  final String address; // where it last answered (this network, else Tailscale), without the port
   const KnownMac({required this.id, required this.address});
 }
 
@@ -69,7 +69,9 @@ List<KnownMac> parseKnown(String json) {
       for (final e in map.entries)
         KnownMac(
           id: '${e.key}',
-          address: _host(e.value is Map ? '${e.value['lan'] ?? ''}' : ''),
+          address: _host(e.value is Map
+              ? ('${e.value['lan'] ?? ''}'.isNotEmpty ? '${e.value['lan']}' : '${e.value['tailscale'] ?? ''}')
+              : ''),
         ),
     ];
   } catch (_) {
@@ -147,21 +149,21 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
         Text('${KitWords.cap(KitWords.many)} this one has connected to', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(
-            "If one was reinstalled, it won't connect until you forget its key here. "
-            'Then connect again to pair it.',
+            "If one of these was reinstalled, it won't connect. Click Forget next to it, "
+            'then connect to it again.',
             style: t.bodySmall),
         const SizedBox(height: Kit.s4),
         if (_known.isEmpty) const Text('None yet.'),
         for (final m in _known)
           ListTile(
             contentPadding: EdgeInsets.zero,
-            title: Text(m.address.isNotEmpty ? m.address : m.id),
+            title: Text(m.address.isNotEmpty ? m.address : 'A ${KitWords.one} you connected to'),
             trailing: TextButton(
               onPressed: () async {
                 await widget.onForget(m.id);
                 if (mounted) setState(() => _known.remove(m));
               },
-              child: Text("Forget this ${KitWords.one}'s key"),
+              child: const Text('Forget'),
             ),
           ),
       ],

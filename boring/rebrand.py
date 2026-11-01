@@ -958,6 +958,7 @@ SIMPLE_SETTINGS_METHOD = (
     "            await mainSetLocalBoolOption(kBoringUpdateCheckOption, on);\n"
     "            setState(() {});\n"
     "          },\n"
+    "          openUrl: (u) => launchUrlString(u), // Download Boring Remote (ticket 15)\n"
     "          advanced: [\n"
     "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
     "            SettingsLink(\n"
@@ -1054,7 +1055,7 @@ PATCHES += [
 
 # --- LAN trust (v1.7 ticket 04, ADRs 0002, 0005) -----------------------------------
 # libs/base/src/trust.rs holds the token exchange; desktop/kit/trust.dart is ours and bridge-free.
-# These wire the kit in: Trusted Controllers (and "Forget this Mac's key" for t03's pinned keys)
+# These wire the kit in: Trusted Controllers (and "Forget" for t03's pinned keys)
 # under Settings → Advanced, and the plain-words approval prompt in the connection window.
 T04_HOOK = "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
 T04_SETTINGS_LINK = (

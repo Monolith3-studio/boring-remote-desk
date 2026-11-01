@@ -554,6 +554,11 @@ class RebrandSeam(unittest.TestCase):
                   "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));\n", "")
         self.assert_check_fails("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)")
 
+    def test_settings_without_the_download_link_fails_check(self):  # ticket 15, app side
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "          openUrl: (u) => launchUrlString(u), // Download Boring Remote (ticket 15)\n", "")
+        self.assert_check_fails("Settings: Download Boring Remote and set up another computer (ticket 15)")
+
 
 if __name__ == "__main__":
     unittest.main()
