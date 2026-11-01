@@ -92,11 +92,11 @@ const setupCopy = <String, String>{
   'allow.on': 'On',
   'allow.picture': 'Turn this on:',
   'allow.box': 'If a box pops up first, click “Open System Settings”.',
-  'allow.password': 'Your Mac may ask for your password or fingerprint. That is normal.',
+  'allow.password': "Your Mac may ask for your password or fingerprint. That's normal.",
   'allow.quit': 'If your Mac asks to quit Boring Remote, click “Quit & Reopen”. Setup comes back to this screen.',
   'allow.missing': 'No “Boring Remote” in the list? Click the + under the list, then pick Boring Remote in Applications.',
   'allow.seen': "You'll see a green check next to each one once it's on.",
-  'allow.skip.why': "If you skip, people who connect won't see this screen or be able to click anything. "
+  'allow.skip.why': "If you skip, people who connect won't see this Mac's screen or be able to click anything. "
       'You can finish this later in Settings.',
   // Screen 2 (Windows, ticket 12)
   'reach.title': 'Let your other computers reach this one',

@@ -41,10 +41,9 @@ WHITELIST = f"{TAILNET},{PRIVATE_LAN}"
 # Windows build "computer" (as the kit's KitWords do). These are the translation keys
 # (src/lang/*.rs, English everywhere) and what check.py compares the Rust constants with.
 NOT_FOUND = "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again."
-NOT_ON_NETWORK = ("Couldn't reach that Mac. Check that it's turned on and on the same Wi-Fi or network as "
-                  "this one, then try again.")
-PLAINTEXT_REFUSED = "That Mac needs the latest Boring Remote. Update it on that Mac, then try again."
-IDENTITY_CHANGED = ("This isn't the Mac you connected to before, so Boring Remote stopped. If it was "
+NOT_ON_NETWORK = "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again."
+PLAINTEXT_REFUSED = "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again."
+IDENTITY_CHANGED = ("This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was "
                     "reinstalled, open Settings, click Trusted Controllers, click Forget next to it, "
                     "then try again.")
 CONNECT_ERRORS = {"NOT_FOUND": NOT_FOUND, "NOT_ON_THIS_NETWORK": NOT_ON_NETWORK,
@@ -1486,9 +1485,11 @@ T12_EDITS = [(g, g.replace("if (isMacOS)", "if (isMacOS || isWindows)", 1)
      "        canBeReached: () => Process.run('netsh', windowsRuleShowArgs())\n"
      "            .then((r) => r.exitCode == 0 && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable))\n"
      "            .catchError((_) => false),\n"
+     "        // A failure shows as the green check staying off (Setup checks again and says so).\n"
      "        allowReach: () => Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))\n"
-     "            .then<void>((_) {})\n"
-     "            .catchError((_) {}),\n"),
+     "            .then<void>((r) {\n"
+     "              if (r.exitCode != 0) debugPrint('Setup: adding the Windows rule failed: ${r.stderr}');\n"
+     "            }).catchError((e) => debugPrint('Setup: could not run powershell: $e')),\n"),
 ]
 
 

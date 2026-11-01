@@ -124,9 +124,8 @@ void main() {
   testWidgets('turning Start at login off says what it stops first, and only then turns it off',
       (tester) async {
     final login = <bool>[];
-    const why = "If you turn this off, your other Macs can't get into this one any more, starting now. "
-        'Turn it back on to let them in again. Your Mac may ask you to confirm, and Boring Remote may '
-        'close and open again.';
+    const why = "Turn this off and your other Macs can't get into this one, starting now. "
+        'Turn it back on to let them in. Your Mac may ask you to confirm, and Boring Remote may restart.';
     await tester.pumpWidget(host(settings(startAtLogin: true, onStartAtLogin: login.add)));
     await tester.tap(find.widgetWithText(SwitchListTile, 'Start at login'));
     await tester.pump();

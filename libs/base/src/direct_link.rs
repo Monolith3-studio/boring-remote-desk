@@ -25,10 +25,10 @@ use std::{collections::HashMap, future::Future, net::IpAddr, net::SocketAddr};
 /// Neither the Direct Link nor the Tailscale address answered.
 #[cfg(not(target_os = "windows"))]
 pub const NOT_ON_THIS_NETWORK: &str =
-    "Couldn't reach that Mac. Check that it's turned on and on the same Wi-Fi or network as this one, then try again.";
+    "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again.";
 #[cfg(target_os = "windows")]
 pub const NOT_ON_THIS_NETWORK: &str =
-    "Couldn't reach that computer. Check that it's turned on and on the same Wi-Fi or network as this one, then try again.";
+    "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again.";
 
 /// A name that resolves to nothing a Target would accept.
 #[cfg(not(target_os = "windows"))]
@@ -39,16 +39,16 @@ pub const NOT_FOUND: &str =
 
 /// A non-Tailscale Target that answers without the encrypted Direct Link handshake (ADR 0005).
 #[cfg(not(target_os = "windows"))]
-pub const PLAINTEXT_REFUSED: &str = "That Mac needs the latest Boring Remote. Update it on that Mac, then try again.";
+pub const PLAINTEXT_REFUSED: &str = "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again.";
 #[cfg(target_os = "windows")]
 pub const PLAINTEXT_REFUSED: &str =
-    "That computer needs the latest Boring Remote. Update it on that computer, then try again.";
+    "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again.";
 
 /// The Target's identity key differs from the one pinned for that address or ID.
 #[cfg(not(target_os = "windows"))]
-pub const IDENTITY_CHANGED: &str = "This isn't the Mac you connected to before, so Boring Remote stopped. If it was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
+pub const IDENTITY_CHANGED: &str = "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
 #[cfg(target_os = "windows")]
-pub const IDENTITY_CHANGED: &str = "This isn't the computer you connected to before, so Boring Remote stopped. If it was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
+pub const IDENTITY_CHANGED: &str = "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
 
 /// Controller-side memory of Targets met over an encrypted Direct Link (LocalConfig option).
 pub const KNOWN_OPTION: &str = "boring-direct-link-known";

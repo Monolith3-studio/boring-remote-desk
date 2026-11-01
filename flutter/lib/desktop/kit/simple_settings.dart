@@ -220,9 +220,9 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         if (_confirmStop) ...[
           // Off stops the service now, not just at the next login: there is no way to drop only the
           // login item (v1.7 review), so the buyer reads exactly that before it happens.
-          Text("If you turn this off, your other ${KitWords.many} can't get into this one any more, starting now. "
-              'Turn it back on to let them in again. Your ${KitWords.one} may ask you to confirm, and Boring Remote '
-              'may close and open again.'),
+          Text("Turn this off and your other ${KitWords.many} can't get into this one, starting now. "
+              'Turn it back on to let them in. Your ${KitWords.one} may ask you to confirm, and Boring Remote '
+              'may restart.'),
           const SizedBox(height: Kit.s2),
           Row(children: [
             OutlinedButton(
