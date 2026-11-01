@@ -592,6 +592,8 @@ def connect_checks(c):
 UPDATE_ENDPOINTS = {
     "VERSION_URL": ("src/update_notice.rs", "https://boringlabs.online/downloads/the-boring-remote-version.json"),
     "UPDATE_ENDPOINT": ("src/license_key.rs", "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update"),
+    # v1.7 ticket 12 / ADR 0007: Windows downloads the MSI the signed version file names, only from here.
+    "WINDOWS_DOWNLOADS": ("libs/base/src/update_feed.rs", "https://boringlabs.online/downloads/"),
 }
 UPDATEISH_URL = re.compile(r"https?://[^\s\"'`)<>]*(?:version|update|release|latest|download)[^\s\"'`)<>]*", re.I)
 # Not app updates: (prefix, why).
@@ -647,7 +649,7 @@ def simple_settings_checks(c):
         off.append("terminal_mouse_handler.dart: no kit terminal theme")
     c.fact("port forward, terminal and camera use kit tokens only", not off, "; ".join(off[:10]))
     settings = c.read(rebrand.SETTINGS)
-    needles = ["simple_settings.dart", "if (isMacOS && !_boringAdvanced) {", "SimpleSettings(",
+    needles = ["simple_settings.dart", "if ((isMacOS || isWindows) && !_boringAdvanced) {", "SimpleSettings(",
                "setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),",
                "label: 'All settings',", "child: const Text('Back to Settings'),"]
     missing = [n for n in needles if n not in settings]
@@ -662,7 +664,7 @@ def setup_checks(c):
     and LAN Discovery do, and opening the exact System Settings panes."""
     home, kit = c.read(rebrand.HOME), c.read(SETUP_DART)
     hooks = [
-        (home, "if (isMacOS && _boringSetup) {"),
+        (home, "if ((isMacOS || isWindows) && _boringSetup) {"),
         (home, "_boringSetup = setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption));"),
         (home, "SetupFlow("),
         (home, f"const nameKey = '{rebrand.BORING_MAC_NAME_OPTION}';"),
@@ -675,6 +677,58 @@ def setup_checks(c):
     ]
     missing = [n for text, n in hooks if n not in text]
     c.fact("Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)",
+           not missing, "; ".join(missing))
+
+
+def windows_checks(c):
+    """v1.7 ticket 12 (ADRs 0006, 0007): the v1.7 UI on Windows, Setup's reach step, the
+    installer's app rule, and a Windows update path off the same signed version file."""
+    gate_files = (rebrand.HOME, rebrand.SETTINGS, rebrand.T07_TOOLBAR, rebrand.CM_PAGE)
+    ui = "".join(c.read(rel) for rel in gate_files)
+    off = [a.strip().splitlines()[0] for a, b in rebrand.T12_EDITS[:len(rebrand.T12_GATES)] if a in ui or b not in ui]
+    words = "  if (isWindows) KitWords.windows();" in c.read("flutter/lib/main.dart")
+    c.fact("v1.7 Home, Setup, Settings, toolbar and trust prompt open on Windows too (t12)",
+           not off and words, "; ".join(off) or "main.dart does not set the Windows kit words")
+
+    home, kit = c.read(rebrand.HOME), c.read(SETUP_DART)
+    rule = f"{rebrand.APP_NAME} Service"
+    hooks = ["isWindows ? SetupPlatform.windows : SetupPlatform.mac", "platform: platform,",
+             "Process.run('netsh', windowsRuleShowArgs())",
+             "Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))"]
+    missing = [h for h in hooks if h not in home]
+    if f"const kWindowsRuleName = '{rule}';" not in kit:
+        missing.append(f"setup.dart rule name is not '{rule}'")
+    c.fact("Windows Setup step 2 lets other computers reach this one, through the installer's rule (t12)",
+           not missing, "; ".join(missing))
+
+    # The MSI's custom action names the rule "<exe name> Service" (BoringRemote.exe -> the name above).
+    wxs = c.read(f"{MSI_DIR}/Components/RustDesk.wxs")
+    fw = strip_tests_and_comments(c.read("res/msi/CustomActions/FirewallRules.cpp"))
+    win = c.read("src/platform/windows.rs")
+    bad = [n for n, ok in [
+        ("added on install", '<Custom Action="AddFirewallRules" Before="InstallFinalize"' in wxs),
+        ("removed on uninstall", '<Custom Action="RemoveFirewallRules" Before="RemoveFiles"/>' in wxs),
+        ("named <exe> Service", 'L"%ls Service"' in fw),
+        ("every network type", "CurrentProfilesBitMask = NET_FW_PROFILE2_ALL;" in fw),
+        ("any protocol and port", not re.search(r"put_(Protocol|LocalPorts|RemotePorts|Profiles\(NET_FW_PROFILE2_(DOMAIN|PRIVATE|PUBLIC))", fw)),
+        ("self-install adds the same rule", f'netsh advfirewall firewall add rule name=\\"{{app_name}} Service\\" dir=in action=allow program=' in win),
+    ] if not ok]
+    c.fact("installer's app rule lets other computers reach Direct Link 21118: any port, every network type (t12)",
+           not bad, "; ".join(bad))
+
+    notice, run = c.read("src/update_notice.rs"), c.read("src/update_install_run.rs")
+    feed = c.read("libs/base/src/update_feed.rs")
+    wf = c.read(".github/workflows/boring-build.yml")
+    needles = [
+        ("libs/base/src/update_feed.rs", feed, '#[cfg(target_os = "windows")]\npub const THIS: Platform = Platform::Windows;'),
+        ("src/update_notice.rs", notice, "base::update_feed::release_for(body, base::update_feed::THIS)"),
+        ("src/update_notice.rs", notice, "store.set(KEY_LAST_PKG_URL, package_url(&body));"),
+        ("src/update_install_run.rs", run, "crate::platform::update_to(p)"),
+        ("src/update_install_run.rs", run, "LocalConfig::get_option(crate::update_notice::KEY_LAST_PKG_URL)"),
+        ("boring-build.yml", wf, "boring/min-version feed-out feed-out/BoringRemote-*-windows-x64*.msi"),
+    ]
+    missing = [f"{rel}: {n}" for rel, text, n in needles if n not in text]
+    c.fact("Windows reads its own signed feed entry and installs the checked MSI (ADR 0007)",
            not missing, "; ".join(missing))
 
 
@@ -793,7 +847,7 @@ def updater_checks(c):
         if rel.endswith(".rs"):  # network calls live in Rust; Dart URLs are links opened in a browser
             stray += [f"{rel}: {h}" for h in UPDATEISH_URL.findall(code)
                       if h not in allowed and not h.startswith(tuple(p for p, _ in NOT_UPDATE_URLS))]
-    c.fact("the only update endpoints are VERSION_URL, its .sig and fulfillment /update (ADR 0004)",
+    c.fact("the only update endpoints are VERSION_URL, its .sig, fulfillment /update and the Windows downloads (ADR 0004/0007)",
            not stray, "; ".join(stray[:10]))
 
     callers = []
@@ -939,7 +993,7 @@ def run_checks(root):
         ("src/core_main.rs", '"--boring-verify-package"'),
         (rebrand.HOME, "bind.mainInstallUpdate()"),
         (rebrand.HOME, "setKey: (k) => bind.mainSetLicenseKey(key: k),"),  # ticket 15
-        (rebrand.HOME, "if (isMacOS) return _buildBlock(child: buildBoringHome(context));"),  # v1.7 t01
+        (rebrand.HOME, "if (isMacOS || isWindows) return _buildBlock(child: buildBoringHome(context));"),  # v1.7 t01/t12
         (rebrand.HOME, "MacHome("), (rebrand.HOME, "Kit.theme()"),
         (rebrand.HOME, "lan: lanMacs.macs,"), (rebrand.HOME, "discover: () => bind.mainDiscover(),"),  # v1.7 t02
         ("libs/base/src/lan.rs", f'DEVICE_NAME_OPTION: &str = "{rebrand.BORING_MAC_NAME_OPTION}";'),
@@ -961,6 +1015,7 @@ def run_checks(root):
     simple_settings_checks(c)  # v1.7 t09
     trust_checks(c, cfg)  # v1.7 t04
     setup_checks(c)  # v1.7 t06
+    windows_checks(c)  # v1.7 t12
     high_efficiency_checks(c)  # v1.7 t05
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",

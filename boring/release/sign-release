@@ -7,6 +7,8 @@ Reads the private seed with `cred get NAME` (base64 of a 32-byte raw ed25519
 seed). NAME is BORING_REMOTE_UPDATE_KEY (current, the default) or
 BORING_REMOTE_UPDATE_KEY_BACKUP; --key-name wins over env BORING_REMOTE_UPDATE_KEY_NAME. Fills package_sig in the-boring-remote-version.json,
 rewrites it, writes the-boring-remote-version.json.sig over its exact bytes,
+also fills windows.sig over the MSI named by windows.url when the file has a
+Windows entry (v1.7 ticket 12; the MSI must sit in the same dir),
 then verifies both against boring/update-pubkeys.json. The seed is never
 printed, logged or written. Exit 0 only when both verify.
 """
@@ -67,6 +69,11 @@ def sign_release(artifact_dir, seed_source=cred_seed, pubkeys=PUBKEYS):
     pkg_bytes = pkg.read_bytes()
     if hashlib.sha256(pkg_bytes).hexdigest() != data.get("package_sha256"):
         raise SignError(f"package_sha256 does not match {pkg.name}")
+    win = data.get("windows")
+    msi = d / win["url"].rsplit("/", 1)[-1] if win else None
+    msi_bytes = msi.read_bytes() if msi else None
+    if msi and hashlib.sha256(msi_bytes).hexdigest() != win.get("sha256"):
+        raise SignError(f"windows sha256 does not match {msi.name}")
 
     keys = embedded_keys(pubkeys)
     raw = base64.b64decode(seed_source())
@@ -80,6 +87,8 @@ def sign_release(artifact_dir, seed_source=cred_seed, pubkeys=PUBKEYS):
         raise SignError("signing key is neither embedded public key")
 
     data["package_sig"] = base64.b64encode(key.sign(pkg_bytes)).decode()
+    if msi:
+        win["sig"] = base64.b64encode(key.sign(msi_bytes)).decode()
     body = (json.dumps(data, separators=(",", ":")) + "\n").encode()
     file_sig = key.sign(body)
     vf.write_bytes(body)
@@ -91,6 +100,8 @@ def sign_release(artifact_dir, seed_source=cred_seed, pubkeys=PUBKEYS):
     pkg_sig = base64.b64decode(json.loads(on_disk)["package_sig"])
     if not (verifies(keys, sig, on_disk) and verifies(keys, pkg_sig, pkg.read_bytes())):
         raise SignError("written signatures do not verify")
+    if msi and not verifies(keys, base64.b64decode(json.loads(on_disk)["windows"]["sig"]), msi.read_bytes()):
+        raise SignError("written Windows signature does not verify")
     return pkg, vf
 
 

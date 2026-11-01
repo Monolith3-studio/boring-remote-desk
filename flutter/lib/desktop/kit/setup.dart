@@ -15,6 +15,24 @@ const kSetupStepOption = 'boring-setup-step';
 const kScreenRecordingPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture';
 const kAccessibilityPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility';
 
+/// The inbound app rule the MSI installs (res/msi CustomActions: "<exe name> Service"): any port,
+/// every network type, so it covers Direct Link (TCP 21118) and LAN Discovery (UDP 21119). v1.7 t12.
+const kWindowsRuleName = 'BoringRemote Service';
+
+/// `netsh` arguments that read the rule; exit code 0 means it is there. Needs no admin.
+List<String> windowsRuleShowArgs() => ['advfirewall', 'firewall', 'show', 'rule', 'name=$kWindowsRuleName', 'dir=in'];
+
+/// `powershell` arguments that add the same rule for [exe] as administrator: Windows asks once.
+List<String> windowsRuleAddArgs(String exe) {
+  final rule = 'advfirewall firewall add rule name="$kWindowsRuleName" dir=in action=allow '
+      'program="$exe" enable=yes profile=any';
+  return [
+    '-NoProfile',
+    '-Command',
+    "Start-Process -FilePath netsh -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '${rule.replaceAll("'", "''")}'",
+  ];
+}
+
 /// First launch only: Setup shows until it has been finished once.
 bool setupNeeded(String doneOption) => doneOption != 'Y';
 
@@ -25,7 +43,9 @@ int setupStartStep(String saved, int screens) {
 }
 
 /// Every word a buyer reads in Setup, in one place, for review (ticket 15, humanizer).
-/// Quoted names (“Boring Remote”, “Quit & Reopen”) are exactly what macOS shows.
+/// Quoted names (“Boring Remote”, “Quit & Reopen”) are exactly what macOS shows; on Windows,
+/// “Yes” and “Allow access” are exactly what Windows shows. A `key@windows` entry replaces
+/// `key` on Windows (v1.7 ticket 12).
 const setupCopy = <String, String>{
   'step': 'Step {n} of {total}',
   'next': 'Continue',
@@ -38,6 +58,9 @@ const setupCopy = <String, String>{
   'name.hint': 'For example: Edit Bay 2',
   'name.seen': "You'll see this name in the list on your other Macs.",
   'name.blank': 'Type a name first.',
+  'name.title@windows': 'Name this computer',
+  'name.body@windows': 'Your other computers will list it by this name.',
+  'name.seen@windows': "You'll see this name in the list on your other computers.",
   // Screen 2 (Mac)
   'allow.title': 'Let Boring Remote see and control this Mac',
   'allow.body': 'Click each button. System Settings opens. Turn on the switch next to “Boring Remote”.',
@@ -54,6 +77,17 @@ const setupCopy = <String, String>{
   'allow.seen': "You'll see a green check next to each one once it's on.",
   'allow.skip.why': "If you skip, people who connect won't see this screen or be able to click anything. "
       'You can finish this later in Settings.',
+  // Screen 2 (Windows, ticket 12)
+  'reach.title': 'Let your other computers reach this one',
+  'reach.body': 'Windows keeps other computers out of Boring Remote until you say yes. Click Allow.',
+  'reach.row': 'Let computers on this network reach Boring Remote',
+  'reach.button': 'Allow',
+  'reach.yes': 'Windows asks “Do you want to allow this app to make changes to your device?” Click “Yes”.',
+  'reach.box': 'If Windows shows a box about Boring Remote, tick every box in it and click “Allow access”.',
+  'reach.seen': "You'll see a green check once it's allowed.",
+  'reach.failed': "That didn't work. Click Allow again, then click “Yes” when Windows asks.",
+  'reach.skip.why': "If you skip, your other computers may not be able to reach this one. "
+      'You can finish this later in Settings.',
   // Screen 3
   'password.title': 'Set a password for when no one is here',
   'password.body': 'Your other Macs can get in with this password when no one is at this one.',
@@ -66,21 +100,22 @@ const setupCopy = <String, String>{
   'password.already': 'A password is already set. Type a new one to change it, or click Finish.',
   'password.skip.why': 'If you skip, someone has to be at this Mac to click Allow every time. '
       'You can set it later in Settings.',
+  'password.body@windows': 'Your other computers can get in with this password when no one is at this one.',
+  'password.skip.why@windows': 'If you skip, someone has to be at this computer to click Allow every time. '
+      'You can set it later in Settings.',
   'done': 'Finish',
 };
 
-String _copy(String key) => setupCopy[key]!;
-
 /// Which machine Setup runs on. Screen 2 depends on it: Mac asks for screen and control
-/// (System Settings); Windows gets its own step from ticket 12.
+/// (System Settings); Windows asks to let other computers reach it (ticket 12).
 enum SetupPlatform { mac, windows }
 
-enum _Screen { name, allow, password }
+enum _Screen { name, allow, reach, password }
 
 List<_Screen> _screensFor(SetupPlatform p) => [
       _Screen.name,
       if (p == SetupPlatform.mac) _Screen.allow,
-      // v1.7 ticket 12 adds the Windows step here.
+      if (p == SetupPlatform.windows) _Screen.reach,
       _Screen.password,
     ];
 
@@ -105,6 +140,10 @@ class SetupFlow extends StatefulWidget {
   final void Function(String url) openPane;
   final Duration pollEvery;
 
+  /// Windows: polled while screen 2 shows (the rule is there); [allowReach] asks Windows to add it.
+  final Future<bool> Function() canBeReached;
+  final Future<void> Function() allowReach;
+
   final bool passwordSet;
   final Future<bool> Function(String password) setPassword;
 
@@ -121,6 +160,8 @@ class SetupFlow extends StatefulWidget {
     required this.canControl,
     required this.openPane,
     this.pollEvery = const Duration(seconds: 1),
+    required this.canBeReached,
+    required this.allowReach,
     required this.passwordSet,
     required this.setPassword,
     this.startStep = 0,
@@ -141,9 +182,13 @@ class _SetupFlowState extends State<SetupFlow> {
   bool _confirmSkip = false;
   bool _saved = false;
   bool _seeScreen = false, _control = false;
+  bool _reached = false, _reachFailed = false;
   Timer? _poll;
 
   _Screen get _screen => _screens[_step];
+
+  String _copy(String key) =>
+      (widget.platform == SetupPlatform.windows ? setupCopy['$key@windows'] : null) ?? setupCopy[key]!;
 
   @override
   void initState() {
@@ -168,6 +213,27 @@ class _SetupFlowState extends State<SetupFlow> {
       _read();
       _poll = Timer.periodic(widget.pollEvery, (_) => setState(_read));
     }
+    if (_screen == _Screen.reach) {
+      _readReach();
+      _poll = Timer.periodic(widget.pollEvery, (_) => _readReach());
+    }
+  }
+
+  Future<bool> _readReach() async {
+    final on = await widget.canBeReached();
+    if (mounted && _screen == _Screen.reach) {
+      setState(() {
+        _reached = on;
+        if (on) _reachFailed = false;
+      });
+    }
+    return on;
+  }
+
+  Future<void> _allowReach() async {
+    await widget.allowReach();
+    final on = await _readReach();
+    if (mounted && !on) setState(() => _reachFailed = true);
   }
 
   void _read() {
@@ -223,6 +289,7 @@ class _SetupFlowState extends State<SetupFlow> {
     final (title, body) = switch (_screen) {
       _Screen.name => (_copy('name.title'), _nameScreen(t)),
       _Screen.allow => (_copy('allow.title'), _allowScreen(t)),
+      _Screen.reach => (_copy('reach.title'), _reachScreen(t)),
       _Screen.password => (_copy('password.title'), _passwordScreen(t)),
     };
     return ListView(
@@ -294,7 +361,32 @@ class _SetupFlowState extends State<SetupFlow> {
         ],
       );
 
+  Widget _reachScreen(TextTheme t) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(_copy('reach.body')),
+          const SizedBox(height: Kit.s4),
+          _row(t, on: _reached, what: _copy('reach.row'), button: _copy('reach.button'), onPressed: _allowReach),
+          if (_reachFailed && !_reached) ...[
+            const SizedBox(height: Kit.s2),
+            Text(_copy('reach.failed')),
+          ],
+          const SizedBox(height: Kit.s3),
+          Text(_copy('reach.seen'), style: t.bodySmall),
+          const SizedBox(height: Kit.s2),
+          Text(_copy('reach.yes'), style: t.bodySmall),
+          const SizedBox(height: Kit.s2),
+          Text(_copy('reach.box'), style: t.bodySmall),
+          const SizedBox(height: Kit.s5),
+          _primary(_copy('next'), _reached ? _advance : null),
+          if (!_reached) ...[const SizedBox(height: Kit.s2), _skip(t, _copy('reach.skip.why'))],
+        ],
+      );
+
   Widget _allowRow(TextTheme t, {required bool on, required String what, required String button, required String pane}) =>
+      _row(t, on: on, what: what, button: button, onPressed: () => widget.openPane(pane));
+
+  Widget _row(TextTheme t, {required bool on, required String what, required String button, required VoidCallback onPressed}) =>
       Container(
         padding: const EdgeInsets.all(Kit.s4),
         decoration: BoxDecoration(
@@ -310,7 +402,7 @@ class _SetupFlowState extends State<SetupFlow> {
           if (on)
             Text(_copy('allow.on'), style: t.bodyMedium?.copyWith(color: Kit.ok))
           else
-            OutlinedButton(onPressed: () => widget.openPane(pane), child: Text(button)),
+            OutlinedButton(onPressed: onPressed, child: Text(button)),
         ]),
       );
 

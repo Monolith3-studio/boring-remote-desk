@@ -238,6 +238,39 @@ class VersionFile(unittest.TestCase):
         })
         self.assertEqual(sorted(p.name for p in self.out.iterdir() if p.suffix == ".sig"), [])
 
+    def write_with_msi(self, tag, msi):
+        return run(["bash", str(VERSION_FILE), str(self.cargo), tag, str(self.dmg), str(self.pkg),
+                    str(self.minv), str(self.out), str(msi)])
+
+    def test_with_an_msi_adds_the_windows_entry(self):
+        """v1.7 ticket 12 / ADR 0007: Windows reads its own entry; the Mac keys are unchanged."""
+        msi = self.out / "BoringRemote-1.5.0-windows-x64-unsigned.msi"
+        msi.write_bytes(b"not really an msi")
+        r = self.write_with_msi("v1.5.0", msi)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads((self.out / "the-boring-remote-version.json").read_text())
+        self.assertEqual(got.pop("windows"), {
+            "version": "1.5.0",
+            "url": "https://boringlabs.online/downloads/BoringRemote-1.5.0-windows-x64-unsigned.msi",
+            "sha256": hashlib.sha256(b"not really an msi").hexdigest(),
+            "sig": "",
+        })
+        self.assertEqual(got["version"], "1.5.0")
+        self.assertEqual(got["package_sha256"], hashlib.sha256(b"not really a package").hexdigest())
+
+    def test_missing_msi_fails_and_writes_nothing(self):
+        r = self.write_with_msi("v1.5.0", self.out / "nope.msi")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("MSI", r.stderr)
+        self.assertFalse((self.out / "the-boring-remote-version.json").exists())
+
+    def test_msi_for_another_version_fails(self):
+        msi = self.out / "BoringRemote-1.4.0-windows-x64-unsigned.msi"
+        msi.write_bytes(b"old")
+        r = self.write_with_msi("v1.5.0", msi)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse((self.out / "the-boring-remote-version.json").exists())
+
     def test_bare_tag_without_v_also_matches(self):
         self.assertEqual(self.write("1.5.0").returncode, 0)
 
@@ -250,17 +283,22 @@ class VersionFile(unittest.TestCase):
     def test_non_semver_tag_fails(self):
         self.assertNotEqual(self.write("v1.5.0-rc1").returncode, 0)
 
-    def test_workflow_runs_it_on_tags_and_ships_the_file_with_the_dmg(self):
+    def test_workflow_runs_it_on_tags_with_both_platforms(self):
+        """Ticket 12 / ADR 0007: one file for Mac and Windows, written once both builds are done."""
         text = WORKFLOW.read_text()
-        st = step(job("build-macos"), "Write version file (tags only)")
-        self.assertIn("if: startsWith(github.ref, 'refs/tags/')", st)
+        j = job("update-feed")
+        self.assertIn("needs: [build-macos, build-windows]", j)
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/')", j)
+        st = step(j, "Write version file (tags only)")
         self.assertIn("boring/dmg/write-version-file.sh", st)
-        self.assertIn("dmg-out", st)
-        self.assertLess(job("build-macos").index("Sign, build DMG"), job("build-macos").index("Write version file"))
-        self.assertLess(job("build-macos").index("Write version file"), job("build-macos").index("path: dmg-out/*"))
-        self.assertNotRegex(text, r"(curl|scp|rsync|wrangler)[^\n]*boringlabs")
         self.assertIn("boring/min-version", st)
-        self.assertNotIn(".sig", job("build-macos"))
+        self.assertRegex(st, r"macos-arm64\.dmg .*macos-arm64\.app\.tar\.xz .*windows-x64\*?\.msi")
+        self.assertIn("name: boring-remote-macos-arm64-dmg", j)
+        self.assertIn("name: boring-remote-windows-x64-msi", j)
+        self.assertIn("name: boring-remote-update-feed", j)
+        self.assertNotIn("write-version-file.sh", job("build-macos"))
+        self.assertNotRegex(text, r"(curl|scp|rsync|wrangler)[^\n]*boringlabs")
+        self.assertNotIn(".sig", job("build-macos") + j)
 
     def test_workflow_builds_the_update_package_from_the_signed_app(self):
         st = step(job("build-macos"), "Build update package")
@@ -268,7 +306,7 @@ class VersionFile(unittest.TestCase):
         self.assertIn("Release/BoringRemote.app", st)
         j = job("build-macos")
         self.assertLess(j.index("Sign, build DMG"), j.index("Build update package"))
-        self.assertLess(j.index("Build update package"), j.index("Write version file"))
+        self.assertLess(j.index("Build update package"), j.index("path: dmg-out/*"))
 
 
 PACKAGE = DMG / "make-update-package.sh"

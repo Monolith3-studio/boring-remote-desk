@@ -1,5 +1,25 @@
 import 'package:flutter/material.dart';
 
+/// What the buyer calls a computer (v1.7 ticket 12): "Mac" on the Mac build, "computer" on
+/// Windows. Set once at startup (main.dart, before any window is built); Mac is the default.
+class KitWords {
+  KitWords._();
+  static String one = 'Mac';
+  static String many = 'Macs';
+  static void mac() {
+    one = 'Mac';
+    many = 'Macs';
+  }
+
+  static void windows() {
+    one = 'computer';
+    many = 'computers';
+  }
+
+  /// First letter capital, for a word that starts a label: "Computers", "Mac".
+  static String cap(String s) => s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
+}
+
 /// The Boring Remote kit: every colour, type and spacing token the v1.7 UI uses.
 /// Palette comes from the icon and DMG art (boring/art/icon.svg, boring/dmg/make_art.py).
 /// Coral is for marks only (focus, cursor, selection): never text, never a fill under text.

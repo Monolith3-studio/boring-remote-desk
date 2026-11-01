@@ -1205,6 +1205,64 @@ PATCHES += [
      "Setup on first launch only"),
 ]
 
+# --- Windows gets the v1.7 UI (v1.7 ticket 12, ADRs 0006, 0007) -------------------
+# Every Mac-only gate the v1.7 tickets added now also opens on Windows: Home + LAN list (t01/t02),
+# Session Toolbar + Link Badge (t07/t03/t05), Settings (t09), trust prompt (t04), Setup (t06).
+# The rewrite runs over the earlier blocks' own patch text (old and new alike), as t04/t06 did, so
+# a second rebrand still finds each block whole and stays a no-op. Setup's screen 2 on Windows is
+# "let other computers reach this one": the MSI's app rule (any port, every network type) covers
+# Direct Link 21118 and LAN Discovery 21119; Allow adds the same rule if it is missing. The kit
+# says "computer" for "Mac" on Windows (KitWords, set once in main()).
+T12_GATES = [
+    "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n",  # t01 Home
+    "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",  # t01
+    "    if (isMacOS) _boringSetup = setupNeeded(",  # t06 first launch
+    "    if (isMacOS && _boringSetup) {\n",  # t06
+    "    if (isMacOS) {\n      // Everything but Close goes behind More;",  # t07 toolbar
+    "    if (isMacOS && !_boringAdvanced) {\n",  # t09 Settings
+    "        if (isMacOS)\n          TextButton(\n            onPressed: () => setState(() => _boringAdvanced = false),",  # t09
+    "    if (isMacOS && showAccept) {\n",  # t04 approval prompt
+]
+T12_EDITS = [(g, g.replace("if (isMacOS)", "if (isMacOS || isWindows)", 1)
+               .replace("if (isMacOS &&", "if ((isMacOS || isWindows) &&", 1)) for g in T12_GATES] + [
+    ("'Unnamed Mac'", "'Unnamed ${KitWords.one}'"),  # t01 Home
+    ("  final screens = SetupFlow.screenCount(SetupPlatform.mac);\n",  # t06 Setup
+     "  final platform = isWindows ? SetupPlatform.windows : SetupPlatform.mac; // v1.7 t12\n"
+     "  final screens = SetupFlow.screenCount(platform);\n"),
+    ("        platform: SetupPlatform.mac,\n", "        platform: platform,\n"),
+    ("        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n",
+     "        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n"
+     "        // v1.7 t12 (Windows): the installer's app rule is there; Allow adds it (Windows asks once).\n"
+     "        canBeReached: () => Process.run('netsh', windowsRuleShowArgs())\n"
+     "            .then((r) => r.exitCode == 0)\n"
+     "            .catchError((_) => false),\n"
+     "        allowReach: () => Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))\n"
+     "            .then<void>((_) {})\n"
+     "            .catchError((_) {}),\n"),
+]
+
+
+def _t12(text):
+    if not isinstance(text, str):
+        return text
+    for a, b in T12_EDITS:
+        text = text.replace(a, b)
+    return text
+
+
+PATCHES[:] = [(rel, _t12(old), _t12(new), why) for rel, old, new, why in PATCHES]
+assert all(any(b in new for _, _, new, _ in PATCHES) for _, b in T12_EDITS), "a v1.7 Mac gate moved under t12"
+PATCHES += [
+    ("flutter/lib/main.dart", "import 'package:flutter_hbb/common/widgets/overlay.dart';\n",
+     "import 'package:flutter_hbb/common/widgets/overlay.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n",
+     "kit words import"),
+    ("flutter/lib/main.dart", "  kBootArgs = List.from(args);\n",
+     "  kBootArgs = List.from(args);\n"
+     "  if (isWindows) KitWords.windows(); // v1.7 t12: the kit says computer, not Mac, on Windows\n",
+     "the kit says computer on Windows (every window runs main)"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

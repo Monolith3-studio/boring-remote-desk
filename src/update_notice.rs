@@ -19,6 +19,8 @@ pub const KEY_LAST_MIN: &str = "boring-update-last-min";
 /// `package_sha256` / `package_sig` from the last good (signed) fetch, for Install update.
 pub const KEY_LAST_PKG_SHA: &str = "boring-update-last-pkg-sha256";
 pub const KEY_LAST_PKG_SIG: &str = "boring-update-last-pkg-sig";
+/// Windows only (ticket 12): the MSI URL from the last good (signed) fetch.
+pub const KEY_LAST_PKG_URL: &str = "boring-update-last-pkg-url";
 const GATE_SECS: u64 = 24 * 60 * 60;
 /// The one source of the update public keys ({current, backup}, base64 raw ed25519).
 const PUBKEYS_JSON: &str = include_str!("../boring/update-pubkeys.json");
@@ -96,26 +98,23 @@ pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// (version, min_version or "") from a version file; None if either is not strict X.Y.Z.
+/// Reads this platform's entry (v1.7 ticket 12: Windows has its own; Mac keeps the top level).
 fn remote_versions(body: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let s = v.get("version")?.as_str()?;
-    parse_semver(s)?;
-    let min = match v.get("min_version") {
-        None => String::new(),
-        Some(m) => {
-            let m = m.as_str()?;
-            parse_semver(m)?;
-            m.to_owned()
-        }
-    };
-    Some((s.to_owned(), min))
+    base::update_feed::release_for(body, base::update_feed::THIS).map(|r| (r.version, r.min_version))
 }
 
 /// (package_sha256, package_sig), "" for either that is missing.
 fn package_fields(body: &str) -> (String, String) {
-    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    let f = |k: &str| v.get(k).and_then(|s| s.as_str()).unwrap_or("").to_owned();
-    (f("package_sha256"), f("package_sig"))
+    base::update_feed::release_for(body, base::update_feed::THIS)
+        .map(|r| (r.package_sha256, r.package_sig))
+        .unwrap_or_default()
+}
+
+/// Windows: the MSI to download (ticket 12). Mac: "" (fulfillment serves the package).
+fn package_url(body: &str) -> String {
+    base::update_feed::release_for(body, base::update_feed::THIS)
+        .map(|r| r.url)
+        .unwrap_or_default()
 }
 
 /// The package to install, from the last good signed fetch; None when it had no package details.
@@ -129,10 +128,7 @@ pub fn release(store: &dyn Store) -> Option<crate::update_install::Release> {
 }
 
 fn newer_than(remote: &str, running: &str) -> bool {
-    match (parse_semver(remote), parse_semver(running)) {
-        (Some(r), Some(l)) => r > l,
-        _ => false,
-    }
+    base::update_feed::newer(remote, running)
 }
 
 /// Returns the notice when the remote version is strictly newer than `running`.
@@ -171,6 +167,7 @@ pub fn check_with(
                         store.set(KEY_LAST_MIN, min);
                         store.set(KEY_LAST_PKG_SHA, sha);
                         store.set(KEY_LAST_PKG_SIG, psig);
+                        store.set(KEY_LAST_PKG_URL, package_url(&body));
                     }
                 }
             }

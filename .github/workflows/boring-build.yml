@@ -46,7 +46,7 @@ jobs:
           submodules: recursive
 
       - name: Rebrand, pin and DMG tests (clean tree, idempotency, moved targets, stale pins, workflow)
-        run: python3 -m unittest boring/test_rebrand.py boring/test_pins.py boring/test_dmg.py -v
+        run: python3 -m unittest boring/test_rebrand.py boring/test_pins.py boring/test_dmg.py boring/test_msi.py -v
 
       - name: Rebrand this checkout
         run: python3 boring/rebrand.py
@@ -253,13 +253,6 @@ jobs:
       - name: Build update package
         run: boring/dmg/make-update-package.sh flutter/build/macos/Build/Products/Release/BoringRemote.app "$VERSION" dmg-out
 
-      # Version file (ADR 0003/0004), beside the DMG. Fails the build if the tag is not Cargo.toml's
-      # version, or boring/min-version is malformed or above it. package_sig stays empty: signing is
-      # local only. Nothing is uploaded to boringlabs.online here; the release step publishes by hand.
-      - name: Write version file (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        run: boring/dmg/write-version-file.sh Cargo.toml "${{ github.ref_name }}" dmg-out/BoringRemote-*-macos-arm64.dmg dmg-out/BoringRemote-*-macos-arm64.app.tar.xz boring/min-version dmg-out
-
       # release-mac.sh deletes its keychain on exit; this covers a killed or cancelled step.
       - name: Delete temp signing keychain
         if: always()
@@ -415,9 +408,21 @@ jobs:
           $lnk = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Boring Remote\Boring Remote.lnk"
           if (-not (Test-Path $lnk)) { throw "missing Start menu shortcut $lnk" }
           Get-Service -Name BoringRemote -ErrorAction Stop | Format-List Name, DisplayName, Status
+          # v1.7 ticket 12: the installer's app rule lets other computers reach Direct Link (TCP 21118)
+          # and LAN Discovery (UDP 21119): inbound, allowed, every network type, any port, this exe.
+          $fw = @(Get-NetFirewallRule -DisplayName 'BoringRemote Service' -ErrorAction Stop | Where-Object { $_.Direction -eq 'Inbound' })
+          if ($fw.Count -eq 0) { throw "no inbound firewall rule 'BoringRemote Service'" }
+          foreach ($r in $fw) {
+            if ("$($r.Enabled)" -ne 'True' -or "$($r.Action)" -ne 'Allow' -or "$($r.Profile)" -ne 'Any') { throw "firewall rule is $($r.Enabled) $($r.Action) $($r.Profile)" }
+            $pf = $r | Get-NetFirewallPortFilter
+            if ("$($pf.Protocol)" -ne 'Any' -or "$($pf.LocalPort)" -ne 'Any') { throw "firewall rule only covers $($pf.Protocol) $($pf.LocalPort)" }
+            $af = $r | Get-NetFirewallApplicationFilter
+            if ($af.Program -ne $exe) { throw "firewall rule is for '$($af.Program)', not $exe" }
+          }
           $p = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /l*v msi-uninstall.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content msi-uninstall.log -Tail 80; throw "silent uninstall exited $($p.ExitCode)" }
           if (Test-Path $exe) { throw "$exe still there after uninstall" }
+          if (Get-NetFirewallRule -DisplayName 'BoringRemote Service' -ErrorAction SilentlyContinue) { throw "firewall rule left after uninstall" }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -451,6 +456,38 @@ jobs:
               || gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
           fi
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber ./*.msi ./*.msi.sha256
+
+  # Version file (ADR 0003/0004/0007): Mac keys top level (1.6.x clients read them) plus the
+  # Windows entry (ticket 12). Fails if the tag is not Cargo.toml's version, boring/min-version is
+  # malformed or above it, or the MSI is another version. Signatures stay empty: signing is local
+  # (boring/release/sign-release on this artifact). Nothing is uploaded to boringlabs.online here.
+  update-feed:
+    needs: [build-macos, build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: boring-remote-macos-arm64-dmg
+          path: feed-out
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: boring-remote-windows-x64-msi
+          path: feed-out
+
+      - name: Write version file (tags only)
+        run: boring/dmg/write-version-file.sh Cargo.toml "${{ github.ref_name }}" feed-out/BoringRemote-*-macos-arm64.dmg feed-out/BoringRemote-*-macos-arm64.app.tar.xz boring/min-version feed-out feed-out/BoringRemote-*-windows-x64*.msi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boring-remote-update-feed
+          path: |
+            feed-out/the-boring-remote-version.json
+            feed-out/*.app.tar.xz
+            feed-out/*.msi
 
   # A tag publishes the signed DMG and its checksum on the same release as the MSI.
   # build-macos already refuses a tag without the signing secrets; this refuses an

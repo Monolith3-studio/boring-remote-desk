@@ -87,21 +87,21 @@ class _MacHomeState extends State<MacHome> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           ...widget.notices,
-          Text('Connect to a Mac', style: Theme.of(context).textTheme.headlineSmall),
+          Text('Connect to a ${KitWords.one}', style: Theme.of(context).textTheme.headlineSmall),
           const SizedBox(height: Kit.s4),
           TextField(
             key: MacHome.addressKey,
             controller: _address,
             autofocus: true,
-            decoration: const InputDecoration(
-              hintText: 'Mac name or IP address',
-              prefixIcon: Icon(Icons.search, color: Kit.muted),
+            decoration: InputDecoration(
+              hintText: '${KitWords.cap(KitWords.one)} name or IP address',
+              prefixIcon: const Icon(Icons.search, color: Kit.muted),
             ),
             onChanged: (_) => setState(() {}),
             onSubmitted: _submit,
           ),
           const SizedBox(height: Kit.s5),
-          Text('Macs', style: Theme.of(context).textTheme.bodySmall),
+          Text(KitWords.cap(KitWords.many), style: Theme.of(context).textTheme.bodySmall),
           const SizedBox(height: Kit.s2),
           Expanded(
             child: ListView(
@@ -127,7 +127,7 @@ class _MacHomeState extends State<MacHome> {
                     ),
                 ],
                 if (widget.macs.isEmpty && widget.lan.isEmpty)
-                  Text('No Macs yet. Type a Mac name or IP above.',
+                  Text('No ${KitWords.many} yet. Type a ${KitWords.one} name or IP above.',
                       style: Theme.of(context).textTheme.bodySmall),
                 for (final m in shown)
                   ListTile(
@@ -173,7 +173,7 @@ class OutsideBuildingSheet extends StatelessWidget {
         children: [
           Text('Connect from outside the building', style: t.titleLarge),
           const SizedBox(height: Kit.s2),
-          Text('On another network? Give them this ID. On the same network, they just pick this Mac by name.',
+          Text('On another network? Give them this ID. On the same network, they just pick this ${KitWords.one} by name.',
               style: t.bodySmall),
           const SizedBox(height: Kit.s5),
           SelectableText(id, style: t.headlineSmall),

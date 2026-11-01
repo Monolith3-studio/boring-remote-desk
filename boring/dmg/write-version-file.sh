@@ -3,15 +3,19 @@
 # version = Cargo.toml's package version; the tag (leading "v" optional) must equal it. min_version
 # comes from the checked-in file (boring/min-version): strict X.Y.Z and <= version. Any failure exits
 # 1 and writes nothing. package_sig stays empty: signing is local (slice 4); no .sig is written here.
+# With a 7th argument (the Windows MSI, ticket 12 / ADR 0007) it adds the Windows entry
+# "windows":{"version","url","sha256","sig"}; the MSI's name must carry the same version.
+# Mac keys stay top level so 1.6.x clients read the file as before.
 # Writes <out dir>/the-boring-remote-version.json. Uploads nothing.
 set -euo pipefail
-USAGE="usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir>"
+USAGE="usage: write-version-file.sh <Cargo.toml> <tag> <dmg> <package> <min-version file> <out dir> [<msi>]"
 CARGO=${1:?$USAGE}
 TAG=${2:?$USAGE}
 DMG=${3:?$USAGE}
 PKG=${4:?$USAGE}
 MINF=${5:?$USAGE}
 OUT=${6:?$USAGE}
+MSI=${7:-}
 die() { echo "write-version-file: $*" >&2; exit 1; }
 
 [ -f "$CARGO" ] || die "no $CARGO"
@@ -31,11 +35,20 @@ MIN=$(tr -d '\n' < "$MINF")
 IFS=. read -r a b c <<< "$MIN"; IFS=. read -r x y z <<< "$VER"
 (( a < x || (a == x && (b < y || (b == y && c <= z))) )) || die "min-version $MIN is above version $VER"
 
+WIN=""
+if [ -n "$MSI" ]; then
+  [ -f "$MSI" ] || die "no MSI at $MSI"
+  MNAME=$(basename "$MSI")
+  [[ $MNAME == BoringRemote-$VER-windows-x64*.msi ]] || die "MSI '$MNAME' is not version $VER"
+  MSHA=$(shasum -a 256 "$MSI" | awk '{print $1}')
+  WIN=$(printf ',"windows":{"version":"%s","url":"https://boringlabs.online/downloads/%s","sha256":"%s","sig":""}' "$VER" "$MNAME" "$MSHA")
+fi
+
 NAME=$(basename "$DMG")
 SHA=$(shasum -a 256 "$DMG" | awk '{print $1}')
 PSHA=$(shasum -a 256 "$PKG" | awk '{print $1}')
 mkdir -p "$OUT"
-printf '{"version":"%s","sha256":"%s","url":"https://boringlabs.online/downloads/%s","package_sha256":"%s","package_sig":"","min_version":"%s"}\n' \
-  "$VER" "$SHA" "$NAME" "$PSHA" "$MIN" \
+printf '{"version":"%s","sha256":"%s","url":"https://boringlabs.online/downloads/%s","package_sha256":"%s","package_sig":"","min_version":"%s"%s}\n' \
+  "$VER" "$SHA" "$NAME" "$PSHA" "$MIN" "$WIN" \
   > "$OUT/the-boring-remote-version.json"
 cat "$OUT/the-boring-remote-version.json"

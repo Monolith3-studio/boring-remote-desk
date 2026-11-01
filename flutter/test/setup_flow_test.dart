@@ -21,6 +21,8 @@ SetupFlow flow({
   bool Function()? canSeeScreen,
   bool Function()? canControl,
   void Function(String url)? openPane,
+  Future<bool> Function()? canBeReached,
+  Future<void> Function()? allowReach,
   bool passwordSet = false,
   Future<bool> Function(String)? setPassword,
   int startStep = 0,
@@ -34,6 +36,8 @@ SetupFlow flow({
       canSeeScreen: canSeeScreen ?? () => false,
       canControl: canControl ?? () => false,
       openPane: openPane ?? (_) {},
+      canBeReached: canBeReached ?? () async => false,
+      allowReach: allowReach ?? () async {},
       passwordSet: passwordSet,
       setPassword: setPassword ?? (_) async => true,
       startStep: startStep,
@@ -214,13 +218,107 @@ void main() {
       expect(steps, [1, 2]);
     });
 
-    testWidgets('Windows has no Mac screen-and-control step (ticket 12 adds its own)', (tester) async {
-      await tester.pumpWidget(host(flow(platform: SetupPlatform.windows)));
+  });
+
+  // v1.7 ticket 12: Windows asks to let other computers reach it in place of the Mac step.
+  group('screen 2 on Windows: let other computers reach this one', () {
+    Future<void> toReach(WidgetTester tester, SetupFlow f) async {
+      await tester.pumpWidget(host(f));
       await tester.pump();
-      expect(find.text('Step 1 of 2'), findsOneWidget);
+      await tapText(tester, setupCopy['next']!);
+      await tester.pump();
+    }
+
+    testWidgets('three screens, the middle one is reach, not the Mac step', (tester) async {
+      await tester.pumpWidget(host(flow(platform: SetupPlatform.windows, computerName: Future.value('FRONT-DESK'))));
+      await tester.pump();
+      expect(find.text('Step 1 of 3'), findsOneWidget);
+      expect(find.text('Name this computer'), findsOneWidget);
+      expect(find.text('Your other computers will list it by this name.'), findsOneWidget);
+      await tapText(tester, setupCopy['next']!);
+      await tester.pump();
+      expect(find.text(setupCopy['reach.title']!), findsOneWidget);
+      expect(find.text(setupCopy['allow.title']!), findsNothing);
+      expect(find.text('Step 2 of 3'), findsOneWidget);
+    });
+
+    testWidgets('already allowed (the installer did it) shows green and Continue works', (tester) async {
+      await toReach(tester, flow(platform: SetupPlatform.windows, canBeReached: () async => true));
+      await tester.pump();
+      expect(find.text(setupCopy['allow.on']!), findsOneWidget);
+      expect(find.text(setupCopy['reach.button']!), findsNothing);
       await tapText(tester, setupCopy['next']!);
       await tester.pump();
       expect(find.text(setupCopy['password.title']!), findsOneWidget);
+    });
+
+    testWidgets('Allow asks Windows once, then turns green when the rule is there', (tester) async {
+      var allowed = false, asked = 0;
+      await toReach(
+          tester,
+          flow(
+              platform: SetupPlatform.windows,
+              canBeReached: () async => allowed,
+              allowReach: () async {
+                asked++;
+                allowed = true;
+              }));
+      await tester.pump();
+      final next = tester.widget<FilledButton>(find.widgetWithText(FilledButton, setupCopy['next']!));
+      expect(next.onPressed, isNull);
+      await tapText(tester, setupCopy['reach.button']!);
+      await tester.pumpAndSettle();
+      expect(asked, 1);
+      expect(find.text(setupCopy['allow.on']!), findsOneWidget);
+      expect(find.text(setupCopy['reach.failed']!), findsNothing);
+    });
+
+    testWidgets('a No at the Windows prompt says the one thing to do next', (tester) async {
+      await toReach(tester, flow(platform: SetupPlatform.windows));
+      await tester.pump();
+      await tapText(tester, setupCopy['reach.button']!);
+      await tester.pumpAndSettle();
+      expect(find.text(setupCopy['reach.failed']!), findsOneWidget);
+      expect(find.text(setupCopy['reach.button']!), findsOneWidget);
+    });
+
+    testWidgets('turns green live if it gets allowed some other way', (tester) async {
+      var allowed = false;
+      await toReach(tester,
+          flow(platform: SetupPlatform.windows, canBeReached: () async => allowed));
+      await tester.pump();
+      expect(find.text(setupCopy['allow.on']!), findsNothing);
+      allowed = true;
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      expect(find.text(setupCopy['allow.on']!), findsOneWidget);
+      await tapText(tester, setupCopy['next']!); // leave the screen so the poll stops
+      await tester.pump();
+    });
+
+    testWidgets('skipping says what it costs before it skips', (tester) async {
+      await toReach(tester, flow(platform: SetupPlatform.windows));
+      await tester.pump();
+      await tapText(tester, setupCopy['skip']!);
+      await tester.pump();
+      expect(find.text(setupCopy['reach.skip.why']!), findsOneWidget);
+      await tapText(tester, setupCopy['skip.confirm']!);
+      await tester.pump();
+      expect(find.text(setupCopy['password.title']!), findsOneWidget);
+      expect(find.text('Your other computers can get in with this password when no one is at this one.'),
+          findsOneWidget);
+    });
+
+    test('the rule commands: read without admin, add asks Windows once, path quoted', () {
+      expect(windowsRuleShowArgs(),
+          ['advfirewall', 'firewall', 'show', 'rule', 'name=BoringRemote Service', 'dir=in']);
+      final add = windowsRuleAddArgs(r"C:\Program Files\BoringRemote\BoringRemote.exe");
+      expect(add.take(2), ['-NoProfile', '-Command']);
+      expect(add.last,
+          "Start-Process -FilePath netsh -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList "
+          "'advfirewall firewall add rule name=\"BoringRemote Service\" dir=in action=allow "
+          "program=\"C:\\Program Files\\BoringRemote\\BoringRemote.exe\" enable=yes profile=any'");
+      expect(windowsRuleAddArgs(r"C:\it's\BoringRemote.exe").last, contains(r"C:\it''s\BoringRemote.exe"));
     });
   });
 

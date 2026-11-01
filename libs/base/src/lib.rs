@@ -7,5 +7,6 @@ pub mod lan;
 pub mod platform;
 pub mod protos;
 pub mod trust;
+pub mod update_feed;
 
 pub use protos::message as message_proto;

@@ -6,7 +6,9 @@ use hbb_common::{config::LocalConfig, log};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "windows"))]
 struct Http;
+#[cfg(not(target_os = "windows"))]
 impl Fetcher for Http {
     fn post_to_file(&self, url: &str, body: &str, dest: &Path, timeout: Duration) -> Result<u16, String> {
         let client = crate::hbbs_http::create_http_client_with_url_strict(url).map_err(|e| e.to_string())?;
@@ -21,6 +23,38 @@ impl Fetcher for Http {
         let mut f = std::fs::File::create(dest).map_err(|e| e.to_string())?;
         r.copy_to(&mut f).map_err(|e| e.to_string())?;
         Ok(r.status().as_u16())
+    }
+}
+
+/// Windows (v1.7 ticket 12): the MSI is a public download named in the signed version file's
+/// Windows entry, so this GETs it; the License key stays on this computer.
+#[cfg(target_os = "windows")]
+struct HttpGet;
+#[cfg(target_os = "windows")]
+impl Fetcher for HttpGet {
+    fn post_to_file(&self, url: &str, _body: &str, dest: &Path, timeout: Duration) -> Result<u16, String> {
+        let client = crate::hbbs_http::create_http_client_with_url_strict(url).map_err(|e| e.to_string())?;
+        let mut r = client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, format!("BoringRemote/{}", crate::VERSION))
+            .timeout(timeout)
+            .send()
+            .map_err(|e| e.to_string())?;
+        let mut f = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+        r.copy_to(&mut f).map_err(|e| e.to_string())?;
+        Ok(r.status().as_u16())
+    }
+}
+
+/// Windows: the checked MSI goes to upstream's MSI update path (msiexec, one Windows prompt),
+/// which waits for the installer, so the temp dir outlives it.
+#[cfg(target_os = "windows")]
+struct Msiexec;
+#[cfg(target_os = "windows")]
+impl Runner for Msiexec {
+    fn run(&self, package: &Path, _sig: &str, _version: &str) -> Result<(), String> {
+        let p = package.to_str().ok_or("package path is not UTF-8")?;
+        crate::platform::update_to(p).map_err(|e| e.to_string())
     }
 }
 
@@ -39,11 +73,14 @@ impl SessionCount for Live {
 }
 
 /// One admin prompt naming Boring Remote and the version; argv is quoted, never spliced.
+#[cfg(not(target_os = "windows"))]
 const OSA: &str = r#"on run argv
   do shell script (quoted form of item 1 of argv) & " " & (quoted form of item 2 of argv) & " " & (quoted form of item 3 of argv) & " " & (quoted form of item 4 of argv) with prompt ("Boring Remote needs your password to install version " & (item 4 of argv) & ".") with administrator privileges
 end run"#;
 
+#[cfg(not(target_os = "windows"))]
 struct Osascript;
+#[cfg(not(target_os = "windows"))]
 impl Runner for Osascript {
     fn run(&self, package: &Path, sig: &str, version: &str) -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -90,15 +127,19 @@ pub fn install_now() -> String {
         return InstallError::Download(e.to_string()).as_str().into();
     }
     let keys = crate::update_notice::embedded_keys();
+    #[cfg(not(target_os = "windows"))]
+    let (fetcher, runner, url) = (&Http, &Osascript, crate::license_key::UPDATE_ENDPOINT.to_owned());
+    #[cfg(target_os = "windows")]
+    let (fetcher, runner, url) = (&HttpGet, &Msiexec, LocalConfig::get_option(crate::update_notice::KEY_LAST_PKG_URL));
     let d = Deps {
-        fetcher: &Http,
+        fetcher,
         clock: &Mono(Instant::now()),
         sessions: &Live,
-        runner: &Osascript,
+        runner,
         keys: &keys,
         temp_dir: &dir,
     };
-    let res = install(&d, crate::license_key::UPDATE_ENDPOINT, &key, release.as_ref());
+    let res = install(&d, &url, &key, release.as_ref());
     let _ = std::fs::remove_dir_all(&dir);
     match res {
         Ok(()) => "ok".into(),

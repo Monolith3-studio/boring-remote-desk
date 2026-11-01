@@ -73,6 +73,39 @@ class SignRelease(unittest.TestCase):
         with self.assertRaises(sr.SignError):
             sr.sign_release(self.tmp, lambda: b64(self.seed), self.keys)
 
+    def add_windows(self, msi_bytes=b"msi bytes \x02", sha=None):
+        """v1.7 ticket 12: the Windows entry write-version-file.sh adds, MSI beside it."""
+        msi = self.tmp / "BoringRemote-1.6.0-windows-x64-unsigned.msi"
+        msi.write_bytes(msi_bytes)
+        data = json.loads(self.vf.read_text())
+        data["windows"] = {"version": "1.6.0", "url": f"https://boringlabs.online/downloads/{msi.name}",
+                           "sha256": sha or hashlib.sha256(msi_bytes).hexdigest(), "sig": ""}
+        self.vf.write_text(json.dumps(data))
+        return msi
+
+    def test_windows_entry_gets_the_msi_signature(self):
+        msi = self.add_windows()
+        self.write_keys(b64(self.key.public_key().public_bytes(**RAW)), "")
+        sr.sign_release(self.tmp, lambda: b64(self.seed), self.keys)
+        data = json.loads(self.vf.read_text())
+        self.key.public_key().verify(base64.b64decode(data["windows"]["sig"]), msi.read_bytes())
+        sig = (self.tmp / "the-boring-remote-version.json.sig").read_text().strip()
+        self.key.public_key().verify(base64.b64decode(sig), self.vf.read_bytes())  # covers the Windows entry
+
+    def test_windows_msi_hash_mismatch_fails_and_writes_no_sig(self):
+        self.add_windows(sha="0" * 64)
+        self.write_keys(b64(self.key.public_key().public_bytes(**RAW)), "")
+        with self.assertRaises(sr.SignError):
+            sr.sign_release(self.tmp, lambda: b64(self.seed), self.keys)
+        self.assertFalse((self.tmp / "the-boring-remote-version.json.sig").exists())
+
+    def test_windows_msi_missing_fails(self):
+        self.add_windows().unlink()
+        self.write_keys(b64(self.key.public_key().public_bytes(**RAW)), "")
+        with self.assertRaises((sr.SignError, OSError)):
+            sr.sign_release(self.tmp, lambda: b64(self.seed), self.keys)
+        self.assertFalse((self.tmp / "the-boring-remote-version.json.sig").exists())
+
     def fake_cred(self, name):
         """A `cred` stub that knows only `name`, holding this test's seed."""
         cred = self.tmp / "cred"

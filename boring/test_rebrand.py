@@ -20,6 +20,10 @@ import check  # noqa: E402  (shares the installer-string reader with check.py)
 import rebrand  # noqa: E402
 
 REPO = HERE.parent
+WIN_UI = "v1.7 Home, Setup, Settings, toolbar and trust prompt open on Windows too (t12)"
+WIN_SETUP = "Windows Setup step 2 lets other computers reach this one, through the installer's rule (t12)"
+WIN_RULE = "installer's app rule lets other computers reach Direct Link 21118: any port, every network type (t12)"
+WIN_UPDATE = "Windows reads its own signed feed entry and installs the checked MSI (ADR 0007)"
 CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
 CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
 CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)"
@@ -192,7 +196,7 @@ class RebrandSeam(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn(f"FAIL {fact}", r.stdout)
 
-    UPDATE_FACT = "the only update endpoints are VERSION_URL, its .sig and fulfillment /update (ADR 0004)"
+    UPDATE_FACT = "the only update endpoints are VERSION_URL, its .sig, fulfillment /update and the Windows downloads (ADR 0004/0007)"
 
     def test_planted_rustdesk_update_url_fails_check(self):
         self.rebrand()
@@ -360,10 +364,41 @@ class RebrandSeam(unittest.TestCase):
     # --- v1.7 t06: three-screen Setup ----------------------------------------------
     def test_setup_unwired_fails_check(self):
         self.rebrand()
-        self.edit(rebrand.HOME, "if (isMacOS && _boringSetup) {", "if (false) {")
+        self.edit(rebrand.HOME, "if ((isMacOS || isWindows) && _boringSetup) {", "if (false) {")
         r = run(CHECK, self.root)
         self.assertIn("FAIL Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)",
                       r.stdout)
+
+    # --- v1.7 t12: Windows gets the v1.7 UI ------------------------------------------
+    def test_windows_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (WIN_UI, WIN_SETUP, WIN_RULE, WIN_UPDATE):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_a_v17_screen_back_to_mac_only_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.T07_TOOLBAR, "    if (isMacOS || isWindows) {\n", "    if (isMacOS) {\n")
+        r = run(CHECK, self.root)
+        self.assertIn(f"FAIL {WIN_UI}", r.stdout)
+
+    def test_windows_setup_without_the_reach_step_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "isWindows ? SetupPlatform.windows : SetupPlatform.mac", "SetupPlatform.mac")
+        r = run(CHECK, self.root)
+        self.assertIn(f"FAIL {WIN_SETUP}", r.stdout)
+
+    def test_installer_rule_limited_to_one_port_fails_check(self):
+        self.rebrand()
+        self.edit("res/msi/CustomActions/FirewallRules.cpp", "//hr = pNetFwRule->put_Protocol(6);", "hr = pNetFwRule->put_Protocol(6);")
+        r = run(CHECK, self.root)
+        self.assertIn(f"FAIL {WIN_RULE}", r.stdout)
+
+    def test_windows_update_check_unwired_fails_check(self):
+        self.rebrand()
+        self.edit("src/update_install_run.rs", "crate::platform::update_to(p)", "Ok::<(), String>(())")
+        r = run(CHECK, self.root)
+        self.assertIn(f"FAIL {WIN_UPDATE}", r.stdout)
 
     # --- v1.7 t05: High Efficiency on a Local link between two Boring Remotes ----
     def test_high_efficiency_unwired_fails_check(self):

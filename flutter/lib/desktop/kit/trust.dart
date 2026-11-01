@@ -127,14 +127,14 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
       children: [
         Text('Trusted Controllers', style: t.headlineSmall),
         const SizedBox(height: Kit.s2),
-        Text('These Macs get into this one without asking. Remove one and it has to ask again.',
+        Text('These ${KitWords.many} get into this one without asking. Remove one and it has to ask again.',
             style: t.bodySmall),
         const SizedBox(height: Kit.s4),
-        if (_trusted.isEmpty) const Text('None yet. A Mac lands here once you allow it in.'),
+        if (_trusted.isEmpty) Text('None yet. A ${KitWords.one} lands here once you allow it in.'),
         for (final c in _trusted)
           ListTile(
             contentPadding: EdgeInsets.zero,
-            title: Text(c.name.isNotEmpty ? c.name : 'A Mac with no name'),
+            title: Text(c.name.isNotEmpty ? c.name : 'A ${KitWords.one} with no name'),
             trailing: TextButton(
               onPressed: () async {
                 await widget.onRemove(c.key);
@@ -144,7 +144,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
             ),
           ),
         const SizedBox(height: Kit.s6),
-        Text('Macs this one has connected to', style: t.bodySmall),
+        Text('${KitWords.cap(KitWords.many)} this one has connected to', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(
             "If one was reinstalled, it won't connect until you forget its key here. "
@@ -161,7 +161,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
                 await widget.onForget(m.id);
                 if (mounted) setState(() => _known.remove(m));
               },
-              child: const Text("Forget this Mac's key"),
+              child: Text("Forget this ${KitWords.one}'s key"),
             ),
           ),
       ],
@@ -180,14 +180,14 @@ class ApprovalPrompt extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
-    final who = name.trim().isNotEmpty ? name.trim() : 'A Mac on this network';
+    final who = name.trim().isNotEmpty ? name.trim() : 'A ${KitWords.one} on this network';
     return Padding(
       padding: const EdgeInsets.all(Kit.s4),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text('$who wants to control this Mac.', style: t.titleMedium),
+          Text('$who wants to control this ${KitWords.one}.', style: t.titleMedium),
           const SizedBox(height: Kit.s2),
           Text("If you allow it, it can get in next time without asking. You can remove it in Settings.",
               style: t.bodySmall),

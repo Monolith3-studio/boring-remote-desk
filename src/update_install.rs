@@ -75,6 +75,10 @@ pub struct Deps<'a> {
 }
 
 pub fn package_path(temp_dir: &Path, version: &str) -> PathBuf {
+    // v1.7 ticket 12: Windows installs the MSI from the version file's Windows entry.
+    #[cfg(target_os = "windows")]
+    return temp_dir.join(format!("BoringRemote-{version}-windows-x64.msi"));
+    #[cfg(not(target_os = "windows"))]
     temp_dir.join(format!("BoringRemote-{version}-macos-arm64.app.tar.xz"))
 }
 

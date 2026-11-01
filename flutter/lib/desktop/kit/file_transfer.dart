@@ -128,7 +128,7 @@ class TransferPane extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.fromLTRB(Kit.s5, Kit.s4, Kit.s5, 0),
               child: Text(
-                side == TransferSide.thisMac ? 'This Mac' : 'That Mac',
+                side == TransferSide.thisMac ? 'This ${KitWords.one}' : 'That ${KitWords.one}',
                 style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     color: Kit.paper, fontWeight: FontWeight.w700),
               ),
@@ -197,12 +197,12 @@ class TransferList extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final body = jobs.isEmpty
-        ? const Center(
+        ? Center(
             child: Padding(
-              padding: EdgeInsets.all(Kit.s5),
-              child: Text('Drag files from one Mac to the other.',
+              padding: const EdgeInsets.all(Kit.s5),
+              child: Text('Drag files from one ${KitWords.one} to the other.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: Kit.muted, fontSize: 15)),
+                  style: const TextStyle(color: Kit.muted, fontSize: 15)),
             ),
           )
         : ListView.separated(

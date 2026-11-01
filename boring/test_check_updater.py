@@ -24,6 +24,8 @@ GOOD = {
     "src/license_key.rs":
         'pub const UPDATE_ENDPOINT: &str = "https://boring-store-fulfillment.restless-term-7ead.workers.dev/update";\n',
     "src/update_install_run.rs": OSA,
+    "libs/base/src/update_feed.rs":
+        'pub const WINDOWS_DOWNLOADS: &str = "https://boringlabs.online/downloads/";\n',
     "src/platform/privileges_scripts/install-update.sh": "#!/bin/sh\n# run with administrator privileges\n",
     "src/platform/privileges_scripts/install.scpt": 'do shell script sh with administrator privileges\n',
     "src/platform/macos.rs": 'pub fn elevate() { let s = "with administrator privileges"; }\n',
@@ -73,6 +75,11 @@ class UpdaterGuard(unittest.TestCase):
     def test_moved_update_endpoint_fails(self):
         self.assert_fails("FAIL", **{"src/license_key.rs":
                                      'pub const UPDATE_ENDPOINT: &str = "https://evil.example/update";\n'})
+
+    def test_moved_windows_downloads_fails(self):
+        """v1.7 ticket 12: Windows installs only MSIs from our downloads folder."""
+        self.assert_fails("WINDOWS_DOWNLOADS", **{"libs/base/src/update_feed.rs":
+                                                  'pub const WINDOWS_DOWNLOADS: &str = "https://evil.example/downloads/";\n'})
 
     def test_other_admin_caller_fails(self):
         self.assert_fails("src/foo.rs", **{"src/foo.rs":

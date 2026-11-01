@@ -158,12 +158,12 @@ class _SimpleSettingsState extends State<SimpleSettings> {
       children: [
         Text('Settings', style: t.headlineSmall),
         const SizedBox(height: Kit.s5),
-        Text("This Mac's name", style: t.bodySmall),
+        Text("This ${KitWords.one}'s name", style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         TextField(
           key: SimpleSettings.nameKey,
           controller: _name,
-          decoration: const InputDecoration(hintText: 'The name other Macs see'),
+          decoration: InputDecoration(hintText: 'The name other ${KitWords.many} see'),
           onSubmitted: _rename,
         ),
         const SizedBox(height: Kit.s6),
