@@ -853,6 +853,84 @@ def rust_hook_checks(c):
            not missing, "; ".join(missing))
 
 
+T07_KIT = "flutter/lib/desktop/kit/session_toolbar.dart"
+SIMPLE_SETTINGS_KIT = "flutter/lib/desktop/kit/simple_settings.dart"
+
+
+def tailnet_dart():
+    """kit/tailscale.dart's tests for rebrand.TAILNET's two ranges, derived from the CIDRs."""
+    import ipaddress
+    v4, v6 = (ipaddress.ip_network(n) for n in rebrand.TAILNET.split(","))
+    o = v4.network_address.packed
+    mask = (0xFF << (16 - v4.prefixlen)) & 0xFF
+    b6 = v6.network_address.packed[:v6.prefixlen // 8]
+    return (f"b[0] == {o[0]} && (b[1] & 0x{mask:x}) == {o[1]}",
+            " && ".join(f"b[{i}] == 0x{x:02x}" for i, x in enumerate(b6)))
+
+
+def home_checks(c):
+    """v1.7 review: Home, Settings and copy. Outside the building is Tailscale (ADR 0004): Home's
+    sheet gives this computer's Tailscale address, never the numeric ID."""
+    home = fn_body(c.read(rebrand.HOME), "  Widget buildBoringHome(BuildContext context) {") or ""
+    kit = c.read("flutter/lib/desktop/kit/tailscale.dart")
+    why = []
+    if "MacHome(" not in home or "tailscaleAddress: thisTailscaleAddress," not in home:
+        why.append("buildBoringHome does not hand MacHome this computer's Tailscale address")
+    why += [f"buildBoringHome still reads the ID ({n})" for n in ("serverId", "myId") if n in home]
+    why += [f"tailscale.dart range is not rebrand.TAILNET: {e}" for e in tailnet_dart() if e not in kit]
+    c.fact("Home's outside-the-building sheet gives this computer's Tailscale address, never the ID (ADR 0004)",
+           not why, "; ".join(why))
+
+    # Ticket 05 follow-up: the Quality pick names High Efficiency while it is on, and a hand pick
+    # drops the Link Badge back to plain Local.
+    bar = fn_body(c.read(rebrand.T07_TOOLBAR), "  Widget buildBoringSessionToolbar(BuildContext context, List<Widget> more) {") or ""
+    st = re.search(r'pub const STREAM_TYPE: &str = "([^"]+)";', c.read("libs/base/src/high_efficiency.rs"))
+    pick = "await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: v);\n" \
+           "            // v1.7 review: a hand pick replaces High Efficiency, so the badge goes back to Local.\n" \
+           "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));"
+    why = [] if pick in bar else ["toolbar's quality pick does not drop High Efficiency"]
+    if not st or f"streamType == '{st.group(1)}' ? 'Local' : streamType;" not in c.read(T07_KIT):
+        why.append("session_toolbar.dart does not map Rust's High Efficiency stream type back to Local")
+    c.fact("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)",
+           not why, "; ".join(why))
+
+    # Ticket 15, app side: Settings links to the download page and says how to set up another computer.
+    settings = fn_body(c.read(rebrand.SETTINGS), "  Widget buildBoringSettings(BuildContext context) {") or ""
+    kit = c.read(SIMPLE_SETTINGS_KIT)
+    why = [] if "SimpleSettings(" in settings and "openUrl: (u) => launchUrlString(u)," in settings \
+        else ["Settings does not hand SimpleSettings a way to open the download page"]
+    why += [f"simple_settings.dart lost {n}" for n in (
+        "const kDownloadUrl = 'https://theboringremote.com/download';",
+        "onPressed: () => widget.openUrl!(kDownloadUrl)",
+        "Clipboard.setData(const ClipboardData(text: kDownloadUrl))") if n not in kit]
+    c.fact("Settings: Download Boring Remote and set up another computer (ticket 15)", not why, "; ".join(why))
+
+    # Ticket 08 follow-up: the kit job list shows delete jobs as well as transfers.
+    fm = c.read(rebrand.FILE_MGR)
+    i = fm.find("  Widget boringTransferList() => Obx(() => TransferList(")
+    jobs = fm[i:fm.find("      ));\n", i)] if i >= 0 else ""
+    need = ("            if (j.type != JobType.none)\n", "                  delete: j.type != JobType.transfer),")
+    c.fact("File Transfer lists delete jobs too (v1.7 t08 follow-up)", all(n in jobs for n in need),
+           "boringTransferList drops delete jobs")
+
+    # Ticket 12 follow-ups: Windows Setup names the computer by its Windows name (scutil is Mac only),
+    # and the reach check counts the installer's rule only when it is for this exe.
+    page = fn_body(c.read(rebrand.HOME), "Widget boringSetupPage({required VoidCallback onDone}) {") or ""
+    named = "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n" \
+            "                ? Future.value(windowsComputerName(Platform.environment, Platform.localHostname))\n" \
+            "            : Process.run('scutil', ['--get', 'ComputerName'])"
+    c.fact("Windows Setup starts from the Windows computer name, never scutil (v1.7 t12 follow-up)", named in page,
+           "boringSetupPage does not branch to windowsComputerName before scutil")
+    kit = c.read(SETUP_DART)
+    why = [] if "Process.run('netsh', windowsRuleShowArgs())\n" \
+                 "            .then((r) => r.exitCode == 0 && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable))" \
+        in page else ["canBeReached does not check the rule's program is this exe"]
+    if "'dir=in', 'verbose']" not in kit:
+        why.append("windowsRuleShowArgs does not ask netsh for the program path (verbose)")
+    c.fact("Windows reach check counts the installer's rule only for this exe (v1.7 t12 follow-up)",
+           not why, "; ".join(why))
+
+
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
     plist = c.read("flutter/macos/Runner/Info.plist")
@@ -1057,6 +1135,7 @@ def run_checks(root):
     windows_checks(c)  # v1.7 t12
     high_efficiency_checks(c)  # v1.7 t05
     rust_hook_checks(c)  # v1.7 t02-t05
+    home_checks(c)  # v1.7 review: Home, Settings, copy
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")

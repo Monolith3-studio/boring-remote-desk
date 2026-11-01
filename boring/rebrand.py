@@ -815,12 +815,12 @@ PATCHES += [
 # --- Mac Home (v1.7 ticket 01) ----------------------------------------------------
 # The kit (desktop/kit/kit.dart) and Mac Home (desktop/kit/mac_home.dart) are ours and
 # bridge-free; these wire them to bind. Mac only: other platforms keep the old home for now.
-# The numeric ID shows only in Mac Home's "Connect from outside the building" sheet.
+# No numeric ID on Home: "Connect from outside the building" gives this computer's Tailscale
+# address (ADR 0004; desktop/kit/tailscale.dart reads it from the network interfaces).
 MAC_HOME_METHOD = (
-    "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n"
+    "  // boring-remote: v1.7 Mac Home. Recents by name; outside the building is Tailscale (ADR 0004), never the ID.\n"
     "  Widget buildBoringHome(BuildContext context) {\n"
     "    final recents = gFFI.recentPeersModel;\n"
-    "    final id = gFFI.serverModel.serverId;\n"
     "    String name(Peer p) => p.alias.isNotEmpty\n"
     "        ? p.alias\n"
     "        : (p.hostname.isNotEmpty ? p.hostname : 'Unnamed Mac');\n"
@@ -829,10 +829,10 @@ MAC_HOME_METHOD = (
     "      child: Material(\n"
     "        color: Kit.ink,\n"
     "        child: ListenableBuilder(\n"
-    "          listenable: Listenable.merge([recents, id, lanMacs]),\n"
+    "          listenable: Listenable.merge([recents, lanMacs]),\n"
     "          builder: (context, _) => MacHome(\n"
     "            macs: [for (final p in recents.peers) MacEntry(name: name(p), target: p.id)],\n"
-    "            myId: id.text,\n"
+    "            tailscaleAddress: thisTailscaleAddress,\n"
     "            lan: lanMacs.macs,\n"
     "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
@@ -850,6 +850,7 @@ PATCHES += [
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/lan_macs_model.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/tailscale.dart';\n"
      "import 'package:flutter_hbb/models/peer_model.dart';\n",
      "Mac Home imports"),
     (HOME, "    super.build(context);\n",
@@ -880,7 +881,7 @@ FILE_MGR_METHODS = (
     "  Widget boringTransferList() => Obx(() => TransferList(\n"
     "        jobs: [\n"
     "          for (final j in jobController.jobTable)\n"
-    "            if (j.type == JobType.transfer)\n"
+    "            if (j.type != JobType.none)\n"
     "              TransferJob.fromEngine(\n"
     "                  id: j.id,\n"
     "                  path: j.jobName,\n"
@@ -888,7 +889,8 @@ FILE_MGR_METHODS = (
     "                  state: j.state.name,\n"
     "                  finished: j.finishedSize,\n"
     "                  total: j.totalSize,\n"
-    "                  err: j.err),\n"
+    "                  err: j.err,\n"
+    "                  delete: j.type != JobType.transfer), // deletes are listed too (v1.7 review)\n"
     "        ],\n"
     "        onCancel: (id) {\n"
     "          jobController.jobTable.removeWhere((j) => j.id == id);\n"
@@ -1011,6 +1013,8 @@ T07_METHOD = (
     "          },\n"
     "          onQuality: (v) async {\n"
     "            await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: v);\n"
+    "            // v1.7 review: a hand pick replaces High Efficiency, so the badge goes back to Local.\n"
+    "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));\n"
     "            if (mounted) setState(() {});\n"
     "          },\n"
     "          onDisconnect: () async {\n"
@@ -1205,6 +1209,7 @@ SIMPLE_SETTINGS_METHOD = (
     "            await mainSetLocalBoolOption(kBoringUpdateCheckOption, on);\n"
     "            setState(() {});\n"
     "          },\n"
+    "          openUrl: (u) => launchUrlString(u), // Download Boring Remote (ticket 15)\n"
     "          advanced: [\n"
     "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
     "            SettingsLink(\n"
@@ -1301,7 +1306,7 @@ PATCHES += [
 
 # --- LAN trust (v1.7 ticket 04, ADRs 0002, 0005) -----------------------------------
 # libs/base/src/trust.rs holds the token exchange; desktop/kit/trust.dart is ours and bridge-free.
-# These wire the kit in: Trusted Controllers (and "Forget this Mac's key" for t03's pinned keys)
+# These wire the kit in: Trusted Controllers (and "Forget" for t03's pinned keys)
 # under Settings → Advanced, and the plain-words approval prompt in the connection window.
 T04_HOOK = "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
 T04_SETTINGS_LINK = (
@@ -1385,6 +1390,8 @@ T06_SETUP_PAGE = (
     "        platform: SetupPlatform.mac,\n"
     "        computerName: name.isNotEmpty\n"
     "            ? Future.value(name)\n"
+    "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n"
+    "                ? Future.value(windowsComputerName(Platform.environment, Platform.localHostname))\n"
     "            : Process.run('scutil', ['--get', 'ComputerName'])\n"
     "                .then((r) => r.exitCode == 0 ? '${r.stdout}'.trim() : '')\n"
     "                .catchError((_) => '')\n"
@@ -1438,9 +1445,9 @@ PATCHES += [
     (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
      T06_SETUP_PAGE + "class _DesktopHomePageState extends State<DesktopHomePage>\n",
      "Setup wiring"),
-    (HOME, "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n",
+    (HOME, "  // boring-remote: v1.7 Mac Home. Recents by name; outside the building is Tailscale (ADR 0004), never the ID.\n",
      "  bool _boringSetup = false; // v1.7 t06: first launch shows Setup until it is finished\n\n"
-     "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n",
+     "  // boring-remote: v1.7 Mac Home. Recents by name; outside the building is Tailscale (ADR 0004), never the ID.\n",
      "Setup state"),
     (HOME, "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",
      "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n"
@@ -1475,9 +1482,9 @@ T12_EDITS = [(g, g.replace("if (isMacOS)", "if (isMacOS || isWindows)", 1)
     ("        platform: SetupPlatform.mac,\n", "        platform: platform,\n"),
     ("        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n",
      "        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n"
-     "        // v1.7 t12 (Windows): the installer's app rule is there; Allow adds it (Windows asks once).\n"
+     "        // v1.7 t12 (Windows): the installer's app rule is there for this exe; Allow adds it (Windows asks once).\n"
      "        canBeReached: () => Process.run('netsh', windowsRuleShowArgs())\n"
-     "            .then((r) => r.exitCode == 0)\n"
+     "            .then((r) => r.exitCode == 0 && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable))\n"
      "            .catchError((_) => false),\n"
      "        allowReach: () => Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))\n"
      "            .then<void>((_) {})\n"

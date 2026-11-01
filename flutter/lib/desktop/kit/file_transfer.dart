@@ -18,6 +18,7 @@ class TransferJob {
     required this.finished,
     required this.total,
     this.error = '',
+    this.delete = false,
   });
 
   final int id;
@@ -27,6 +28,10 @@ class TransferJob {
   final int finished;
   final int total;
   final String error;
+
+  /// A delete (the engine's deleteFile / deleteDir job), not a transfer. For a delete,
+  /// [toThisMac] means the file was on that Mac (the engine's isRemote).
+  final bool delete;
 
   /// [state] is the engine's JobState name (none, inProgress, done, error, paused);
   /// [err] its error text, where 'cancel' and 'skipped' are not real errors.
@@ -38,6 +43,7 @@ class TransferJob {
     required int finished,
     required int total,
     String err = '',
+    bool delete = false,
   }) {
     final TransferPhase phase;
     var error = '';
@@ -65,12 +71,14 @@ class TransferJob {
       finished: finished,
       total: total,
       error: error,
+      delete: delete,
     );
   }
 
   double get fraction => total > 0 ? (finished / total).clamp(0.0, 1.0) : 0;
 
   String get status {
+    if (delete) return _deleteStatus;
     switch (phase) {
       case TransferPhase.waiting:
         return 'Waiting';
@@ -81,7 +89,19 @@ class TransferJob {
       case TransferPhase.done:
         return 'Done';
       case TransferPhase.failed:
-        return error == 'cancel' ? 'Cancelled' : "Didn't send: $error";
+        return error == 'cancel' ? 'Cancelled' : "Didn't send: $error. Drag it across to try again.";
+    }
+  }
+
+  String get _deleteStatus {
+    final where = toThisMac ? 'that ${KitWords.one}' : 'this ${KitWords.one}';
+    switch (phase) {
+      case TransferPhase.done:
+        return 'Deleted from $where';
+      case TransferPhase.failed:
+        return error == 'cancel' ? 'Cancelled' : "Didn't delete: $error";
+      default:
+        return 'Deleting from $where…';
     }
   }
 }
@@ -237,7 +257,7 @@ class TransferList extends StatelessWidget {
     final icon = switch (j.phase) {
       TransferPhase.done => Icons.check_circle_outline,
       TransferPhase.failed => Icons.error_outline,
-      _ => j.toThisMac ? Icons.arrow_back : Icons.arrow_forward,
+      _ => j.delete ? Icons.delete_outline : (j.toThisMac ? Icons.arrow_back : Icons.arrow_forward),
     };
     final active = j.phase == TransferPhase.sending || j.phase == TransferPhase.waiting;
     Widget action(String tip, IconData i, void Function(int) f) => IconButton(

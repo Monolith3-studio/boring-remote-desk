@@ -101,6 +101,31 @@ void main() {
     expect(got, ['low']);
   });
 
+  testWidgets('while High Efficiency is on, Quality says so, not Auto; a hand pick still reports',
+      (tester) async {
+    wide(tester);
+    final got = <String>[];
+    await tester.pumpWidget(host(bar(link: LinkState.localHighEfficiency, onQuality: got.add)));
+    expect(find.text('Quality: High Efficiency'), findsOneWidget);
+    expect(find.text('Quality: Auto'), findsNothing);
+    await tester.tap(find.text('Quality: High Efficiency'));
+    await tester.pumpAndSettle();
+    final on = tester.widget<CheckedPopupMenuItem<String>>(
+        find.widgetWithText(CheckedPopupMenuItem<String>, 'High Efficiency'));
+    expect(on.checked, isTrue);
+    await tester.tap(find.text('Fastest'));
+    await tester.pumpAndSettle();
+    expect(got, ['low']);
+  });
+
+  test('picking a quality by hand drops the link back to plain Local', () {
+    expect(streamTypeAfterQualityPick('LocalHighEfficiency'), 'Local');
+    expect(linkStateFor(streamTypeAfterQualityPick('LocalHighEfficiency')), LinkState.local);
+    for (final other in ['Local', 'Tailscale', '']) {
+      expect(streamTypeAfterQualityPick(other), other, reason: other);
+    }
+  });
+
   testWidgets('rare actions stay behind More until it is pressed', (tester) async {
     wide(tester);
     await tester.pumpWidget(host(bar(more: const [Text('Lock screen')])));

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'kit.dart';
 import 'lan_macs.dart';
@@ -26,7 +27,10 @@ class MacHome extends StatefulWidget {
 
   /// Starts a LAN Discovery cycle; called on open and every [discoverEvery].
   final VoidCallback? discover;
-  final String myId;
+
+  /// This computer's Tailscale address for the outside-the-building sheet (ADR 0004), null when
+  /// Tailscale isn't up here. The page passes tailscale.dart's [thisTailscaleAddress].
+  final Future<String?> Function() tailscaleAddress;
   final void Function(String target) onConnect;
 
   /// Page-level notices (the update banner), shown above the Address box.
@@ -35,7 +39,7 @@ class MacHome extends StatefulWidget {
   const MacHome({
     super.key,
     required this.macs,
-    required this.myId,
+    required this.tailscaleAddress,
     required this.onConnect,
     this.notices = const [],
     this.lan = const [],
@@ -67,12 +71,15 @@ class _MacHomeState extends State<MacHome> {
     super.dispose();
   }
 
-  /// Return connects to the one Mac whose name matches exactly, else to whatever was typed (an IP).
+  /// Return connects to the Mac whose name matches (any case): one on this network first (its IP),
+  /// then a recent one, else to whatever was typed (an IP).
   void _submit(String text) {
     final q = text.trim();
     if (q.isEmpty) return;
-    final hit = widget.macs.where((m) => m.name.toLowerCase() == q.toLowerCase());
-    widget.onConnect(hit.isEmpty ? q : hit.first.target);
+    final low = q.toLowerCase();
+    final here = widget.lan.where((m) => m.name.toLowerCase() == low);
+    final recent = widget.macs.where((m) => m.name.toLowerCase() == low);
+    widget.onConnect(here.isNotEmpty ? here.first.ip : (recent.isNotEmpty ? recent.first.target : q));
   }
 
   @override
@@ -94,7 +101,7 @@ class _MacHomeState extends State<MacHome> {
             controller: _address,
             autofocus: true,
             decoration: InputDecoration(
-              hintText: '${KitWords.cap(KitWords.one)} name or IP address',
+              hintText: "Type a ${KitWords.one}'s name",
               prefixIcon: const Icon(Icons.search, color: Kit.muted),
             ),
             onChanged: (_) => setState(() {}),
@@ -126,9 +133,15 @@ class _MacHomeState extends State<MacHome> {
                       onTap: () => widget.onConnect(m.ip),
                     ),
                 ],
-                if (widget.macs.isEmpty && widget.lan.isEmpty)
-                  Text('No ${KitWords.many} yet. Type a ${KitWords.one} name or IP above.',
+                if (widget.macs.isEmpty && widget.lan.isEmpty) ...[
+                  Text(
+                      'No other ${KitWords.many} found yet. Open Boring Remote on the other ${KitWords.one}. '
+                      "You'll see it here once both are on the same network."),
+                  const SizedBox(height: Kit.s2),
+                  Text('Or type its address above, like 192.168.1.20.',
                       style: Theme.of(context).textTheme.bodySmall),
+                ],
+                if (shown.isNotEmpty) Text('Used before', style: Theme.of(context).textTheme.bodySmall),
                 for (final m in shown)
                   ListTile(
                     leading: const Icon(Icons.desktop_mac_outlined),
@@ -147,7 +160,8 @@ class _MacHomeState extends State<MacHome> {
               label: const Text('Connect from outside the building'),
               onPressed: () => showModalBottomSheet<void>(
                 context: context,
-                builder: (_) => OutsideBuildingSheet(id: widget.myId),
+                isScrollControlled: true,
+                builder: (_) => OutsideBuildingSheet(tailscaleAddress: widget.tailscaleAddress),
               ),
             ),
           ),
@@ -157,27 +171,78 @@ class _MacHomeState extends State<MacHome> {
   }
 }
 
-/// The only place the numeric ID shows: for a Controller that isn't on this network.
-class OutsideBuildingSheet extends StatelessWidget {
-  final String id;
-  const OutsideBuildingSheet({super.key, required this.id});
+/// For a computer that isn't on this network: the way in is Tailscale (ADR 0004), so the thing to
+/// type over there is this computer's Tailscale address. No Tailscale here: how to get it.
+class OutsideBuildingSheet extends StatefulWidget {
+  final Future<String?> Function() tailscaleAddress;
+  const OutsideBuildingSheet({super.key, required this.tailscaleAddress});
+
+  @override
+  State<OutsideBuildingSheet> createState() => _OutsideBuildingSheetState();
+}
+
+class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
+  late Future<String?> _address = widget.tailscaleAddress();
+  bool _copied = false;
 
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
-    return Padding(
+    final one = KitWords.one, many = KitWords.many;
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(Kit.s6),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('Connect from outside the building', style: t.titleLarge),
-          const SizedBox(height: Kit.s2),
-          Text('On another network? Give them this ID. On the same network, they just pick this ${KitWords.one} by name.',
-              style: t.bodySmall),
-          const SizedBox(height: Kit.s5),
-          SelectableText(id, style: t.headlineSmall),
-        ],
+      child: FutureBuilder<String?>(
+        future: _address,
+        builder: (context, snap) {
+          final address = snap.data;
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Connect from outside the building', style: t.titleLarge),
+              const SizedBox(height: Kit.s4),
+              if (snap.connectionState != ConnectionState.done)
+                Text('Checking…', style: t.bodySmall)
+              else if (address != null) ...[
+                Text('From another network, type this on the other $one:'),
+                const SizedBox(height: Kit.s3),
+                Row(children: [
+                  Flexible(child: SelectableText(address, style: t.headlineSmall)),
+                  const SizedBox(width: Kit.s4),
+                  OutlinedButton(
+                    onPressed: () async {
+                      await Clipboard.setData(ClipboardData(text: address));
+                      if (mounted) setState(() => _copied = true);
+                    },
+                    child: Text(_copied ? 'Copied' : 'Copy'),
+                  ),
+                ]),
+                const SizedBox(height: Kit.s3),
+                Text('It works while Tailscale is open on both $many. '
+                    'Tailscale is a free app that links your computers over the internet.',
+                    style: t.bodySmall),
+              ] else ...[
+                Text('To reach this $one from another network, both $many need Tailscale. '
+                    'Tailscale is a free app that links your computers over the internet.'),
+                const SizedBox(height: Kit.s3),
+                Text('1. Get Tailscale from tailscale.com. Install it on this $one and on the other one.'),
+                const SizedBox(height: Kit.s2),
+                Text('2. Open Tailscale on both and sign in with the same account.'),
+                const SizedBox(height: Kit.s2),
+                Text("3. Click Check again. You'll see what to type on the other $one."),
+                const SizedBox(height: Kit.s3),
+                OutlinedButton(
+                  onPressed: () => setState(() {
+                    _address = widget.tailscaleAddress();
+                  }),
+                  child: const Text('Check again'),
+                ),
+              ],
+              const SizedBox(height: Kit.s5),
+              Text('On the same network? Just pick this $one by name.', style: t.bodySmall),
+            ],
+          );
+        },
       ),
     );
   }

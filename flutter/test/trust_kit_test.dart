@@ -22,7 +22,7 @@ void main() {
 
   test("forgets a Mac's pinned key by Target ID", () {
     final known = parseKnown(knownJson);
-    expect(known.map((m) => m.address), ['192.168.1.20', '']);
+    expect(known.map((m) => m.address), ['192.168.1.20', '100.64.0.2']); // no LAN address: its Tailscale one
     expect(parseKnown(forgetId(knownJson, '123456789')).map((m) => m.id), ['987654321']);
     expect(forgetId('{"123456789":"00abc"}', '123456789'), '{}');
   });
@@ -53,11 +53,25 @@ void main() {
     )));
     expect(find.text('None yet. A Mac lands here once you allow it in.'), findsOneWidget);
     expect(find.text('192.168.1.20'), findsOneWidget);
-    expect(find.text('987654321'), findsOneWidget); // no LAN address: show its ID
-    await tester.tap(find.text("Forget this Mac's key").first);
+    expect(find.text('100.64.0.2'), findsOneWidget);
+    expect(find.textContaining('987654321'), findsNothing); // never the ID
+    expect(find.text("If one of these was reinstalled, it won't connect. Click Forget next to it, "
+        'then connect to it again.'), findsOneWidget);
+    await tester.tap(find.text('Forget').first);
     await tester.pumpAndSettle();
     expect(forgot, ['123456789']);
     expect(find.text('192.168.1.20'), findsNothing);
+  });
+
+  testWidgets('a Mac with no address left is named in plain words, never by its ID', (tester) async {
+    await tester.pumpWidget(host(TrustedControllersPage(
+      trusted: const [],
+      known: const [KnownMac(id: '555666777', address: '')],
+      onRemove: (_) async {},
+      onForget: (_) async {},
+    )));
+    expect(find.text('A Mac you connected to'), findsOneWidget);
+    expect(find.textContaining('555666777'), findsNothing);
   });
 
   testWidgets('approval prompt says who is asking, Allow or Don\'t allow', (tester) async {

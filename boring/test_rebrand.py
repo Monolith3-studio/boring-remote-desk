@@ -564,6 +564,47 @@ class RebrandSeam(unittest.TestCase):
             self.assertNotIn(b"\r", (self.root / rel).read_bytes(), rel)
         self.assertIn("rebrand: 0 changed, 0 moved", self.rebrand().stdout)
 
+    # --- v1.7 review: Home, Settings, copy -------------------------------------------
+    HOME_OUTSIDE = "Home's outside-the-building sheet gives this computer's Tailscale address, never the ID (ADR 0004)"
+
+    def test_numeric_id_back_in_the_outside_sheet_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "tailscaleAddress: thisTailscaleAddress,",
+                  "tailscaleAddress: () async => gFFI.serverModel.serverId.text,")
+        self.assert_check_fails(self.HOME_OUTSIDE)
+
+    def test_tailscale_range_drifting_from_the_tailnet_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/tailscale.dart", "(b[1] & 0xc0) == 64", "(b[1] & 0x80) == 0")
+        self.assert_check_fails(self.HOME_OUTSIDE)
+
+    def test_quality_pick_keeping_high_efficiency_fails_check(self):  # v1.7 t05 follow-up
+        self.rebrand()
+        self.edit(rebrand.T07_TOOLBAR,
+                  "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));\n", "")
+        self.assert_check_fails("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)")
+
+    def test_settings_without_the_download_link_fails_check(self):  # ticket 15, app side
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "          openUrl: (u) => launchUrlString(u), // Download Boring Remote (ticket 15)\n", "")
+        self.assert_check_fails("Settings: Download Boring Remote and set up another computer (ticket 15)")
+
+    def test_transfer_list_dropping_deletes_again_fails_check(self):  # v1.7 t08 follow-up
+        self.rebrand()
+        self.edit(rebrand.FILE_MGR, "            if (j.type != JobType.none)\n", "            if (j.type == JobType.transfer)\n")
+        self.assert_check_fails("File Transfer lists delete jobs too (v1.7 t08 follow-up)")
+
+    def test_windows_setup_falling_back_to_scutil_fails_check(self):  # v1.7 t12 follow-up
+        self.rebrand()
+        self.edit(rebrand.HOME, "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n"
+                                "                ? Future.value(windowsComputerName(Platform.environment, Platform.localHostname))\n", "")
+        self.assert_check_fails("Windows Setup starts from the Windows computer name, never scutil (v1.7 t12 follow-up)")
+
+    def test_reach_check_by_rule_name_only_fails_check(self):  # v1.7 t12 follow-up
+        self.rebrand()
+        self.edit(rebrand.HOME, " && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable)", "")
+        self.assert_check_fails("Windows reach check counts the installer's rule only for this exe (v1.7 t12 follow-up)")
+
 
 if __name__ == "__main__":
     unittest.main()

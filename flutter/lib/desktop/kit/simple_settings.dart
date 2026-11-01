@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'kit.dart';
+
+/// Where a buyer gets Boring Remote for another computer (ticket 15).
+const kDownloadUrl = 'https://theboringremote.com/download';
 
 /// One row under Advanced: a label and where it goes.
 class SettingsLink {
@@ -40,6 +44,9 @@ class SimpleSettings extends StatefulWidget {
   /// Opens Setup again (v1.7 t06); null hides the button.
   final VoidCallback? onRunSetup;
 
+  /// Opens a web page (the download page); null hides the Download button.
+  final void Function(String url)? openUrl;
+
   const SimpleSettings({
     super.key,
     required this.macName,
@@ -52,6 +59,7 @@ class SimpleSettings extends StatefulWidget {
     required this.onCheckUpdates,
     this.advanced = const [],
     this.onRunSetup,
+    this.openUrl,
   });
 
   @override
@@ -64,6 +72,8 @@ class _SimpleSettingsState extends State<SimpleSettings> {
   bool _editingPassword = false;
   bool? _savedPassword; // set once a save here succeeds, until the page passes a new passwordSet
   String? _passwordError;
+  bool _confirmStop = false; // Start at login off: say what it stops before it does
+  bool _linkCopied = false;
 
   @override
   void didUpdateWidget(SimpleSettings old) {
@@ -103,11 +113,11 @@ class _SimpleSettingsState extends State<SimpleSettings> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Unattended Password', style: t.bodySmall),
+        Text('Password for when no one is here', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(isSet
-            ? 'Set. Trusted people can get in with no one here.'
-            : 'Not set. Someone has to approve each connection here.'),
+            ? 'Set. Your other ${KitWords.many} can get in with it when no one is here.'
+            : 'Not set. Someone has to be at this ${KitWords.one} to click Allow each time.'),
         const SizedBox(height: Kit.s2),
         if (!_editingPassword)
           OutlinedButton(
@@ -120,7 +130,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             controller: _password,
             obscureText: true,
             autofocus: true,
-            decoration: const InputDecoration(hintText: 'New Unattended Password'),
+            decoration: const InputDecoration(hintText: 'Type a new password'),
             onSubmitted: (_) => _savePassword(),
           ),
           if (_passwordError != null) ...[
@@ -141,6 +151,36 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             ),
           ]),
         ],
+      ],
+    );
+  }
+
+  /// Ticket 15: get Boring Remote onto the next computer in a couple of minutes.
+  Widget _anotherSection(TextTheme t) {
+    final one = KitWords.one;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Set up another $one', style: t.bodySmall),
+        const SizedBox(height: Kit.s2),
+        Text('1. On the other $one, open theboringremote.com/download and download Boring Remote.'),
+        const SizedBox(height: Kit.s1),
+        const Text('2. Open it and follow the three setup steps.'),
+        const SizedBox(height: Kit.s1),
+        Text("3. You'll see it by name on this $one's Home screen when both are on the same network."),
+        const SizedBox(height: Kit.s3),
+        Wrap(spacing: Kit.s2, runSpacing: Kit.s2, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          if (widget.openUrl != null)
+            OutlinedButton(onPressed: () => widget.openUrl!(kDownloadUrl), child: const Text('Download Boring Remote')),
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(const ClipboardData(text: kDownloadUrl));
+              if (mounted) setState(() => _linkCopied = true);
+            },
+            child: const Text('Copy the link'),
+          ),
+          if (_linkCopied) Text('Link copied.', style: t.bodySmall),
+        ]),
       ],
     );
   }
@@ -171,11 +211,32 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         const SizedBox(height: Kit.s5),
         SwitchListTile(
           title: const Text('Start at login'),
-          subtitle: Text('Reachable after a restart, before anyone opens the app.', style: t.bodySmall),
-          value: widget.startAtLogin,
-          onChanged: widget.onStartAtLogin,
+          subtitle: Text('Keeps this ${KitWords.one} open to your other ${KitWords.many}, even after a restart.',
+              style: t.bodySmall),
+          value: widget.startAtLogin && !_confirmStop,
+          onChanged: (on) => on ? widget.onStartAtLogin(true) : setState(() => _confirmStop = true),
           contentPadding: EdgeInsets.zero,
         ),
+        if (_confirmStop) ...[
+          // Off stops the service now, not just at the next login: there is no way to drop only the
+          // login item (v1.7 review), so the buyer reads exactly that before it happens.
+          Text("If you turn this off, your other ${KitWords.many} can't get into this one any more, starting now. "
+              'Turn it back on to let them in again. Your ${KitWords.one} may ask you to confirm, and Boring Remote '
+              'may close and open again.'),
+          const SizedBox(height: Kit.s2),
+          Row(children: [
+            OutlinedButton(
+              onPressed: () {
+                setState(() => _confirmStop = false);
+                widget.onStartAtLogin(false);
+              },
+              child: const Text('Turn off'),
+            ),
+            const SizedBox(width: Kit.s2),
+            TextButton(onPressed: () => setState(() => _confirmStop = false), child: const Text('Keep it on')),
+          ]),
+          const SizedBox(height: Kit.s3),
+        ],
         SwitchListTile(
           title: const Text('Check for updates'),
           value: widget.checkUpdates,
@@ -189,6 +250,8 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             child: OutlinedButton(onPressed: widget.onRunSetup, child: const Text('Run Setup again')),
           ),
         ],
+        const SizedBox(height: Kit.s6),
+        _anotherSection(t),
         if (widget.advanced.isNotEmpty) ...[
           const SizedBox(height: Kit.s5),
           Text('Advanced', style: t.bodySmall),

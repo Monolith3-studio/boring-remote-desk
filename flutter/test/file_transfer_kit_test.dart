@@ -4,7 +4,7 @@ import 'package:flutter_hbb/desktop/kit/kit.dart';
 import 'package:flutter_hbb/desktop/kit/file_transfer.dart';
 
 TransferJob job(String state,
-        {int finished = 0, int total = 1000, String err = '', bool remoteToLocal = false}) =>
+        {int finished = 0, int total = 1000, String err = '', bool remoteToLocal = false, bool delete = false}) =>
     TransferJob.fromEngine(
         id: 7,
         path: '/Users/j/Movies/cut.mov',
@@ -12,7 +12,8 @@ TransferJob job(String state,
         state: state,
         finished: finished,
         total: total,
-        err: err);
+        err: err,
+        delete: delete);
 
 void main() {
   group('TransferJob reads the engine job', () {
@@ -38,7 +39,7 @@ void main() {
     test('error carries the reason', () {
       final j = job('error', err: 'Permission denied');
       expect(j.phase, TransferPhase.failed);
-      expect(j.status, "Didn't send: Permission denied");
+      expect(j.status, "Didn't send: Permission denied. Drag it across to try again.");
     });
 
     test('cancelled shows as stopped, not as an error', () {
@@ -52,6 +53,16 @@ void main() {
       expect(job('none').status, 'Waiting');
       expect(job('paused').phase, TransferPhase.paused);
       expect(job('paused').status, 'Paused');
+    });
+
+    test('a delete job says what it deletes and where, in plain words', () {
+      // The engine marks a delete on the other side with remoteToLocal (its isRemote).
+      expect(job('none', delete: true, remoteToLocal: true).status, 'Deleting from that Mac…');
+      expect(job('none', delete: true).status, 'Deleting from this Mac…');
+      expect(job('done', delete: true, remoteToLocal: true).status, 'Deleted from that Mac');
+      expect(job('done', delete: true, remoteToLocal: true).phase, TransferPhase.done);
+      expect(job('error', delete: true, err: 'Access denied').status, "Didn't delete: Access denied");
+      expect(job('done', delete: true, err: 'cancel').status, 'Cancelled');
     });
 
     test('zero-size file never divides by zero', () {
@@ -168,8 +179,19 @@ void main() {
 
     testWidgets('error shows the reason', (tester) async {
       await tester.pumpWidget(list([job('error', err: 'Disk full')]));
-      expect(find.text("Didn't send: Disk full"), findsOneWidget);
+      expect(find.text("Didn't send: Disk full. Drag it across to try again."), findsOneWidget);
       expect(find.byType(LinearProgressIndicator), findsNothing);
+    });
+
+    testWidgets('delete jobs are listed too, with a bin, and can be stopped', (tester) async {
+      final got = <int>[];
+      await tester.pumpWidget(list([job('none', delete: true, remoteToLocal: true)], onCancel: got.add));
+      expect(find.text('cut.mov'), findsOneWidget);
+      expect(find.text('Deleting from that Mac…'), findsOneWidget);
+      expect(find.byIcon(Icons.delete_outline), findsOneWidget);
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+      await tester.tap(find.byTooltip('Stop'));
+      expect(got, [7]);
     });
 
     testWidgets('paused offers Resume', (tester) async {
