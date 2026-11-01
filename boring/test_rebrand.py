@@ -223,6 +223,34 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", "        let addr = hbb_common::try_into_v4(addr);\n", "")
         self.assert_check_fails("whitelist is enforced on incoming connections")
 
+    # --- ADR 0003: private LAN allowed, LAN Discovery on ---------------------
+    WHITELIST_FACT = "whitelist locked to Tailscale + private LAN, nothing public (ADR 0003)"
+    LAN_LISTENER = "LAN discovery listener answers pings (ADR 0003)"
+    LAN_UNLOCKED = "LAN discovery not locked off (ADR 0003)"
+
+    def test_lan_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.WHITELIST_FACT, self.LAN_LISTENER, self.LAN_UNLOCKED):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_public_range_in_whitelist_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HBB, "192.168.0.0/16", "192.168.0.0/16,8.8.8.0/24")
+        self.assert_check_fails(self.WHITELIST_FACT)
+
+    def test_lan_listener_stripped_again_fails_check(self):
+        self.rebrand()
+        sig = "pub(super) fn start_listening() -> ResultType<()> {\n"
+        self.edit("src/lan.rs", sig, f"{sig}    {rebrand.GUARD_OK}\n")
+        self.assert_check_fails(self.LAN_LISTENER)
+
+    def test_lan_discovery_locked_off_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HBB, '("direct-server", "Y")',
+                  '("direct-server", "Y"), ("enable-lan-discovery", "N")')
+        self.assert_check_fails(self.LAN_UNLOCKED)
+
     def test_changed_protocol_file_fails_check(self):
         self.rebrand()
         proto = self.root / "libs/hbb_common/protos/rendezvous.proto"

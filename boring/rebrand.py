@@ -31,6 +31,10 @@ LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Sour
 # MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
+# ADR 0003: the private LAN is allowed too (RFC 1918, IPv6 ULA and link-local),
+# so Macs on the same network connect Direct. Public addresses stay blocked.
+PRIVATE_LAN = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
+WHITELIST = f"{TAILNET},{PRIVATE_LAN}"
 
 # What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
@@ -71,13 +75,12 @@ GUARD = "if true { return; } // boring-remote: stripped"
 GUARD_OK = "if true { return Ok(()); } // boring-remote: stripped"
 
 LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows them fixed
-    "whitelist": TAILNET,
+    "whitelist": WHITELIST,
     "direct-server": "Y",
     "custom-rendezvous-server": "",
     "relay-server": "",
     "api-server": "",
     "allow-auto-update": "N",
-    "enable-lan-discovery": "N",  # no answering LAN pings with ID, hostname, user, MAC
     "rendezvous-servers": "",     # a server list the config file could otherwise carry
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
@@ -230,7 +233,7 @@ PATCHES = [
     # --- locked settings ----------------------------------------------------
     (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(LOCKED) + ";",
-     "whitelist, Direct IP, empty servers, no auto update, no LAN discovery"),
+     "whitelist, Direct IP, empty servers, no auto update"),
     (HBB, "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(DEFAULTS) + ";",
      "allow-only-conn-window-open off by default"),
@@ -251,9 +254,6 @@ PATCHES = [
      f"fn start_auto_update_check_(rx_msg: Receiver<UpdateMsg>) {{\n    {GUARD}\n", "Windows auto-updater"),
     ("src/updater.rs", "pub fn start_auto_update_macos() {\n",
      f"pub fn start_auto_update_macos() {{\n    {GUARD}\n", "Mac auto-updater"),
-    ("src/lan.rs", "pub(super) fn start_listening() -> ResultType<()> {\n",
-     f"pub(super) fn start_listening() -> ResultType<()> {{\n    {GUARD_OK}\n",
-     "LAN discovery listener: never binds UDP 21119"),
     # --- banned codecs: hwcodec / vram --------------------------------------
     ("build.py", "    if args.hwcodec:\n        features.append('hwcodec')\n"
                  "    if args.vram:\n        features.append('vram')\n",
@@ -572,10 +572,12 @@ MAC_HOME_METHOD = (
     "      child: Material(\n"
     "        color: Kit.ink,\n"
     "        child: ListenableBuilder(\n"
-    "          listenable: Listenable.merge([recents, id]),\n"
+    "          listenable: Listenable.merge([recents, id, lanMacs]),\n"
     "          builder: (context, _) => MacHome(\n"
     "            macs: [for (final p in recents.peers) MacEntry(name: name(p), target: p.id)],\n"
     "            myId: id.text,\n"
+    "            lan: lanMacs.macs,\n"
+    "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
     "            notices: [\n"
     + NOTICE_BANNER +
@@ -589,6 +591,7 @@ PATCHES += [
     (HOME, "import 'package:flutter_hbb/consts.dart';\n",
      "import 'package:flutter_hbb/consts.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/lan_macs_model.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
      "import 'package:flutter_hbb/models/peer_model.dart';\n",
      "Mac Home imports"),

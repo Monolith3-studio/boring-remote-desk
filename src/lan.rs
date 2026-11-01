@@ -345,6 +345,7 @@ async fn handle_received_peers(mut rx: UnboundedReceiver<config::DiscoveryPeer>)
         }
     }
 
+    base::lan::drop_stale(&mut peers);
     config::LanPeers::store(&peers);
     #[cfg(feature = "flutter")]
     crate::flutter_ffi::main_load_lan_peers();
