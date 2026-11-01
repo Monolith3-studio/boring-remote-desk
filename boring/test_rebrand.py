@@ -24,6 +24,9 @@ CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
 CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
 CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)"
 NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
+NO_DEFAULT_PASSWORD = "no default or blank password ships (ADR 0002)"
+TRUST_WIRED = "LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)"
+TRUST_TOKENS = "trust tokens: 256-bit, constant-time, option names agree in Rust and Dart"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 
@@ -411,6 +414,31 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/lang/fr.rs", f'        ("{rebrand.NOT_ON_NETWORK}", ""),\n', "")
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, rf"FAIL {NOT_FOUND_TRANSLATED}: .*fr.rs")
+
+    # --- v1.7 t04: LAN trust, no default password ----------------------------------
+    def test_preset_password_in_hard_settings_fails_check(self):
+        self.rebrand()
+        self.edit("libs/hbb_common/src/config.rs",
+                  "pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+                  'pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new('
+                  '[("password", "letmein1A")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());')
+        self.assert_check_fails(NO_DEFAULT_PASSWORD)
+
+    def test_hardcoded_unattended_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/server.rs", "pub fn new() -> ServerPtr {\n",
+                  'pub fn new() -> ServerPtr {\n    Config::set_permanent_password("Boring2026");\n')
+        self.assert_check_fails(NO_DEFAULT_PASSWORD)
+
+    def test_trusted_skip_moved_out_of_the_login_decision_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "if self.boring_trust.is_trusted() {", "if self.authorized {")
+        self.assert_check_fails(TRUST_WIRED)
+
+    def test_trust_option_renamed_on_one_side_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/trust.dart", "'boring-trust-tokens'", "'boring-tokens'")
+        self.assert_check_fails(TRUST_TOKENS)
 
     def test_tabs_back_as_the_default_fails_check(self):  # v1.7 t11
         self.rebrand()

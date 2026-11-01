@@ -1049,6 +1049,73 @@ PATCHES += [
     (CAMERA, "thumbColor: Colors.grey,", "thumbColor: Kit.muted,", "camera: kit scrollbars"),
 ]
 
+# --- LAN trust (v1.7 ticket 04, ADRs 0002, 0005) -----------------------------------
+# libs/base/src/trust.rs holds the token exchange; desktop/kit/trust.dart is ours and bridge-free.
+# These wire the kit in: Trusted Controllers (and "Forget this Mac's key" for t03's pinned keys)
+# under Settings → Advanced, and the plain-words approval prompt in the connection window.
+T04_HOOK = "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
+T04_SETTINGS_LINK = (
+    "            // boring-remote: v1.7 t04 Trusted Controllers (base::trust, kit/trust.dart).\n"
+    "            SettingsLink(\n"
+    "              label: 'Trusted Controllers',\n"
+    "              onTap: () => Navigator.of(context).push(MaterialPageRoute(\n"
+    "                builder: (_) => Theme(\n"
+    "                  data: Kit.theme(),\n"
+    "                  child: Scaffold(\n"
+    "                    backgroundColor: Kit.ink,\n"
+    "                    appBar: AppBar(backgroundColor: Kit.ink),\n"
+    "                    body: TrustedControllersPage(\n"
+    "                      trusted: parseTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption)),\n"
+    "                      known: parseKnown(bind.mainGetLocalOption(key: kDirectLinkKnownOption)),\n"
+    "                      onRemove: (k) => bind.mainSetOption(\n"
+    "                          key: kTrustedControllersOption,\n"
+    "                          value: removeTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption), k)),\n"
+    "                      onForget: (id) async {\n"
+    "                        for (final o in [kDirectLinkKnownOption, kTrustTokensOption]) {\n"
+    "                          await bind.mainSetLocalOption(\n"
+    "                              key: o, value: forgetId(bind.mainGetLocalOption(key: o), id));\n"
+    "                        }\n"
+    "                      },\n"
+    "                    ),\n"
+    "                  ),\n"
+    "                ),\n"
+    "              )),\n"
+    "            ),\n")
+T04_PROMPT = (
+    "    // boring-remote (v1.7 t04): on Mac the ask is plain words: who, Allow or Don't allow.\n"
+    "    if (isMacOS && showAccept) {\n"
+    "      return Theme(\n"
+    "        data: Kit.theme(),\n"
+    "        child: Material(\n"
+    "          color: Kit.ink,\n"
+    "          child: ApprovalPrompt(\n"
+    "            name: client.name,\n"
+    "            onAllow: () {\n"
+    "              handleAccept(context);\n"
+    "              windowManager.minimize();\n"
+    "            },\n"
+    "            onDeny: handleDisconnect,\n"
+    "          ),\n"
+    "        ),\n"
+    "      );\n"
+    "    }\n")
+CM_PAGE = "flutter/lib/desktop/pages/server_page.dart"
+PATCHES += [
+    (SETTINGS, "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n",
+     "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/trust.dart';\n",
+     "Trusted Controllers import"),
+    (SETTINGS, T04_HOOK, T04_SETTINGS_LINK, "Trusted Controllers under Advanced"),
+    (CM_PAGE, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/trust.dart';\n",
+     "approval prompt imports"),
+    (CM_PAGE, "    final showAccept = model.approveMode != 'password';\n",
+     "    final showAccept = model.approveMode != 'password';\n" + T04_PROMPT,
+     "approval prompt in plain words"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

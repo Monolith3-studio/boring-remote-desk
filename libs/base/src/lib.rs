@@ -5,5 +5,6 @@ pub mod keyboard;
 pub mod lan;
 pub mod platform;
 pub mod protos;
+pub mod trust;
 
 pub use protos::message as message_proto;

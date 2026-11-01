@@ -345,6 +345,8 @@ pub async fn dial(addr: SocketAddr, known: &Known, ms: u64) -> Result<(Stream, O
     if !stream.is_secured() {
         return Err(Failure::Refused(anyhow!(PLAINTEXT_REFUSED)));
     }
+    // v1.7 t04: present this Target's trust token (if any) inside the encrypted stream.
+    crate::trust::present_for(&mut stream, &who.id, ms).await.map_err(Failure::Refused)?;
     Ok((stream, Some(who)))
 }
 

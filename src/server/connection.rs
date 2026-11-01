@@ -370,6 +370,8 @@ pub struct Connection {
     port_forward_address: String,
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
+    // boring-remote: the Direct Link trust exchange (v1.7 t04, base::trust).
+    boring_trust: base::trust::Admission,
     // The place among the unauthorized connections; given back at authorization.
     unauthorized_id: Option<UnauthorizedID>,
     require_2fa: Option<totp_rs::TOTP>,
@@ -532,6 +534,7 @@ impl Connection {
         let super::ConnectionMeta {
             control_permissions,
             controlled_context,
+            trust: boring_trust,
             ..
         } = meta;
         // Android is not supported yet, so we always set control_permissions to None.
@@ -618,6 +621,7 @@ impl Connection {
             server_audit_conn: "".to_owned(),
             server_audit_file: "".to_owned(),
             controlled_context,
+            boring_trust,
             lr: Default::default(),
             login_scope: None,
             peer_argb: 0u32,
@@ -1891,6 +1895,7 @@ impl Connection {
         }
         self.authorized = true;
         self.unauthorized_id = None;
+        self.boring_trust.approve(&self.lr.my_name); // v1.7 t04: approved here = Trusted
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
         // session remembers, so they are not affected.
@@ -2992,6 +2997,14 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
+            // boring-remote (v1.7 t04): only a token this Mac issued skips the ask (ADR 0005).
+            if self.boring_trust.is_trusted() {
+                if !self.send_logon_response_and_keep_alive().await {
+                    return false;
+                }
+                self.try_start_cm(lr.my_id, lr.my_name, self.authorized);
+                return true;
+            }
             if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {

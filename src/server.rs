@@ -90,6 +90,8 @@ pub struct ConnectionMeta {
     pub controlled_context: Option<ControlledContext>,
     /// boring-remote: an encrypted Direct Link (v1.7 t03, ADR 0005), see base::direct_link.
     pub direct_link: bool,
+    /// boring-remote: what the Direct Link trust exchange found (v1.7 t04), see base::trust.
+    pub trust: base::trust::Admission,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -229,8 +231,9 @@ pub async fn create_tcp_connection(
     // Before the handshake, so its read is bounded too; lifted again at authorization.
     stream.set_max_packet_length(MAX_UNAUTHORIZED_MESSAGE);
     let direct_link = meta.direct_link;
+    let mut meta = meta;
     tokio::select! {
-        handshake = boring_direct_link_handshake(&mut stream, secure, direct_link) => handshake?,
+        handshake = boring_direct_link_handshake(&mut stream, secure, direct_link) => meta.trust = handshake?,
         _ = unauthorized.evicted() => {
             bail!("evicted to make room for a newer unauthenticated connection");
         }
@@ -264,12 +267,13 @@ pub async fn create_tcp_connection(
 }
 
 /// boring-remote (v1.7 t03): a Direct Link first announces our identity key and Tailscale
-/// address (base::direct_link::announce), then runs the usual signed handshake.
+/// address (base::direct_link::announce), then runs the usual signed handshake, then the trust
+/// exchange inside the keyed stream (v1.7 t04, base::trust).
 async fn boring_direct_link_handshake(
     stream: &mut Stream,
     secure: bool,
     direct_link: bool,
-) -> ResultType<()> {
+) -> ResultType<base::trust::Admission> {
     if direct_link {
         let tailscale = default_net::get_interfaces()
             .iter()
@@ -277,7 +281,11 @@ async fn boring_direct_link_handshake(
             .find(|ip| base::direct_link::is_tailscale(*ip));
         base::direct_link::announce(stream, &Config::get_key_pair().1, tailscale).await?;
     }
-    identity_handshake(stream, secure).await
+    identity_handshake(stream, secure).await?;
+    if direct_link && stream.is_secured() {
+        return base::trust::answer(stream, &base::trust::Trusted::load(), CONNECT_TIMEOUT).await;
+    }
+    Ok(Default::default())
 }
 
 /// Our signed identity goes out and, when `secure`, the controller's reply keys `stream`.

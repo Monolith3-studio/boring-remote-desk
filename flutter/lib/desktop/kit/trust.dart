@@ -1,0 +1,212 @@
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+
+import 'kit.dart';
+
+/// LAN trust in the kit (v1.7 t04, ADRs 0002, 0005). Bridge-free: the settings page and the
+/// connection window pass the option JSON and callbacks. Formats match libs/base/src/trust.rs
+/// (Trusted Controllers, Target side) and direct_link.rs (Macs this Mac has met, Controller side).
+
+/// Server option on the Target: who it trusts. Each entry holds a hash of a token, never the token.
+const kTrustedControllersOption = 'boring-trusted-controllers';
+
+/// Local options on the Controller: the Target keys it pinned, and the tokens Targets issued it.
+const kDirectLinkKnownOption = 'boring-direct-link-known';
+const kTrustTokensOption = 'boring-trust-tokens';
+
+class TrustedController {
+  final String key;
+  final String name;
+  final int added; // seconds since 1970
+  const TrustedController({required this.key, required this.name, this.added = 0});
+}
+
+List<TrustedController> parseTrusted(String json) {
+  try {
+    final list = jsonDecode(json);
+    if (list is! List) return [];
+    return [
+      for (final e in list)
+        if (e is Map && e['key'] is String)
+          TrustedController(
+            key: e['key'] as String,
+            name: (e['name'] as String?) ?? '',
+            added: (e['added'] as num?)?.toInt() ?? 0,
+          ),
+    ];
+  } catch (_) {
+    return [];
+  }
+}
+
+/// The Trusted Controllers JSON without `key`. Removing revokes: that Controller is asked again.
+String removeTrusted(String json, String key) {
+  try {
+    final list = jsonDecode(json);
+    if (list is! List) return '[]';
+    return jsonEncode([
+      for (final e in list)
+        if (!(e is Map && e['key'] == key)) e
+    ]);
+  } catch (_) {
+    return '[]';
+  }
+}
+
+/// A Target this Mac pinned the key of on its first encrypted Direct Link.
+class KnownMac {
+  final String id;
+  final String address; // where it last answered, without the port
+  const KnownMac({required this.id, required this.address});
+}
+
+List<KnownMac> parseKnown(String json) {
+  try {
+    final map = jsonDecode(json);
+    if (map is! Map) return [];
+    return [
+      for (final e in map.entries)
+        KnownMac(
+          id: '${e.key}',
+          address: _host(e.value is Map ? '${e.value['lan'] ?? ''}' : ''),
+        ),
+    ];
+  } catch (_) {
+    return [];
+  }
+}
+
+String _host(String addr) {
+  final i = addr.lastIndexOf(':');
+  final h = i > 0 ? addr.substring(0, i) : addr;
+  return h.replaceAll('[', '').replaceAll(']', '');
+}
+
+/// The JSON map without `id` (used for both the pinned keys and the tokens).
+String forgetId(String json, String id) {
+  try {
+    final map = jsonDecode(json);
+    if (map is! Map) return '{}';
+    map.remove(id);
+    return jsonEncode(map);
+  } catch (_) {
+    return '{}';
+  }
+}
+
+/// Settings → Advanced → Trusted Controllers. Who can get into this Mac without asking, and
+/// which Macs' keys this Mac remembers. Remove and Forget take effect at once.
+class TrustedControllersPage extends StatefulWidget {
+  final List<TrustedController> trusted;
+  final List<KnownMac> known;
+  final Future<void> Function(String key) onRemove;
+  final Future<void> Function(String id) onForget;
+
+  const TrustedControllersPage({
+    super.key,
+    required this.trusted,
+    required this.known,
+    required this.onRemove,
+    required this.onForget,
+  });
+
+  @override
+  State<TrustedControllersPage> createState() => _TrustedControllersPageState();
+}
+
+class _TrustedControllersPageState extends State<TrustedControllersPage> {
+  late final _trusted = [...widget.trusted];
+  late final _known = [...widget.known];
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    return ListView(
+      padding: const EdgeInsets.all(Kit.s6),
+      children: [
+        Text('Trusted Controllers', style: t.headlineSmall),
+        const SizedBox(height: Kit.s2),
+        Text('These Macs get into this one without asking. Remove one and it has to ask again.',
+            style: t.bodySmall),
+        const SizedBox(height: Kit.s4),
+        if (_trusted.isEmpty) const Text('None yet. A Mac lands here once you allow it in.'),
+        for (final c in _trusted)
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: Text(c.name.isNotEmpty ? c.name : 'A Mac with no name'),
+            trailing: TextButton(
+              onPressed: () async {
+                await widget.onRemove(c.key);
+                if (mounted) setState(() => _trusted.remove(c));
+              },
+              child: const Text('Remove'),
+            ),
+          ),
+        const SizedBox(height: Kit.s6),
+        Text('Macs this one has connected to', style: t.bodySmall),
+        const SizedBox(height: Kit.s2),
+        Text(
+            "If one was reinstalled, it won't connect until you forget its key here. "
+            'Then connect again to pair it.',
+            style: t.bodySmall),
+        const SizedBox(height: Kit.s4),
+        if (_known.isEmpty) const Text('None yet.'),
+        for (final m in _known)
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: Text(m.address.isNotEmpty ? m.address : m.id),
+            trailing: TextButton(
+              onPressed: () async {
+                await widget.onForget(m.id);
+                if (mounted) setState(() => _known.remove(m));
+              },
+              child: const Text("Forget this Mac's key"),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// What the Target shows when an unknown Mac asks to come in. Plain words, two choices.
+class ApprovalPrompt extends StatelessWidget {
+  final String name;
+  final VoidCallback onAllow;
+  final VoidCallback onDeny;
+
+  const ApprovalPrompt({super.key, required this.name, required this.onAllow, required this.onDeny});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    final who = name.trim().isNotEmpty ? name.trim() : 'A Mac on this network';
+    return Padding(
+      padding: const EdgeInsets.all(Kit.s4),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('$who wants to control this Mac.', style: t.titleMedium),
+          const SizedBox(height: Kit.s2),
+          Text("If you allow it, it can get in next time without asking. You can remove it in Settings.",
+              style: t.bodySmall),
+          const SizedBox(height: Kit.s4),
+          Row(children: [
+            Expanded(
+              child: OutlinedButton(onPressed: onDeny, child: const Text("Don't allow")),
+            ),
+            const SizedBox(width: Kit.s2),
+            Expanded(
+              child: FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: Kit.paper, foregroundColor: Kit.ink),
+                onPressed: onAllow,
+                child: const Text('Allow'),
+              ),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+}

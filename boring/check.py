@@ -654,6 +654,67 @@ def simple_settings_checks(c):
     c.fact("Mac Settings is one simple page with Advanced behind it", not missing, "; ".join(missing))
 
 
+TRUST_RS = "libs/base/src/trust.rs"
+TRUST_DART = "flutter/lib/desktop/kit/trust.dart"
+PASSWORDISH = re.compile(r"password|salt", re.I)
+
+
+def trust_checks(c, cfg):
+    """v1.7 t04 (ADRs 0002, 0005): a Controller gets in by approval, the Unattended Password, or
+    a token this Target issued and still trusts. Nothing ships a default password."""
+    hooks = [
+        (DIRECT_LINK, "crate::trust::present_for(&mut stream, &who.id, ms)"),
+        ("src/server.rs", "return base::trust::answer(stream, &base::trust::Trusted::load(), CONNECT_TIMEOUT).await;"),
+        ("src/server.rs", "handshake = boring_direct_link_handshake(&mut stream, secure, direct_link) => meta.trust = handshake?,"),
+        ("src/server/connection.rs", "trust: boring_trust,"),
+        ("src/server/connection.rs", "if self.boring_trust.is_trusted() {"),
+        ("src/server/connection.rs", "self.boring_trust.approve(&self.lr.my_name);"),
+        (rebrand.SETTINGS, "label: 'Trusted Controllers',"),
+        (rebrand.SETTINGS, "TrustedControllersPage("),
+        (rebrand.CM_PAGE, "ApprovalPrompt("),
+    ]
+    missing = [f"{rel}: {n}" for rel, n in hooks if n not in c.read(rel)]
+    conn = c.read("src/server/connection.rs")
+    # The trusted skip must sit inside the login decision, before the approve-mode ask.
+    i, j = conn.find("if self.boring_trust.is_trusted() {"), conn.find("if (password::approve_mode() == ApproveMode::Click")
+    if not (0 <= i < j):
+        missing.append("connection.rs: trusted skip is not right before the approve-mode ask")
+    c.fact("LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)",
+           not missing, "; ".join(missing))
+
+    rs, dart, link = c.read(TRUST_RS), c.read(TRUST_DART), c.read(DIRECT_LINK)
+    pairs = [(rs, "TRUSTED_OPTION", "kTrustedControllersOption"), (rs, "TOKENS_OPTION", "kTrustTokensOption"),
+             (link, "KNOWN_OPTION", "kDirectLinkKnownOption")]
+    off = []
+    for src, rname, dname in pairs:
+        r = re.search(rf'pub const {rname}: &str = "([^"]+)";', src)
+        d = re.search(rf"const {dname} = '([^']+)';", dart)
+        if not r or not d or r.group(1) != d.group(1):
+            off.append(f"{rname} vs {dname}")
+    if "const TOKEN_LEN: usize = 32;" not in rs or "randombytes(TOKEN_LEN)" not in rs or "memcmp(" not in rs:
+        off.append("token is not 256 random bits compared in constant time")
+    c.fact("trust tokens: 256-bit, constant-time, option names agree in Rust and Dart", not off, "; ".join(off))
+
+    why = [f"rebrand map sets {k}" for d in (rebrand.LOCKED, rebrand.DEFAULTS, rebrand.LOCKED_LOCAL)
+           for k in d if PASSWORDISH.search(k)]
+    for name in ("DEFAULT_SETTINGS", "OVERWRITE_SETTINGS", "HARD_SETTINGS", "BUILTIN_SETTINGS",
+                 "DEFAULT_LOCAL_SETTINGS", "OVERWRITE_LOCAL_SETTINGS"):
+        m = re.search(rf"pub static ref {name}: RwLock<HashMap<String, String>> = (.*?);\n", cfg, re.S)
+        if not m or PASSWORDISH.search(m.group(1)):
+            why.append(f"{name} ships a value: {m and m.group(1)[:80]}")
+    for base in ("src", "libs", "flutter/lib"):
+        for p in sorted((c.root / base).rglob("*")):
+            if p.suffix not in (".rs", ".dart") or not p.is_file() or "/lang/" in p.as_posix():
+                continue
+            code = strip_tests_and_comments(p.read_text(encoding="utf-8", errors="replace"))
+            for m in re.finditer(r'\.insert\(\s*"(?:password|salt)"\s*\.to_\w+\(\)\s*,\s*"[^"]+"|'
+                                 r'set_permanent_password\(\s*"[^"]*"|mainSetPermanentPassword\w*\(\s*password:\s*\'[^\']*\'', code):
+                why.append(f"{p.relative_to(c.root)}: {m.group(0)[:60]}")
+    if rebrand.GUARD not in (fn_body(c.read("src/common.rs"), "pub fn read_custom_client(config: &str) {") or ""):
+        why.append("read_custom_client (the preset-password path) is not stripped")
+    c.fact("no default or blank password ships (ADR 0002)", not why, "; ".join(why[:10]))
+
+
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
     plist = c.read("flutter/macos/Runner/Info.plist")
@@ -853,6 +914,7 @@ def run_checks(root):
     multi_window_checks(c, cfg)  # v1.7 t11
     activate_link_checks(c)
     simple_settings_checks(c)  # v1.7 t09
+    trust_checks(c, cfg)  # v1.7 t04
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")
