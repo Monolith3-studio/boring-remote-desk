@@ -311,6 +311,20 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, r"FAIL coral is never text or a fill under text: .*desktop_setting_page.dart:\d+")
 
+    # --- v1.7 t09: extras in the kit, one simple Settings page ------
+    def test_upstream_colour_back_in_an_extras_screen_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/pages/port_forward_page.dart", "color: Kit.line", "color: Colors.red")
+        r = run(CHECK, self.root)
+        self.assertRegex(r.stdout, r"FAIL port forward, terminal and camera use kit tokens only: "
+                                   r".*port_forward_page.dart: Colors.red")
+
+    def test_simple_settings_unwired_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "SimpleSettings(", "Placeholder(")
+        r = run(CHECK, self.root)
+        self.assertIn("FAIL Mac Settings is one simple page with Advanced behind it", r.stdout)
+
     # --- connect by tailnet name ----------------------------------
     def test_domain_port_branch_back_in_connect_fails_check(self):
         self.rebrand()
