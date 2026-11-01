@@ -354,6 +354,16 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertIn("FAIL Mac Settings is one simple page with Advanced behind it", r.stdout)
 
+    # --- v1.7 t05: High Efficiency on a Local link between two Boring Remotes ----
+    def test_high_efficiency_unwired_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "platform_additions.insert(base::high_efficiency::MARKER.into(), json!(crate::VERSION));",
+                  "")
+        r = run(CHECK, self.root)
+        self.assertIn("FAIL High Efficiency wired: Target marks itself, Controller applies it, badge reads it",
+                      r.stdout)
+
     # --- v1.7 t03: Direct Link, Tailscale fallback, encrypted off Tailscale ----
     def test_ip_branch_back_before_the_direct_link_fails_check(self):
         self.rebrand()
