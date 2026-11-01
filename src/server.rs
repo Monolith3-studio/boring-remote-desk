@@ -88,6 +88,8 @@ type ConnMap = HashMap<i32, ConnInner>;
 pub struct ConnectionMeta {
     pub control_permissions: Option<ControlPermissions>,
     pub controlled_context: Option<ControlledContext>,
+    /// boring-remote: an encrypted Direct Link (v1.7 t03, ADR 0005), see base::direct_link.
+    pub direct_link: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -226,11 +228,15 @@ pub async fn create_tcp_connection(
     };
     // Before the handshake, so its read is bounded too; lifted again at authorization.
     stream.set_max_packet_length(MAX_UNAUTHORIZED_MESSAGE);
+    let direct_link = meta.direct_link;
     tokio::select! {
-        handshake = identity_handshake(&mut stream, secure) => handshake?,
+        handshake = boring_direct_link_handshake(&mut stream, secure, direct_link) => handshake?,
         _ = unauthorized.evicted() => {
             bail!("evicted to make room for a newer unauthenticated connection");
         }
+    }
+    if direct_link {
+        base::direct_link::require_encrypted(addr.ip(), &stream)?;
     }
 
     #[cfg(target_os = "macos")]
@@ -255,6 +261,23 @@ pub async fn create_tcp_connection(
     )
     .await;
     Ok(())
+}
+
+/// boring-remote (v1.7 t03): a Direct Link first announces our identity key and Tailscale
+/// address (base::direct_link::announce), then runs the usual signed handshake.
+async fn boring_direct_link_handshake(
+    stream: &mut Stream,
+    secure: bool,
+    direct_link: bool,
+) -> ResultType<()> {
+    if direct_link {
+        let tailscale = default_net::get_interfaces()
+            .iter()
+            .flat_map(|i| i.ipv4.iter().map(|a| std::net::IpAddr::V4(a.addr)))
+            .find(|ip| base::direct_link::is_tailscale(*ip));
+        base::direct_link::announce(stream, &Config::get_key_pair().1, tailscale).await?;
+    }
+    identity_handshake(stream, secure).await
 }
 
 /// Our signed identity goes out and, when `secure`, the controller's reply keys `stream`.

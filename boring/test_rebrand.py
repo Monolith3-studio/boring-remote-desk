@@ -21,7 +21,8 @@ import rebrand  # noqa: E402
 
 REPO = HERE.parent
 CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
-CONNECT_TAILNET = "names connect Direct IP only to Tailscale addresses, else the plain error"
+CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
+CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)"
 NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
@@ -81,7 +82,7 @@ class RebrandSeam(unittest.TestCase):
                      "no RustDesk in app metadata", "window titles and tray tooltip say Boring Remote",
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
                      "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
-                     CONNECT_DIRECT, CONNECT_TAILNET, NOT_FOUND_TRANSLATED):
+                     CONNECT_DIRECT, NOT_FOUND_TRANSLATED):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -353,41 +354,61 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertIn("FAIL Mac Settings is one simple page with Advanced behind it", r.stdout)
 
-    # --- connect by tailnet name ----------------------------------
-    def test_domain_port_branch_back_in_connect_fails_check(self):
+    # --- v1.7 t03: Direct Link, Tailscale fallback, encrypted off Tailscale ----
+    def test_ip_branch_back_before_the_direct_link_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        if true {\n            return Ok((\n                (\n"
-                  "                    connect_tcp_local(boring_tailnet_addr(peer).await?",
-                  "        if hbb_common::is_domain_port_str(peer) {\n            return Ok((\n                (\n"
-                  "                    connect_tcp_local(boring_tailnet_addr(peer).await?")
+        self.edit("src/client.rs", rebrand.DIRECT_LINK_CALL,
+                  "        if hbb_common::is_domain_port_str(peer) {\n            bail!(\"x\");\n        }\n"
+                  + rebrand.DIRECT_LINK_CALL)
         self.assert_check_fails(CONNECT_DIRECT)
 
-    def test_rendezvous_lookup_before_the_tailnet_guard_fails_check(self):
+    def test_rendezvous_lookup_before_the_direct_link_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        // boring-remote: anything that is not an IP is a tailnet name",
+        self.edit("src/client.rs", "        // boring-remote (v1.7 t03): every peer is a name or IP",
                   "        let _ = crate::get_rendezvous_server(1_000).await;\n"
-                  "        // boring-remote: anything that is not an IP is a tailnet name")
+                  "        // boring-remote (v1.7 t03): every peer is a name or IP")
         self.assert_check_fails(CONNECT_DIRECT)
 
-    def test_non_tailnet_answer_accepted_fails_check(self):
+    def test_public_answer_accepted_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "!addrs.iter().all(|a| boring_is_tailnet(*a))",
-                  "!addrs.iter().any(|a| boring_is_tailnet(*a))")
+        self.edit("libs/base/src/direct_link.rs", "!addrs.iter().all(|a| crate::lan::is_allowed(a.ip()))",
+                  "!addrs.iter().any(|a| crate::lan::is_allowed(a.ip()))")
         self.assert_check_fails(CONNECT_TAILNET)
 
     def test_widened_tailnet_range_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "(ip.octets()[1] & 0xc0) == 64", "(ip.octets()[1] & 0x80) == 0")
+        self.edit("libs/base/src/direct_link.rs", "(v4.octets()[1] & 0xc0) == 64", "(v4.octets()[1] & 0x80) == 0")
         self.assert_check_fails(CONNECT_TAILNET)
 
     def test_reworded_error_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", rebrand.NOT_FOUND, "failed to lookup address information")
+        self.edit("libs/base/src/direct_link.rs", rebrand.NOT_ON_NETWORK, "failed to connect")
         self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_fallback_past_a_refusal_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "Ok(Err(Failure::Refused(e))) => return Err(e),",
+                  "Ok(Err(Failure::Refused(_))) => {}")
+        self.assert_check_fails(CONNECT_TAILNET)
+
+    def test_plaintext_direct_link_on_the_lan_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "    !is_tailscale(ip)\n", "    false\n")
+        self.assert_check_fails(CONNECT_ENCRYPTED)
+
+    def test_target_accepting_an_unkeyed_direct_link_fails_check(self):
+        self.rebrand()
+        self.edit("src/server.rs", "        base::direct_link::require_encrypted(addr.ip(), &stream)?;\n", "")
+        self.assert_check_fails(CONNECT_ENCRYPTED)
+
+    def test_direct_listener_back_to_plaintext_fails_check(self):
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", "direct_link: encrypt,", "direct_link: false,")
+        self.assert_check_fails(CONNECT_ENCRYPTED)
 
     def test_not_found_key_missing_from_a_language_fails_check(self):
         self.rebrand()
-        self.edit("src/lang/fr.rs", f'        ("{rebrand.NOT_FOUND}", ""),\n', "")
+        self.edit("src/lang/fr.rs", f'        ("{rebrand.NOT_ON_NETWORK}", ""),\n', "")
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, rf"FAIL {NOT_FOUND_TRANSLATED}: .*fr.rs")
 

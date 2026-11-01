@@ -46,6 +46,7 @@ fn connection_meta(
     ConnectionMeta {
         control_permissions,
         controlled_context,
+        ..Default::default()
     }
 }
 
@@ -1398,14 +1399,19 @@ async fn direct_server(server: ServerPtr) {
                     .local_addr()
                     .unwrap_or(Config::get_any_listen_addr(true));
                 let server = server.clone();
+                // boring-remote: encrypted everywhere but Tailscale (v1.7 t03, ADR 0005).
+                let encrypt = base::direct_link::must_encrypt(hbb_common::try_into_v4(addr).ip());
                 tokio::spawn(async move {
                     allow_err!(
                         crate::server::create_tcp_connection(
                             server,
                             hbb_common::Stream::from(stream, local_addr),
                             addr,
-                            false,
-                            ConnectionMeta::default(), // Direct connections don't have server-side user context.
+                            encrypt,
+                            ConnectionMeta {
+                                direct_link: encrypt,
+                                ..Default::default()
+                            }, // Direct connections don't have server-side user context.
                         )
                         .await
                     );

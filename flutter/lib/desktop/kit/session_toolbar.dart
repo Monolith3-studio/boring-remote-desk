@@ -2,8 +2,16 @@ import 'package:flutter/material.dart';
 
 import 'kit.dart';
 
-/// How this session reaches the other Mac. Tickets 03/05 feed the real value; until then it is unknown.
+/// How this session reaches the other Mac. Ticket 03 feeds Local / Via internet; ticket 05 the codec.
 enum LinkState { unknown, local, localHighEfficiency, viaInternet }
+
+/// The badge for the session's `stream_type` as Rust reports it (base::direct_link::Path):
+/// "Local" = Direct Link on this network, "Tailscale" = via internet. Anything else is unknown.
+LinkState linkStateFor(String streamType) => switch (streamType) {
+      'Local' => LinkState.local,
+      'Tailscale' => LinkState.viaInternet,
+      _ => LinkState.unknown,
+    };
 
 /// Link Badge: the small session label naming Direct Link vs Relay. Shows nothing while unknown.
 class LinkBadge extends StatelessWidget {

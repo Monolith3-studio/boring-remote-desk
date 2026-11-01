@@ -34,6 +34,14 @@ SessionToolbar bar({
     );
 
 void main() {
+  test('Link Badge follows the path the session actually took (Rust stream_type)', () {
+    expect(linkStateFor('Local'), LinkState.local);
+    expect(linkStateFor('Tailscale'), LinkState.viaInternet);
+    for (final other in ['', 'TCP', 'UDP', 'WebRTC/IPv6', 'other']) {
+      expect(linkStateFor(other), LinkState.unknown, reason: other);
+    }
+  });
+
   testWidgets('Link Badge names the link, and hides when unknown', (tester) async {
     for (final (link, label) in [
       (LinkState.local, 'Local'),

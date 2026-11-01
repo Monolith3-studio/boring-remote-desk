@@ -1,4 +1,5 @@
 pub mod config;
+pub mod direct_link;
 pub mod fs;
 pub mod keyboard;
 pub mod lan;
