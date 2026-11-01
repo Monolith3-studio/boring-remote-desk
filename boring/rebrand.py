@@ -608,6 +608,117 @@ PATCHES += [
      "Mac Home loads recents"),
 ]
 
+# --- File Transfer (v1.7 ticket 08) ----------------------------------------------
+# Two kit panes (This Mac / That Mac), rows drag across both ways, kit job list with
+# progress / done / error. desktop/kit/file_transfer.dart is ours and bridge-free; these
+# wire it to the unchanged engine (FileController.sendFiles, the Send button's path).
+FILE_MGR = "flutter/lib/desktop/pages/file_manager_page.dart"
+FILE_MGR_METHODS = (
+    "  // boring-remote: v1.7 File Transfer. A drop on one pane sends the other pane's selection.\n"
+    "  void _boringSend(FileController from) {\n"
+    "    if (!SelectedItems.valid(from.selectedItems.items)) return;\n"
+    "    from.sendFiles(from.selectedItems, from.getOtherSideDirectoryData());\n"
+    "    from.selectedItems.clear();\n"
+    "  }\n\n"
+    "  Widget boringTransferList() => Obx(() => TransferList(\n"
+    "        jobs: [\n"
+    "          for (final j in jobController.jobTable)\n"
+    "            if (j.type == JobType.transfer)\n"
+    "              TransferJob.fromEngine(\n"
+    "                  id: j.id,\n"
+    "                  path: j.jobName,\n"
+    "                  remoteToLocal: j.isRemoteToLocal,\n"
+    "                  state: j.state.name,\n"
+    "                  finished: j.finishedSize,\n"
+    "                  total: j.totalSize,\n"
+    "                  err: j.err),\n"
+    "        ],\n"
+    "        onCancel: (id) {\n"
+    "          jobController.jobTable.removeWhere((j) => j.id == id);\n"
+    "          jobController.cancelJob(id);\n"
+    "        },\n"
+    "        onResume: (id) => jobController.resumeJob(id),\n"
+    "        onRemove: (id) => jobController.jobTable.removeWhere((j) => j.id == id),\n"
+    "      ));\n\n")
+PATCHES += [
+    (FILE_MGR, "import 'package:flutter_hbb/models/file_model.dart';\n",
+     "import 'package:flutter_hbb/models/file_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/file_transfer.dart';\n",
+     "File Transfer kit imports"),
+    (FILE_MGR,
+     "          backgroundColor: Theme.of(context).scaffoldBackgroundColor,\n"
+     "          body: Row(\n"
+     "            children: [\n"
+     "              if (!isWeb)\n"
+     "                Flexible(\n"
+     "                    flex: 3,\n"
+     "                    child: dropArea(FileManagerView(\n"
+     "                        model.localController, _ffi, _mouseFocusScope))),\n"
+     "              Flexible(\n"
+     "                  flex: 3,\n"
+     "                  child: dropArea(FileManagerView(\n"
+     "                      model.remoteController, _ffi, _mouseFocusScope))),\n"
+     "              Flexible(flex: 2, child: statusList())\n"
+     "            ],\n"
+     "          ),\n",
+     "          backgroundColor: Kit.ink,\n"
+     "          body: Theme(\n"
+     "            data: Kit.theme().copyWith(cardColor: Kit.panel),\n"
+     "            child: Row(\n"
+     "              children: [\n"
+     "                if (!isWeb)\n"
+     "                  Flexible(\n"
+     "                      flex: 3,\n"
+     "                      child: TransferPane(\n"
+     "                          side: TransferSide.thisMac,\n"
+     "                          onDropFromOther: () => _boringSend(model.remoteController),\n"
+     "                          child: dropArea(FileManagerView(\n"
+     "                              model.localController, _ffi, _mouseFocusScope)))),\n"
+     "                Flexible(\n"
+     "                    flex: 3,\n"
+     "                    child: TransferPane(\n"
+     "                        side: TransferSide.thatMac,\n"
+     "                        onDropFromOther: () => _boringSend(model.localController),\n"
+     "                        child: dropArea(FileManagerView(\n"
+     "                            model.remoteController, _ffi, _mouseFocusScope)))),\n"
+     "                Flexible(flex: 2, child: boringTransferList())\n"
+     "              ],\n"
+     "            ),\n"
+     "          ),\n",
+     "File Transfer: kit panes and job list"),
+    (FILE_MGR, "  Widget dropArea(FileManagerView fileView) {\n",
+     FILE_MGR_METHODS + "  Widget dropArea(FileManagerView fileView) {\n",
+     "File Transfer: drop-to-send and job list wiring"),
+    (FILE_MGR,
+     "          return Padding(\n"
+     "            padding: EdgeInsets.symmetric(vertical: 1),\n"
+     "            child: Obx(() => Container(\n",
+     "          return TransferDraggable(\n"
+     "            side: isLocal ? TransferSide.thisMac : TransferSide.thatMac,\n"
+     "            label: selectedItems.items.contains(entry) && selectedItems.items.length > 1\n"
+     "                ? '${selectedItems.items.length} items'\n"
+     "                : entry.name,\n"
+     "            onDragStarted: () {\n"
+     "              if (selectedItems.items.contains(entry)) return;\n"
+     "              selectedItems.clear();\n"
+     "              selectedItems.add(entry);\n"
+     "            },\n"
+     "            child: Padding(\n"
+     "            padding: EdgeInsets.symmetric(vertical: 1),\n"
+     "            child: Obx(() => Container(\n",
+     "File Transfer: rows drag to the other pane"),
+    (FILE_MGR, "                ))),\n          );\n        });\n\n        return Column(\n",
+     "                ))),\n          ));\n        });\n\n        return Column(\n",
+     "File Transfer: close the row drag wrapper"),
+    (FILE_MGR,
+     "                  color: selectedItems.items.contains(entry)\n"
+     "                      ? MyTheme.button\n",
+     "                  color: selectedItems.items.contains(entry)\n"
+     "                      ? Kit.line\n",
+     "File Transfer: selected row in kit grey"),
+]
+
 # --- Session Toolbar (v1.7 ticket 07) --------------------------------------------
 # desktop/kit/session_toolbar.dart is ours and bridge-free; this wires it on Mac. Five
 # actions up front (Link Badge, Send files, display, quality, Disconnect); every other
@@ -707,6 +818,146 @@ PATCHES += [
      "don't log incoming links"),
     ("flutter/lib/common.dart", '    print("initialLink: $initialLink");\n', "", "don't log the cold-boot link"),
     ("flutter/lib/main.dart", '  debugPrint("launch args: $args");\n', "", "don't log launch args (may be a link)"),
+]
+
+# --- Extras in the kit + one simple Settings page (v1.7 ticket 09) ----------------
+# desktop/kit/simple_settings.dart and kit_extras.dart are ours and bridge-free; these wire them
+# in. Port forward, terminal and camera view get the kit theme and kit tokens (check.py:
+# EXTRAS_PAGES). Settings on Mac opens on SimpleSettings; the full tabs sit behind Advanced.
+PORT_FWD = "flutter/lib/desktop/pages/port_forward_page.dart"
+TERMINAL = "flutter/lib/desktop/pages/terminal_page.dart"
+CAMERA = "flutter/lib/desktop/pages/view_camera_page.dart"
+KIT_IMPORTS = ("import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+               "import 'package:flutter_hbb/desktop/kit/kit_extras.dart';\n")
+BORING_MAC_NAME_OPTION = "boring-device-name"  # server-side: the LAN listener answers with it (t02/t06)
+SIMPLE_SETTINGS_METHOD = (
+    "  // boring-remote: v1.7 Settings. One simple page on Mac; the full tabs are Advanced.\n"
+    "  bool _boringAdvanced = false;\n\n"
+    "  void _boringOpenAdvanced(SettingsTabKey tab) {\n"
+    "    setState(() => _boringAdvanced = true);\n"
+    "    WidgetsBinding.instance.addPostFrameCallback((_) {\n"
+    "      final i = DesktopSettingPage.tabKeys.indexOf(tab);\n"
+    "      if (i >= 0 && controller.hasClients) controller.jumpToPage(i);\n"
+    "    });\n"
+    "  }\n\n"
+    "  Widget buildBoringSettings(BuildContext context) {\n"
+    f"    const nameKey = '{BORING_MAC_NAME_OPTION}';\n"
+    "    final name = bind.mainGetOptionSync(key: nameKey);\n"
+    "    return Theme(\n"
+    "      data: Kit.theme(),\n"
+    "      child: Material(\n"
+    "        color: Kit.ink,\n"
+    "        child: SimpleSettings(\n"
+    "          macName: name.isNotEmpty ? name : Platform.localHostname.replaceAll('.local', ''),\n"
+    "          onRename: (n) => bind.mainSetOption(key: nameKey, value: n),\n"
+    "          passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
+    "          setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
+    "          // Start at login = the LaunchAgent is installed and the service isn't stopped.\n"
+    "          // Off stops the service (it stays off across restarts until turned back on).\n"
+    "          startAtLogin: bind.mainIsInstalledDaemon(prompt: false) &&\n"
+    "              !mainGetBoolOptionSync(kOptionStopService),\n"
+    "          onStartAtLogin: (on) async {\n"
+    "            if (on) bind.mainIsInstalledDaemon(prompt: true);\n"
+    "            await mainSetBoolOption(kOptionStopService, !on);\n"
+    "            setState(() {});\n"
+    "          },\n"
+    "          checkUpdates: mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
+    "          onCheckUpdates: (on) async {\n"
+    "            await mainSetLocalBoolOption(kBoringUpdateCheckOption, on);\n"
+    "            setState(() {});\n"
+    "          },\n"
+    "          advanced: [\n"
+    "            // boring-remote: v1.7 t04 adds Trusted Controllers here.\n"
+    "            SettingsLink(\n"
+    "              label: 'Sessions open in windows or tabs',\n"
+    "              onTap: () => _boringOpenAdvanced(SettingsTabKey.general), // v1.7 t11 owns this choice\n"
+    "            ),\n"
+    "            SettingsLink(\n"
+    "              label: 'All settings',\n"
+    "              onTap: () => _boringOpenAdvanced(DesktopSettingPage.tabKeys.first),\n"
+    "            ),\n"
+    "          ],\n"
+    "        ),\n"
+    "      ),\n"
+    "    );\n"
+    "  }\n\n")
+PATCHES += [
+    # Settings
+    (SETTINGS, "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
+     "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n",
+     "simple Settings imports"),
+    (SETTINGS, "    super.build(context);\n    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).colorScheme.background,\n      body: _buildBlock(\n",
+     "    super.build(context);\n"
+     "    if (isMacOS && !_boringAdvanced) {\n"
+     "      return _buildBlock(children: [Expanded(child: buildBoringSettings(context))]);\n"
+     "    }\n"
+     "    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).colorScheme.background,\n      body: _buildBlock(\n",
+     "Mac Settings opens on the simple page"),
+    (SETTINGS, "  Widget _header(BuildContext context) {\n",
+     SIMPLE_SETTINGS_METHOD + "  Widget _header(BuildContext context) {\n",
+     "simple Settings wiring"),
+    (SETTINGS, "        const Spacer(),\n      ],\n",
+     "        const Spacer(),\n"
+     "        if (isMacOS)\n"
+     "          TextButton(\n"
+     "            onPressed: () => setState(() => _boringAdvanced = false),\n"
+     "            child: const Text('Back to Settings'),\n"
+     "          ).marginOnly(right: 20, top: 10),\n"
+     "      ],\n",
+     "Advanced goes back to the simple page"),
+    # Port forward
+    (PORT_FWD, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n" + KIT_IMPORTS, "port forward: kit imports"),
+    (PORT_FWD, "    super.build(context);\n    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).scaffoldBackgroundColor,\n      body: FutureBuilder(",
+     "    super.build(context);\n    return Theme(\n      data: kitThemeKeeping(context),\n      child: Scaffold(\n"
+     "      backgroundColor: Kit.ink,\n      body: FutureBuilder(",
+     "port forward: kit theme"),
+    (PORT_FWD, "        return const Offstage();\n      }),\n    );\n  }\n",
+     "        return const Offstage();\n      }),\n    ));\n  }\n", "port forward: close kit theme"),
+    (PORT_FWD, "color: MyTheme.border", "color: Kit.line", "port forward: kit border"),
+    (PORT_FWD, "color: const Color(0xFF007F00),", "color: Kit.panel,", "port forward: listening bar"),
+    (PORT_FWD, "style: const TextStyle(fontSize: 16, color: Colors.white),",
+     "style: const TextStyle(fontSize: 16, color: Kit.paper),", "port forward: listening text"),
+    (PORT_FWD, "fontSize: 10, color: Color(0xFFDDDDDD), height: 1.2),",
+     "fontSize: 12, color: Kit.muted, height: 1.2),", "port forward: listening tip, 12px floor"),
+    (PORT_FWD, "              ? MyTheme.currentThemeMode() == ThemeMode.dark\n"
+     "                  ? const Color(0xFF202020)\n                  : const Color(0xFFF4F5F6)\n"
+     "              : Theme.of(context).colorScheme.background),",
+     "              ? Kit.glass\n              : Kit.panel),", "port forward: kit row stripes"),
+    # Terminal
+    (TERMINAL, "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';\n" + KIT_IMPORTS, "terminal: kit imports"),
+    (TERMINAL, "    super.build(context);\n    return Scaffold(\n"
+     "      backgroundColor: Theme.of(context).scaffoldBackgroundColor,\n      body: LayoutBuilder(",
+     "    super.build(context);\n    return Theme(\n      data: kitThemeKeeping(context),\n      child: Scaffold(\n"
+     "      backgroundColor: Kit.ink,\n      body: LayoutBuilder(",
+     "terminal: kit theme"),
+    (TERMINAL, "        },\n      ),\n    );\n  }\n\n  @override\n  bool get wantKeepAlive => true;",
+     "        },\n      ),\n    ));\n  }\n\n  @override\n  bool get wantKeepAlive => true;",
+     "terminal: close kit theme"),
+    ("flutter/lib/models/terminal_mouse_handler.dart", "import 'package:xterm/xterm.dart';\n",
+     "import 'package:xterm/xterm.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit_extras.dart';\n", "terminal: kit terminal theme import"),
+    ("flutter/lib/models/terminal_mouse_handler.dart", "        backgroundOpacity: widget.backgroundOpacity,\n",
+     "        theme: kitTerminalTheme,\n        backgroundOpacity: widget.backgroundOpacity,\n",
+     "terminal: kit terminal colours"),
+    # Camera view
+    (CAMERA, "import '../widgets/tabbar_widget.dart';\n",
+     "import '../widgets/tabbar_widget.dart';\n" + KIT_IMPORTS, "camera: kit imports"),
+    (CAMERA, "    return Scaffold(\n      backgroundColor: Theme.of(context).colorScheme.background,\n"
+     "      body: Obx(() {\n",
+     "    return Theme(\n      data: kitThemeKeeping(context),\n      child: Scaffold(\n"
+     "      backgroundColor: Kit.ink,\n      body: Obx(() {\n",
+     "camera: kit theme"),
+    (CAMERA, "          return bodyWidget();\n        }\n      }),\n    );\n  }\n",
+     "          return bodyWidget();\n        }\n      }),\n    ));\n  }\n", "camera: close kit theme"),
+    (CAMERA, "color: kColorCanvas,", "color: Kit.ink,", "camera: kit canvas"),
+    (CAMERA, "thumbColor: Colors.grey,", "thumbColor: Kit.muted,", "camera: kit scrollbars"),
 ]
 
 COPIES = [

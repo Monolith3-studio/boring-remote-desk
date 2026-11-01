@@ -594,6 +594,27 @@ def shipped_files(c, suffixes):
                 yield p.relative_to(c.root).as_posix(), p.read_text(encoding="utf-8", errors="replace")
 
 
+# Colours an extras screen may not use once rebranded: upstream theme statics and raw colours.
+EXTRAS_OFF_KIT = re.compile(r"MyTheme\.(?!color\(context\))\w+|Colors\.(?!transparent\b)\w+|Color\(0x[0-9A-Fa-f]+\)|kColorCanvas")
+
+
+def simple_settings_checks(c):
+    """v1.7 ticket 09: extras in the kit, Mac Settings = one simple page + Advanced."""
+    pages = (rebrand.PORT_FWD, rebrand.TERMINAL, rebrand.CAMERA)
+    off = [f"{rel}: {h}" for rel in pages
+           for h in EXTRAS_OFF_KIT.findall(strip_tests_and_comments(c.read(rel)))]
+    off += [f"{rel}: no kit theme" for rel in pages if "data: kitThemeKeeping(context)," not in c.read(rel)]
+    if "theme: kitTerminalTheme," not in c.read("flutter/lib/models/terminal_mouse_handler.dart"):
+        off.append("terminal_mouse_handler.dart: no kit terminal theme")
+    c.fact("port forward, terminal and camera use kit tokens only", not off, "; ".join(off[:10]))
+    settings = c.read(rebrand.SETTINGS)
+    needles = ["simple_settings.dart", "if (isMacOS && !_boringAdvanced) {", "SimpleSettings(",
+               "setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),",
+               "label: 'All settings',", "child: const Text('Back to Settings'),"]
+    missing = [n for n in needles if n not in settings]
+    c.fact("Mac Settings is one simple page with Advanced behind it", not missing, "; ".join(missing))
+
+
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
     plist = c.read("flutter/macos/Runner/Info.plist")
@@ -788,6 +809,12 @@ def run_checks(root):
     c.fact("Session Toolbar uses kit tokens only",
            not re.search(r"\bColors\.|Color\(|MyTheme", bar))
     activate_link_checks(c)
+    simple_settings_checks(c)  # v1.7 t09
+    ft = rebrand.FILE_MGR  # v1.7 t08
+    ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
+                  "_boringSend(model.remoteController)", "_boringSend(model.localController)")
+    ft_missing = [n for n in ft_needles if n not in c.read(ft)]
+    c.fact("v1.7 File Transfer kit wired into the file manager", not ft_missing, "; ".join(ft_missing))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):
