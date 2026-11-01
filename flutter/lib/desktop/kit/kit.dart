@@ -13,6 +13,7 @@ class Kit {
   static const Color paper = Color(0xFFF0EFEB); // text
   static const Color muted = Color(0xFF9B999D); // secondary text
   static const Color coral = Color(0xFFFF5949); // accent, non-text only
+  static const Color ok = Color(0xFF0DBC79); // done / allowed: Setup's green checks
 
   // Boring Type is not ours to publish (public AGPL repo), so no font files are bundled.
   // These family names resolve only if installed; otherwise the system UI font is used.

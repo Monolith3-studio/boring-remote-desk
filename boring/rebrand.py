@@ -1120,6 +1120,91 @@ PATCHES += [
      "approval prompt in plain words"),
 ]
 
+# --- Three-screen Setup (v1.7 ticket 06) -------------------------------------------
+# desktop/kit/setup.dart is ours and bridge-free; these wire it in. First launch on Mac opens
+# Setup in place of Home until it is finished once (local option boring-setup-done); Settings
+# opens it again. Screen 1 writes the same name option Settings and LAN Discovery use.
+T06_SETUP_PAGE = (
+    "// boring-remote: v1.7 t06 Setup (name, see + control, Unattended Password).\n"
+    "Widget boringSetupPage({required VoidCallback onDone}) {\n"
+    f"  const nameKey = '{BORING_MAC_NAME_OPTION}';\n"
+    "  final name = bind.mainGetOptionSync(key: nameKey);\n"
+    "  final screens = SetupFlow.screenCount(SetupPlatform.mac);\n"
+    "  return Theme(\n"
+    "    data: Kit.theme(),\n"
+    "    child: Material(\n"
+    "      color: Kit.ink,\n"
+    "      child: SetupFlow(\n"
+    "        platform: SetupPlatform.mac,\n"
+    "        computerName: name.isNotEmpty\n"
+    "            ? Future.value(name)\n"
+    "            : Process.run('scutil', ['--get', 'ComputerName'])\n"
+    "                .then((r) => r.exitCode == 0 ? '${r.stdout}'.trim() : '')\n"
+    "                .catchError((_) => '')\n"
+    "                .then((n) => n.isNotEmpty ? n : Platform.localHostname.replaceAll('.local', '')),\n"
+    "        onName: (n) => bind.mainSetOption(key: nameKey, value: n),\n"
+    "        canSeeScreen: () => bind.mainIsCanScreenRecording(prompt: false),\n"
+    "        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n"
+    "        openPane: (url) {\n"
+    "          // Asking once puts Boring Remote in the pane's list; then open the pane itself.\n"
+    "          if (url == kScreenRecordingPane) bind.mainIsCanScreenRecording(prompt: true);\n"
+    "          if (url == kAccessibilityPane) bind.mainIsProcessTrusted(prompt: true);\n"
+    "          launchUrl(Uri.parse(url));\n"
+    "        },\n"
+    "        passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
+    "        setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
+    "        startStep: setupStartStep(bind.mainGetLocalOption(key: kSetupStepOption), screens),\n"
+    "        onStep: (i) => bind.mainSetLocalOption(key: kSetupStepOption, value: '$i'),\n"
+    "        onDone: () async {\n"
+    "          await bind.mainSetLocalOption(key: kSetupStepOption, value: '');\n"
+    "          await bind.mainSetLocalOption(key: kSetupDoneOption, value: 'Y');\n"
+    "          onDone();\n"
+    "        },\n"
+    "      ),\n"
+    "    ),\n"
+    "  );\n"
+    "}\n\n")
+T06_FIRST_LAUNCH = (
+    "    if (isMacOS && _boringSetup) {\n"
+    "      return _buildBlock(child: boringSetupPage(onDone: () => setState(() => _boringSetup = false)));\n"
+    "    }\n")
+T06_RUN_AGAIN = (
+    "          onRunSetup: () => Navigator.of(context).push(MaterialPageRoute(\n"
+    "            builder: (ctx) => Scaffold(\n"
+    "              backgroundColor: Kit.ink,\n"
+    "              appBar: AppBar(backgroundColor: Kit.ink, foregroundColor: Kit.paper),\n"
+    "              body: boringSetupPage(onDone: () => Navigator.of(ctx).pop()),\n"
+    "            ),\n"
+    "          )),\n")
+# The import, the first-launch branch and the Settings button land inside t01's and t09's own
+# patches (as t04 did), so a second rebrand still finds their text whole and stays a no-op.
+T06_FOLDS = {
+    (HOME, "Mac Home imports"): ("import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n",
+                                "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
+                                "import 'package:flutter_hbb/desktop/kit/setup.dart';\n"),
+    (HOME, "Mac Home replaces the RustDesk home on Mac"): (
+        "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n",
+        T06_FIRST_LAUNCH + "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n"),
+    (SETTINGS, "simple Settings wiring"): ("          advanced: [\n", T06_RUN_AGAIN + "          advanced: [\n"),
+}
+PATCHES[:] = [(rel, old, new.replace(*T06_FOLDS[rel, why]) if (rel, why) in T06_FOLDS else new, why)
+              for rel, old, new, why in PATCHES]
+assert all(any(r == rel and w == why and T06_FOLDS[rel, why][1] in new for r, _, new, w in PATCHES)
+           for rel, why in T06_FOLDS), "t01/t09 patch text moved under t06"
+PATCHES += [
+    (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
+     T06_SETUP_PAGE + "class _DesktopHomePageState extends State<DesktopHomePage>\n",
+     "Setup wiring"),
+    (HOME, "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n",
+     "  bool _boringSetup = false; // v1.7 t06: first launch shows Setup until it is finished\n\n"
+     "  // boring-remote: v1.7 Mac Home. Recents by name; the ID only in the outside-the-building sheet.\n",
+     "Setup state"),
+    (HOME, "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",
+     "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n"
+     "    if (isMacOS) _boringSetup = setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption));\n",
+     "Setup on first launch only"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

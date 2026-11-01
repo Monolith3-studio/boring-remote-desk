@@ -37,6 +37,9 @@ class SimpleSettings extends StatefulWidget {
   /// Advanced entries, in order (all settings, Trusted Controllers, tabs vs windows...).
   final List<SettingsLink> advanced;
 
+  /// Opens Setup again (v1.7 t06); null hides the button.
+  final VoidCallback? onRunSetup;
+
   const SimpleSettings({
     super.key,
     required this.macName,
@@ -48,6 +51,7 @@ class SimpleSettings extends StatefulWidget {
     required this.checkUpdates,
     required this.onCheckUpdates,
     this.advanced = const [],
+    this.onRunSetup,
   });
 
   @override
@@ -178,6 +182,13 @@ class _SimpleSettingsState extends State<SimpleSettings> {
           onChanged: widget.onCheckUpdates,
           contentPadding: EdgeInsets.zero,
         ),
+        if (widget.onRunSetup != null) ...[
+          const SizedBox(height: Kit.s3),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton(onPressed: widget.onRunSetup, child: const Text('Run Setup again')),
+          ),
+        ],
         if (widget.advanced.isNotEmpty) ...[
           const SizedBox(height: Kit.s5),
           Text('Advanced', style: t.bodySmall),

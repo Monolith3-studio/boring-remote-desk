@@ -15,6 +15,7 @@ SimpleSettings settings({
   bool checkUpdates = true,
   void Function(bool)? onCheckUpdates,
   List<SettingsLink> advanced = const [],
+  VoidCallback? onRunSetup,
 }) =>
     SimpleSettings(
       macName: macName,
@@ -26,6 +27,7 @@ SimpleSettings settings({
       checkUpdates: checkUpdates,
       onCheckUpdates: onCheckUpdates ?? (_) {},
       advanced: advanced,
+      onRunSetup: onRunSetup,
     );
 
 void main() {
@@ -124,5 +126,14 @@ void main() {
     await tester.tap(find.text('Trusted Controllers'));
     await tester.tap(find.text('All settings'));
     expect(opened, ['trusted', 'all']);
+  });
+
+  testWidgets('Setup can be opened again from Settings', (tester) async {
+    var opened = 0;
+    await tester.pumpWidget(host(settings(onRunSetup: () => opened++)));
+    await tester.tap(find.text('Run Setup again'));
+    expect(opened, 1);
+    await tester.pumpWidget(host(settings()));
+    expect(find.text('Run Setup again'), findsNothing);
   });
 }

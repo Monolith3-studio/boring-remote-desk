@@ -357,6 +357,14 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertIn("FAIL Mac Settings is one simple page with Advanced behind it", r.stdout)
 
+    # --- v1.7 t06: three-screen Setup ----------------------------------------------
+    def test_setup_unwired_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "if (isMacOS && _boringSetup) {", "if (false) {")
+        r = run(CHECK, self.root)
+        self.assertIn("FAIL Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)",
+                      r.stdout)
+
     # --- v1.7 t05: High Efficiency on a Local link between two Boring Remotes ----
     def test_high_efficiency_unwired_fails_check(self):
         self.rebrand()

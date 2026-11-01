@@ -654,6 +654,30 @@ def simple_settings_checks(c):
     c.fact("Mac Settings is one simple page with Advanced behind it", not missing, "; ".join(missing))
 
 
+SETUP_DART = "flutter/lib/desktop/kit/setup.dart"
+
+
+def setup_checks(c):
+    """v1.7 ticket 06: Setup on first launch (Mac), again from Settings, naming this Mac as Settings
+    and LAN Discovery do, and opening the exact System Settings panes."""
+    home, kit = c.read(rebrand.HOME), c.read(SETUP_DART)
+    hooks = [
+        (home, "if (isMacOS && _boringSetup) {"),
+        (home, "_boringSetup = setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption));"),
+        (home, "SetupFlow("),
+        (home, f"const nameKey = '{rebrand.BORING_MAC_NAME_OPTION}';"),
+        (home, "onName: (n) => bind.mainSetOption(key: nameKey, value: n),"),
+        (home, "setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),"),
+        (c.read(rebrand.SETTINGS), "onRunSetup: () =>"),
+        (kit, "?Privacy_ScreenCapture'"),
+        (kit, "?Privacy_Accessibility'"),
+        (kit, "SimpleSettings.strongEnough("),
+    ]
+    missing = [n for text, n in hooks if n not in text]
+    c.fact("Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)",
+           not missing, "; ".join(missing))
+
+
 TRUST_RS = "libs/base/src/trust.rs"
 TRUST_DART = "flutter/lib/desktop/kit/trust.dart"
 PASSWORDISH = re.compile(r"password|salt", re.I)
@@ -936,6 +960,7 @@ def run_checks(root):
     activate_link_checks(c)
     simple_settings_checks(c)  # v1.7 t09
     trust_checks(c, cfg)  # v1.7 t04
+    setup_checks(c)  # v1.7 t06
     high_efficiency_checks(c)  # v1.7 t05
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
