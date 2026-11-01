@@ -770,6 +770,11 @@ def run_checks(root):
     missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
     c.fact("update hooks landed in upstream files (ADR 0004)", not missing, "; ".join(missing))
     activate_link_checks(c)
+    ft = rebrand.FILE_MGR  # v1.7 t08
+    ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
+                  "_boringSend(model.remoteController)", "_boringSend(model.localController)")
+    ft_missing = [n for n in ft_needles if n not in c.read(ft)]
+    c.fact("v1.7 File Transfer kit wired into the file manager", not ft_missing, "; ".join(ft_missing))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):

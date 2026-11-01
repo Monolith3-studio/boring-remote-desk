@@ -605,6 +605,117 @@ PATCHES += [
      "Mac Home loads recents"),
 ]
 
+# --- File Transfer (v1.7 ticket 08) ----------------------------------------------
+# Two kit panes (This Mac / That Mac), rows drag across both ways, kit job list with
+# progress / done / error. desktop/kit/file_transfer.dart is ours and bridge-free; these
+# wire it to the unchanged engine (FileController.sendFiles, the Send button's path).
+FILE_MGR = "flutter/lib/desktop/pages/file_manager_page.dart"
+FILE_MGR_METHODS = (
+    "  // boring-remote: v1.7 File Transfer. A drop on one pane sends the other pane's selection.\n"
+    "  void _boringSend(FileController from) {\n"
+    "    if (!SelectedItems.valid(from.selectedItems.items)) return;\n"
+    "    from.sendFiles(from.selectedItems, from.getOtherSideDirectoryData());\n"
+    "    from.selectedItems.clear();\n"
+    "  }\n\n"
+    "  Widget boringTransferList() => Obx(() => TransferList(\n"
+    "        jobs: [\n"
+    "          for (final j in jobController.jobTable)\n"
+    "            if (j.type == JobType.transfer)\n"
+    "              TransferJob.fromEngine(\n"
+    "                  id: j.id,\n"
+    "                  path: j.jobName,\n"
+    "                  remoteToLocal: j.isRemoteToLocal,\n"
+    "                  state: j.state.name,\n"
+    "                  finished: j.finishedSize,\n"
+    "                  total: j.totalSize,\n"
+    "                  err: j.err),\n"
+    "        ],\n"
+    "        onCancel: (id) {\n"
+    "          jobController.jobTable.removeWhere((j) => j.id == id);\n"
+    "          jobController.cancelJob(id);\n"
+    "        },\n"
+    "        onResume: (id) => jobController.resumeJob(id),\n"
+    "        onRemove: (id) => jobController.jobTable.removeWhere((j) => j.id == id),\n"
+    "      ));\n\n")
+PATCHES += [
+    (FILE_MGR, "import 'package:flutter_hbb/models/file_model.dart';\n",
+     "import 'package:flutter_hbb/models/file_model.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/file_transfer.dart';\n",
+     "File Transfer kit imports"),
+    (FILE_MGR,
+     "          backgroundColor: Theme.of(context).scaffoldBackgroundColor,\n"
+     "          body: Row(\n"
+     "            children: [\n"
+     "              if (!isWeb)\n"
+     "                Flexible(\n"
+     "                    flex: 3,\n"
+     "                    child: dropArea(FileManagerView(\n"
+     "                        model.localController, _ffi, _mouseFocusScope))),\n"
+     "              Flexible(\n"
+     "                  flex: 3,\n"
+     "                  child: dropArea(FileManagerView(\n"
+     "                      model.remoteController, _ffi, _mouseFocusScope))),\n"
+     "              Flexible(flex: 2, child: statusList())\n"
+     "            ],\n"
+     "          ),\n",
+     "          backgroundColor: Kit.ink,\n"
+     "          body: Theme(\n"
+     "            data: Kit.theme().copyWith(cardColor: Kit.panel),\n"
+     "            child: Row(\n"
+     "              children: [\n"
+     "                if (!isWeb)\n"
+     "                  Flexible(\n"
+     "                      flex: 3,\n"
+     "                      child: TransferPane(\n"
+     "                          side: TransferSide.thisMac,\n"
+     "                          onDropFromOther: () => _boringSend(model.remoteController),\n"
+     "                          child: dropArea(FileManagerView(\n"
+     "                              model.localController, _ffi, _mouseFocusScope)))),\n"
+     "                Flexible(\n"
+     "                    flex: 3,\n"
+     "                    child: TransferPane(\n"
+     "                        side: TransferSide.thatMac,\n"
+     "                        onDropFromOther: () => _boringSend(model.localController),\n"
+     "                        child: dropArea(FileManagerView(\n"
+     "                            model.remoteController, _ffi, _mouseFocusScope)))),\n"
+     "                Flexible(flex: 2, child: boringTransferList())\n"
+     "              ],\n"
+     "            ),\n"
+     "          ),\n",
+     "File Transfer: kit panes and job list"),
+    (FILE_MGR, "  Widget dropArea(FileManagerView fileView) {\n",
+     FILE_MGR_METHODS + "  Widget dropArea(FileManagerView fileView) {\n",
+     "File Transfer: drop-to-send and job list wiring"),
+    (FILE_MGR,
+     "          return Padding(\n"
+     "            padding: EdgeInsets.symmetric(vertical: 1),\n"
+     "            child: Obx(() => Container(\n",
+     "          return TransferDraggable(\n"
+     "            side: isLocal ? TransferSide.thisMac : TransferSide.thatMac,\n"
+     "            label: selectedItems.items.contains(entry) && selectedItems.items.length > 1\n"
+     "                ? '${selectedItems.items.length} items'\n"
+     "                : entry.name,\n"
+     "            onDragStarted: () {\n"
+     "              if (selectedItems.items.contains(entry)) return;\n"
+     "              selectedItems.clear();\n"
+     "              selectedItems.add(entry);\n"
+     "            },\n"
+     "            child: Padding(\n"
+     "            padding: EdgeInsets.symmetric(vertical: 1),\n"
+     "            child: Obx(() => Container(\n",
+     "File Transfer: rows drag to the other pane"),
+    (FILE_MGR, "                ))),\n          );\n        });\n\n        return Column(\n",
+     "                ))),\n          ));\n        });\n\n        return Column(\n",
+     "File Transfer: close the row drag wrapper"),
+    (FILE_MGR,
+     "                  color: selectedItems.items.contains(entry)\n"
+     "                      ? MyTheme.button\n",
+     "                  color: selectedItems.items.contains(entry)\n"
+     "                      ? Kit.line\n",
+     "File Transfer: selected row in kit grey"),
+]
+
 # --- Activate link (ticket 14) ----------------------------------------------------
 # Rides upstream's URL scheme (already renamed to boringremote above). src/activate_link.rs
 # and activate_link.dart are ours; these wire them in and stop upstream logging incoming
