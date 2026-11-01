@@ -39,6 +39,19 @@ pub fn drop_stale(peers: &mut Vec<DiscoveryPeer>) {
     peers.retain(|p| p.online);
 }
 
+/// The name this Mac was given in Setup / Settings (v1.7 t09 writes it).
+pub const DEVICE_NAME_OPTION: &str = "boring-device-name";
+
+/// What the LAN Discovery pong calls this Mac: the chosen name, else the hostname.
+pub fn advertised_name(chosen: &str, hostname: String) -> String {
+    let chosen = chosen.trim();
+    if chosen.is_empty() {
+        hostname
+    } else {
+        chosen.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +78,12 @@ mod tests {
         let mut peers = vec![peer("a", true, &["10.0.0.2"]), peer("b", false, &["10.0.0.3"])];
         drop_stale(&mut peers);
         assert_eq!(peers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["a"]);
+    }
+
+    #[test]
+    fn pong_carries_the_chosen_mac_name_else_the_hostname() {
+        assert_eq!(advertised_name(" Edit Bay 2 ", "edit-bay.local".to_owned()), "Edit Bay 2");
+        assert_eq!(advertised_name("  ", "edit-bay.local".to_owned()), "edit-bay.local");
     }
 
     fn ip(s: &str) -> IpAddr {

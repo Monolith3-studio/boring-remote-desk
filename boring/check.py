@@ -797,6 +797,8 @@ def run_checks(root):
         (rebrand.HOME, "if (isMacOS) return _buildBlock(child: buildBoringHome(context));"),  # v1.7 t01
         (rebrand.HOME, "MacHome("), (rebrand.HOME, "Kit.theme()"),
         (rebrand.HOME, "lan: lanMacs.macs,"), (rebrand.HOME, "discover: () => bind.mainDiscover(),"),  # v1.7 t02
+        ("libs/base/src/lan.rs", f'DEVICE_NAME_OPTION: &str = "{rebrand.BORING_MAC_NAME_OPTION}";'),
+        ("src/lan.rs", "base::lan::advertised_name("),  # LAN pong names this Mac as Settings does
         (rebrand.T07_TOOLBAR, "..add(buildBoringSessionToolbar(context, more));"),  # v1.7 t07
         (rebrand.T07_TOOLBAR, "SessionToolbar("),
         ("src/platform/privileges_scripts/install-update.sh", f'SERVICE_LABEL="{rebrand.HOSTD_ID}"'),        ("src/lib.rs", "mod activate_link;"),
