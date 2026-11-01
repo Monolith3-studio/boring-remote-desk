@@ -559,6 +559,11 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.SETTINGS, "          openUrl: (u) => launchUrlString(u), // Download Boring Remote (ticket 15)\n", "")
         self.assert_check_fails("Settings: Download Boring Remote and set up another computer (ticket 15)")
 
+    def test_transfer_list_dropping_deletes_again_fails_check(self):  # v1.7 t08 follow-up
+        self.rebrand()
+        self.edit(rebrand.FILE_MGR, "            if (j.type != JobType.none)\n", "            if (j.type == JobType.transfer)\n")
+        self.assert_check_fails("File Transfer lists delete jobs too (v1.7 t08 follow-up)")
+
 
 if __name__ == "__main__":
     unittest.main()

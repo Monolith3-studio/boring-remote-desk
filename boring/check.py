@@ -866,6 +866,14 @@ def home_checks(c):
         "Clipboard.setData(const ClipboardData(text: kDownloadUrl))") if n not in kit]
     c.fact("Settings: Download Boring Remote and set up another computer (ticket 15)", not why, "; ".join(why))
 
+    # Ticket 08 follow-up: the kit job list shows delete jobs as well as transfers.
+    fm = c.read(rebrand.FILE_MGR)
+    i = fm.find("  Widget boringTransferList() => Obx(() => TransferList(")
+    jobs = fm[i:fm.find("      ));\n", i)] if i >= 0 else ""
+    need = ("            if (j.type != JobType.none)\n", "                  delete: j.type != JobType.transfer),")
+    c.fact("File Transfer lists delete jobs too (v1.7 t08 follow-up)", all(n in jobs for n in need),
+           "boringTransferList drops delete jobs")
+
 
 def activate_link_checks(c):
     """Ticket 14: boringremote://activate?key= rides upstream's URL scheme, renamed; nothing else new."""
