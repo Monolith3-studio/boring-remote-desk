@@ -35,9 +35,9 @@ class Kit {
   static const Color coral = Color(0xFFFF5949); // accent, non-text only
   static const Color ok = Color(0xFF0DBC79); // done / allowed: Setup's green checks
 
-  // Boring Type is not ours to publish (public AGPL repo), so no font files are bundled.
-  // These family names resolve only if installed; otherwise the system UI font is used.
-  // CI could fetch the binaries into flutter/assets from a private store and declare them in pubspec.
+  // Boring Type is not ours to publish (public AGPL repo), so no font files are committed. CI's
+  // boring/fonts.py bundles them under these family names when the BORING_TYPE_URL secret is set;
+  // without it (and locally) the system UI font is used.
   static const String fontUi = 'Neue Corp';
   static const String fontText = 'Söhne';
   static const List<String> fontFallback = [fontText, '.AppleSystemUIFont', 'Helvetica Neue', 'Segoe UI'];
