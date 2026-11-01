@@ -548,6 +548,12 @@ class RebrandSeam(unittest.TestCase):
         self.edit("flutter/lib/desktop/kit/tailscale.dart", "(b[1] & 0xc0) == 64", "(b[1] & 0x80) == 0")
         self.assert_check_fails(self.HOME_OUTSIDE)
 
+    def test_quality_pick_keeping_high_efficiency_fails_check(self):  # v1.7 t05 follow-up
+        self.rebrand()
+        self.edit(rebrand.T07_TOOLBAR,
+                  "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));\n", "")
+        self.assert_check_fails("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -814,6 +814,9 @@ def high_efficiency_checks(c):
            not missing, "; ".join(missing))
 
 
+T07_KIT = "flutter/lib/desktop/kit/session_toolbar.dart"
+
+
 def tailnet_dart():
     """kit/tailscale.dart's tests for rebrand.TAILNET's two ranges, derived from the CIDRs."""
     import ipaddress
@@ -836,6 +839,19 @@ def home_checks(c):
     why += [f"buildBoringHome still reads the ID ({n})" for n in ("serverId", "myId") if n in home]
     why += [f"tailscale.dart range is not rebrand.TAILNET: {e}" for e in tailnet_dart() if e not in kit]
     c.fact("Home's outside-the-building sheet gives this computer's Tailscale address, never the ID (ADR 0004)",
+           not why, "; ".join(why))
+
+    # Ticket 05 follow-up: the Quality pick names High Efficiency while it is on, and a hand pick
+    # drops the Link Badge back to plain Local.
+    bar = fn_body(c.read(rebrand.T07_TOOLBAR), "  Widget buildBoringSessionToolbar(BuildContext context, List<Widget> more) {") or ""
+    st = re.search(r'pub const STREAM_TYPE: &str = "([^"]+)";', c.read("libs/base/src/high_efficiency.rs"))
+    pick = "await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: v);\n" \
+           "            // v1.7 review: a hand pick replaces High Efficiency, so the badge goes back to Local.\n" \
+           "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));"
+    why = [] if pick in bar else ["toolbar's quality pick does not drop High Efficiency"]
+    if not st or f"streamType == '{st.group(1)}' ? 'Local' : streamType;" not in c.read(T07_KIT):
+        why.append("session_toolbar.dart does not map Rust's High Efficiency stream type back to Local")
+    c.fact("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)",
            not why, "; ".join(why))
 
 

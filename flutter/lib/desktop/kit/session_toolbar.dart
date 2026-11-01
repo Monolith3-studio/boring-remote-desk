@@ -15,6 +15,11 @@ LinkState linkStateFor(String streamType) => switch (streamType) {
       _ => LinkState.unknown,
     };
 
+/// A quality picked by hand replaces High Efficiency for the rest of the session, so the
+/// link goes back to plain "Local" (v1.7 review). Any other stream type stays as Rust said.
+String streamTypeAfterQualityPick(String streamType) =>
+    streamType == 'LocalHighEfficiency' ? 'Local' : streamType;
+
 /// Link Badge: the small session label naming Direct Link vs Relay. Shows nothing while unknown.
 class LinkBadge extends StatelessWidget {
   final LinkState link;
@@ -82,12 +87,17 @@ class SessionToolbar extends StatefulWidget {
 }
 
 class _SessionToolbarState extends State<SessionToolbar> {
+  /// The Quality pick's own entry while High Efficiency is on; picking it changes nothing.
+  static const _highEfficiency = 'boring-high-efficiency';
   bool _open = false;
 
   @override
   Widget build(BuildContext context) {
     final w = widget;
-    final qualityLabel = w.qualities[w.quality] ?? w.qualities.values.first;
+    final he = w.link == LinkState.localHighEfficiency;
+    final qualities = he ? {_highEfficiency: 'High Efficiency', ...w.qualities} : w.qualities;
+    final quality = he ? _highEfficiency : w.quality;
+    final qualityLabel = qualities[quality] ?? qualities.values.first;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: Kit.s2, vertical: Kit.s1),
       decoration: BoxDecoration(
@@ -110,9 +120,11 @@ class _SessionToolbarState extends State<SessionToolbar> {
         _Pick<String>(
           label: 'Quality: $qualityLabel',
           icon: Icons.tune,
-          options: w.qualities,
-          current: w.quality,
-          onPick: w.onQuality,
+          options: qualities,
+          current: quality,
+          onPick: (k) {
+            if (k != _highEfficiency) w.onQuality(k);
+          },
         ),
         _Action('Disconnect', Icons.close, w.onDisconnect),
         if (w.more.isNotEmpty)

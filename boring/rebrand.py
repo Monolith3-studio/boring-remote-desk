@@ -762,6 +762,8 @@ T07_METHOD = (
     "          },\n"
     "          onQuality: (v) async {\n"
     "            await bind.sessionSetImageQuality(sessionId: ffi.sessionId, value: v);\n"
+    "            // v1.7 review: a hand pick replaces High Efficiency, so the badge goes back to Local.\n"
+    "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));\n"
     "            if (mounted) setState(() {});\n"
     "          },\n"
     "          onDisconnect: () async {\n"
