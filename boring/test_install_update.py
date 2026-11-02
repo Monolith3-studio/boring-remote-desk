@@ -307,7 +307,7 @@ class InstallUpdate(unittest.TestCase):
 
     def test_update_over_a_16x_install_moves_it_first(self):
         old = self.old_install("1.6.4")
-        r = self.run_script(self.package("1.7.0"), GOOD_SIG, "1.7.0")
+        r = self.run_script(self.package("1.7.0"), GOOD_SIG, "1.7.0", wait=30)  # look before any rollback
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(old.exists())
         self.assertEqual(self.marker(self.app), "new")
