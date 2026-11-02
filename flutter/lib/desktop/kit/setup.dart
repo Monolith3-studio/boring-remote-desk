@@ -11,9 +11,11 @@ const kSetupDoneOption = 'boring-setup-done';
 /// Local option holding the screen Setup was on, so a "Quit & Reopen" from macOS comes back to it.
 const kSetupStepOption = 'boring-setup-step';
 
-/// System Settings panes Setup opens (macOS 13+ resolves these old-style ids too).
+/// System Settings panes Setup and Settings' Access rows open (macOS 13+ resolves these old-style
+/// ids; checked on macOS 26.6: "Screen & System Audio Recording", "Accessibility", "Input Monitoring").
 const kScreenRecordingPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture';
 const kAccessibilityPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility';
+const kInputMonitoringPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent';
 
 /// The inbound app rule the MSI installs (res/msi CustomActions, named for people since v1.7 t17):
 /// any port, every network type, so it covers Direct Link (TCP 21118) and LAN Discovery (UDP 21119). v1.7 t12.

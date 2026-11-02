@@ -11,8 +11,11 @@ SimpleSettings settings({
   Future<void> Function(String)? onRename,
   bool passwordSet = false,
   Future<bool> Function(String)? setPassword,
-  bool startAtLogin = false,
-  void Function(bool)? onStartAtLogin,
+  bool remoteAccess = false,
+  void Function(bool)? onRemoteAccess,
+  bool? openAtLogin,
+  void Function(bool)? onOpenAtLogin,
+  Widget? access,
   bool checkUpdates = true,
   void Function(bool)? onCheckUpdates,
   List<SettingsLink> advanced = const [],
@@ -24,8 +27,11 @@ SimpleSettings settings({
       onRename: onRename ?? (_) async {},
       passwordSet: passwordSet,
       setPassword: setPassword ?? (_) async => true,
-      startAtLogin: startAtLogin,
-      onStartAtLogin: onStartAtLogin ?? (_) {},
+      remoteAccess: remoteAccess,
+      onRemoteAccess: onRemoteAccess ?? (_) {},
+      openAtLogin: openAtLogin,
+      onOpenAtLogin: onOpenAtLogin ?? (_) {},
+      access: access,
       checkUpdates: checkUpdates,
       onCheckUpdates: onCheckUpdates ?? (_) {},
       advanced: advanced,
@@ -111,23 +117,43 @@ void main() {
     expect(find.text("Couldn't save that password. Try again."), findsOneWidget);
   });
 
-  testWidgets('start at login and updates are switches', (tester) async {
-    final login = <bool>[], updates = <bool>[];
+  testWidgets('remote access, open at login and updates are switches', (tester) async {
+    final access = <bool>[], login = <bool>[], updates = <bool>[];
     await tester.pumpWidget(host(settings(
-        startAtLogin: false, onStartAtLogin: login.add, checkUpdates: true, onCheckUpdates: updates.add)));
-    await tester.tap(find.widgetWithText(SwitchListTile, 'Start at login'));
+        remoteAccess: false, onRemoteAccess: access.add, openAtLogin: false, onOpenAtLogin: login.add,
+        checkUpdates: true, onCheckUpdates: updates.add)));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other Macs in'));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Open Boring Remote at login'));
     await tester.tap(find.widgetWithText(SwitchListTile, 'Check for updates'));
+    expect(access, [true]);
     expect(login, [true]);
     expect(updates, [false]);
   });
 
-  testWidgets('turning Start at login off says what it stops first, and only then turns it off',
+  testWidgets('open at login on and off never touches remote access (t17)', (tester) async {
+    final access = <bool>[], login = <bool>[];
+    await tester.pumpWidget(host(settings(
+        remoteAccess: true, onRemoteAccess: access.add, openAtLogin: true, onOpenAtLogin: login.add)));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Open Boring Remote at login'));
+    await tester.pump();
+    expect(login, [false]);
+    expect(access, isEmpty);
+    expect(find.text('Turn off'), findsNothing);
+  });
+
+  testWidgets('no open-at-login row when the page passes none; the Access slot shows', (tester) async {
+    await tester.pumpWidget(host(settings(access: const Text('ACCESS ROWS'))));
+    expect(find.widgetWithText(SwitchListTile, 'Open Boring Remote at login'), findsNothing);
+    expect(find.text('ACCESS ROWS'), findsOneWidget);
+  });
+
+  testWidgets('turning remote access off says what it stops first, and only then turns it off',
       (tester) async {
     final login = <bool>[];
     const why = "Turn this off and your other Macs can't get into this one, starting now. "
         'Turn it back on to let them in. Your Mac may ask you to confirm, and Boring Remote may restart.';
-    await tester.pumpWidget(host(settings(startAtLogin: true, onStartAtLogin: login.add)));
-    await tester.tap(find.widgetWithText(SwitchListTile, 'Start at login'));
+    await tester.pumpWidget(host(settings(remoteAccess: true, onRemoteAccess: login.add)));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other Macs in'));
     await tester.pump();
     expect(find.text(why), findsOneWidget);
     expect(login, isEmpty);
@@ -135,7 +161,7 @@ void main() {
     await tester.pump();
     expect(find.text(why), findsNothing);
     expect(login, isEmpty);
-    await tester.tap(find.widgetWithText(SwitchListTile, 'Start at login'));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other Macs in'));
     await tester.pump();
     await tester.tap(find.text('Turn off'));
     await tester.pump();

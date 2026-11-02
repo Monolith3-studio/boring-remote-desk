@@ -986,10 +986,28 @@ def bundle_checks(c):
     wd = f"{apps}/Contents/MacOS/"
     bad = [n for n, ok in [
         (f"agent runs {agent.get('ProgramArguments')}", agent.get("ProgramArguments") == [f"{wd}{APP}", "--server"]),
+        (f"agent KeepAlive is {agent.get('KeepAlive')}", agent.get("KeepAlive") is True),
         (f"daemon runs {daemon.get('ProgramArguments')}", daemon.get("ProgramArguments") == [f"{wd}service"]),
         ("working directories", agent.get("WorkingDirectory") == wd and daemon.get("WorkingDirectory") == wd),
     ] if not ok]
     c.fact(f"launchd plists run {bundle} directly, no sh -c (t17)", not bad, "; ".join(bad))
+    home, settings, access = c.read(rebrand.HOME), c.read(rebrand.SETTINGS), c.read("flutter/lib/desktop/kit/access.dart")
+    bad = [n for n, ok in [
+        ("Home's not-ready line", "AccessSummary(checks: boringAccessChecks())," in home),
+        ("Settings' Access section", "access: AccessSection(checks: boringAccessChecks())," in settings),
+        ("remote access is its own switch", "remoteAccess: bind.mainIsInstalledDaemon(prompt: false) &&" in settings
+         and "await mainSetBoolOption(kOptionStopService, !on);" in settings
+         and settings.count("kOptionStopService") == 2 and "openAtLoginPlist(" in settings),
+        ("checks the --server agent, its port and all three panes",
+         all(n in home for n in ("'gui/${await uid()}/$kAgentLabel'", "Socket.connect('127.0.0.1', kDirectLinkPort",
+                                 "pane(kScreenRecordingPane)", "pane(kAccessibilityPane)", "pane(kInputMonitoringPane)",
+                                 "bind.mainIsCanScreenRecording(prompt: true)"))),
+        ("pane ids", all(f"?{p}'" in c.read(SETUP_DART) for p in ("Privacy_ScreenCapture", "Privacy_Accessibility",
+                                                                   "Privacy_ListenEvent"))
+         and f"kAgentLabel = '{AGENT}'" in access),
+    ] if not ok]
+    c.fact("Access: Settings and Home check what serves sessions; remote access is its own switch (t17)",
+           not bad, "; ".join(bad))
 
     mac, ipc, auth = c.read("src/platform/macos.rs"), c.read("src/ipc.rs"), c.read("src/ipc/auth.rs")
     move, script = c.read("libs/base/src/bundle_move.rs"), c.read(INSTALL_SCRIPT)

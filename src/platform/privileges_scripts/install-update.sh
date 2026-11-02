@@ -67,9 +67,11 @@ newer() {
 bundle_version() { plutil -extract CFBundleShortVersionString raw -o - "$1/Contents/Info.plist"; }
 user_session() { [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != root ]; }
 
-# 1.6.x's bundle is still there, or a plist still runs it.
+# 1.6.x's bundle is still there, a plist still runs it, or the agent plist is one that leaves
+# --server down after a clean exit (KeepAlive SuccessfulExit=false, before t17).
 needs_move() {
-  [ -d "$OLD" ] || grep -qsF "/Applications/$OLD_BUNDLE/" "$DAEMON_PLIST" "$AGENT_PLIST"
+  [ -d "$OLD" ] || grep -qsF "/Applications/$OLD_BUNDLE/" "$DAEMON_PLIST" "$AGENT_PLIST" \
+    || grep -qsF SuccessfulExit "$AGENT_PLIST"
 }
 
 # The per-user agent (--server, the screen capturer) lives in the user's GUI domain, not root's.
@@ -83,6 +85,7 @@ agent_out() {
 agent_in() {
   launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT_PLIST" 2>/dev/null \
     || launchctl kickstart -k "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
+  launchctl kickstart "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true  # loaded but not started
 }
 
 # Keep the newer bundle (the new path wins a tie) at the new path, then point both jobs at it.

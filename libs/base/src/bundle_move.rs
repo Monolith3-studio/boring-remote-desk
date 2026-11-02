@@ -11,6 +11,7 @@ use std::path::Path;
 pub const BUNDLE: &str = "/Applications/Boring Remote.app";
 /// 1.6.x's bundle.
 pub const OLD_BUNDLE: &str = "/Applications/BoringRemote.app";
+pub const AGENT_LABEL: &str = "io.boringlabs.remote.agent";
 /// The LaunchDaemon (hostd) and LaunchAgent plists `service --write-plists` writes.
 pub const PLISTS: [&str; 2] = [
     "/Library/LaunchDaemons/io.boringlabs.remote.hostd.plist",
@@ -21,13 +22,15 @@ fn under(root: &Path, abs: &str) -> std::path::PathBuf {
     root.join(abs.trim_start_matches('/'))
 }
 
-/// True while `root` ("/" for real) still has 1.6.x's bundle, or a plist that runs it.
+/// True while `root` ("/" for real) still has 1.6.x's bundle, a plist that runs it, or an agent
+/// plist that leaves `--server` down after a clean exit (KeepAlive SuccessfulExit=false, before t17).
 pub fn needs_move(root: &Path) -> bool {
     let old = format!("{OLD_BUNDLE}/");
     under(root, OLD_BUNDLE).exists()
         || PLISTS
             .iter()
             .any(|p| std::fs::read_to_string(under(root, p)).is_ok_and(|t| t.contains(&old)))
+        || std::fs::read_to_string(under(root, PLISTS[1])).is_ok_and(|t| t.contains("SuccessfulExit"))
 }
 
 /// Some(true) when `exe` runs from the old bundle, Some(false) from the new one, None when
@@ -70,7 +73,11 @@ fn run(support_dir: &Path, quit: fn()) {
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    if pending.exists() || !needs_move(Path::new("/")) {
+    if pending.exists() {
+        return;
+    }
+    if !needs_move(Path::new("/")) {
+        start_agent();
         return;
     }
     let Some(script) = exe.parent().and_then(|m| m.parent()).map(|c| c.join("Resources/boring-install-update.sh"))
@@ -86,6 +93,24 @@ fn run(support_dir: &Path, quit: fn()) {
         }
         Ok(out) => log::warn!("bundle move: {}", String::from_utf8_lossy(&out.stderr).trim()),
         Err(e) => log::warn!("bundle move: {e}"),
+    }
+}
+
+/// The agent (`--server`) serves sessions. Start it when remote access is on and it isn't up
+/// (a plist written before t17 left it down after macOS's "Quit & Reopen").
+#[cfg(target_os = "macos")]
+fn start_agent() {
+    if !Path::new(PLISTS[1]).exists() || hbb_common::config::Config::get_option("stop-service") == "Y" {
+        return;
+    }
+    let target = format!("gui/{}/{AGENT_LABEL}", unsafe { libc::getuid() });
+    let up = std::process::Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| l == "\tstate = running"));
+    if !up {
+        log::info!("starting {target}");
+        let _ = std::process::Command::new("launchctl").args(["kickstart", &target]).status();
     }
 }
 
@@ -111,6 +136,16 @@ mod tests {
         fs::remove_dir_all(under(&r, OLD_BUNDLE)).unwrap();
         // 1.6.x's daemon ran `/bin/sh -c /Applications/BoringRemote.app/Contents/MacOS/service`
         fs::write(under(&r, PLISTS[0]), "<string>/Applications/BoringRemote.app/Contents/MacOS/service</string>").unwrap();
+        assert!(needs_move(&r));
+    }
+
+    #[test]
+    fn agent_plist_that_stays_down_after_a_clean_exit_needs_a_rewrite() {
+        let r = root();
+        fs::create_dir_all(under(&r, BUNDLE)).unwrap();
+        fs::write(under(&r, PLISTS[0]), "<string>/Applications/Boring Remote.app/Contents/MacOS/service</string>").unwrap();
+        // 1.6.x / first 1.7 builds: KeepAlive {SuccessfulExit=false}, so "Quit & Reopen" left --server down
+        fs::write(under(&r, PLISTS[1]), "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>").unwrap();
         assert!(needs_move(&r));
     }
 

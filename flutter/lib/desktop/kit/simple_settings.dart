@@ -13,8 +13,9 @@ class SettingsLink {
   const SettingsLink({required this.label, required this.onTap});
 }
 
-/// Settings (v1.7): one page. This Mac's name, Unattended Password, start at login, updates;
-/// everything else sits behind Advanced. Bridge-free; the settings page passes data and callbacks.
+/// Settings (v1.7): one page. This Mac's name, Unattended Password, remote access, open at login,
+/// updates, Access (t17); everything else sits behind Advanced. Bridge-free; the settings page
+/// passes data and callbacks.
 class SimpleSettings extends StatefulWidget {
   static const nameKey = Key('simple-settings-name');
   static const passwordKey = Key('simple-settings-password');
@@ -32,8 +33,16 @@ class SimpleSettings extends StatefulWidget {
   final bool passwordSet;
   final Future<bool> Function(String password) setPassword;
 
-  final bool startAtLogin;
-  final void Function(bool on) onStartAtLogin;
+  /// Other computers can get in: the service runs (v1.7 t17: its own switch, never tied to login).
+  final bool remoteAccess;
+  final void Function(bool on) onRemoteAccess;
+
+  /// Opens the window at login (Mac); null hides the row. Never touches [remoteAccess].
+  final bool? openAtLogin;
+  final void Function(bool on)? onOpenAtLogin;
+
+  /// The Access rows (kit/access.dart); null hides them.
+  final Widget? access;
 
   final bool checkUpdates;
   final void Function(bool on) onCheckUpdates;
@@ -53,8 +62,11 @@ class SimpleSettings extends StatefulWidget {
     required this.onRename,
     required this.passwordSet,
     required this.setPassword,
-    required this.startAtLogin,
-    required this.onStartAtLogin,
+    required this.remoteAccess,
+    required this.onRemoteAccess,
+    this.openAtLogin,
+    this.onOpenAtLogin,
+    this.access,
     required this.checkUpdates,
     required this.onCheckUpdates,
     this.advanced = const [],
@@ -72,13 +84,15 @@ class _SimpleSettingsState extends State<SimpleSettings> {
   bool _editingPassword = false;
   bool? _savedPassword; // set once a save here succeeds, until the page passes a new passwordSet
   String? _passwordError;
-  bool _confirmStop = false; // Start at login off: say what it stops before it does
+  bool _confirmStop = false; // remote access off: say what it stops before it does
+  bool? _openAtLogin; // what this page last set, until the page passes a new value
   bool _linkCopied = false;
 
   @override
   void didUpdateWidget(SimpleSettings old) {
     super.didUpdateWidget(old);
     if (old.passwordSet != widget.passwordSet) _savedPassword = null;
+    if (old.openAtLogin != widget.openAtLogin) _openAtLogin = null;
   }
 
   @override
@@ -210,16 +224,14 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         _passwordSection(t),
         const SizedBox(height: Kit.s5),
         SwitchListTile(
-          title: const Text('Start at login'),
-          subtitle: Text('Keeps this ${KitWords.one} open to your other ${KitWords.many}, even after a restart.',
-              style: t.bodySmall),
-          value: widget.startAtLogin && !_confirmStop,
-          onChanged: (on) => on ? widget.onStartAtLogin(true) : setState(() => _confirmStop = true),
+          title: Text('Let your other ${KitWords.many} in'),
+          subtitle: Text('Keeps this ${KitWords.one} open to them, even after a restart.', style: t.bodySmall),
+          value: widget.remoteAccess && !_confirmStop,
+          onChanged: (on) => on ? widget.onRemoteAccess(true) : setState(() => _confirmStop = true),
           contentPadding: EdgeInsets.zero,
         ),
         if (_confirmStop) ...[
-          // Off stops the service now, not just at the next login: there is no way to drop only the
-          // login item (v1.7 review), so the buyer reads exactly that before it happens.
+          // Off stops the service now, so the buyer reads exactly that before it happens.
           Text("Turn this off and your other ${KitWords.many} can't get into this one, starting now. "
               'Turn it back on to let them in. Your ${KitWords.one} may ask you to confirm, and Boring Remote '
               'may restart.'),
@@ -228,7 +240,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             OutlinedButton(
               onPressed: () {
                 setState(() => _confirmStop = false);
-                widget.onStartAtLogin(false);
+                widget.onRemoteAccess(false);
               },
               child: const Text('Turn off'),
             ),
@@ -237,6 +249,18 @@ class _SimpleSettingsState extends State<SimpleSettings> {
           ]),
           const SizedBox(height: Kit.s3),
         ],
+        if (widget.openAtLogin != null)
+          SwitchListTile(
+            title: const Text('Open Boring Remote at login'),
+            subtitle: Text('Opens this window when you log in. Your other ${KitWords.many} can get in either way.',
+                style: t.bodySmall),
+            value: _openAtLogin ?? widget.openAtLogin!,
+            onChanged: (on) {
+              setState(() => _openAtLogin = on);
+              widget.onOpenAtLogin?.call(on);
+            },
+            contentPadding: EdgeInsets.zero,
+          ),
         SwitchListTile(
           title: const Text('Check for updates'),
           value: widget.checkUpdates,
@@ -249,6 +273,10 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             alignment: Alignment.centerLeft,
             child: OutlinedButton(onPressed: widget.onRunSetup, child: const Text('Run Setup again')),
           ),
+        ],
+        if (widget.access != null) ...[
+          const SizedBox(height: Kit.s6),
+          widget.access!,
         ],
         const SizedBox(height: Kit.s6),
         _anotherSection(t),

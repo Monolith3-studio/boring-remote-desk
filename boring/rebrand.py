@@ -175,6 +175,11 @@ PATCHES = [
         # t17: the app file is "Boring Remote.app"; the exe in it keeps the internal name
         ("agent.plist", "/Applications/RustDesk.app/", f"/Applications/{MAC_BUNDLE}/", "agent runs Boring Remote.app"),
         ("agent.plist", "Contents/MacOS/RustDesk</string>", f"Contents/MacOS/{APP_NAME}</string>", "agent exe"),
+        # t17: --server comes back after any exit; with SuccessfulExit=false, macOS's "Quit & Reopen"
+        # (after granting Screen Recording) left it down for good
+        ("agent.plist", "        <key>KeepAlive</key>\n        <dict>\n            <key>SuccessfulExit</key>\n"
+         "            <false />\n            <key>AfterInitialDemand</key>\n            <false />\n        </dict>\n",
+         "        <key>KeepAlive</key>\n        <true/>\n", "agent always comes back"),
         ("daemon.plist", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("daemon.plist", "<string>com.carriez.rustdesk</string>", f"<string>{AGENT_ID}</string>", "daemon bundle id"),
         # t17: run the service directly; through `sh -c` the space in the path splits the command
@@ -916,6 +921,7 @@ MAC_HOME_METHOD = (
     "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
     "            notices: [\n"
+    "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n"
     + NOTICE_BANNER +
     "            ],\n"
     "          ),\n"
@@ -1274,15 +1280,28 @@ SIMPLE_SETTINGS_METHOD = (
     "          onRename: (n) => bind.mainSetOption(key: nameKey, value: n),\n"
     "          passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
     "          setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
-    "          // Start at login = the LaunchAgent is installed and the service isn't stopped.\n"
-    "          // Off stops the service (it stays off across restarts until turned back on).\n"
-    "          startAtLogin: bind.mainIsInstalledDaemon(prompt: false) &&\n"
+    "          // Remote access = the service is installed and not stopped. Off stops it (it stays off\n"
+    "          // across restarts until turned back on). v1.7 t17: its own switch, never tied to login.\n"
+    "          remoteAccess: bind.mainIsInstalledDaemon(prompt: false) &&\n"
     "              !mainGetBoolOptionSync(kOptionStopService),\n"
-    "          onStartAtLogin: (on) async {\n"
+    "          onRemoteAccess: (on) async {\n"
     "            if (on) bind.mainIsInstalledDaemon(prompt: true);\n"
     "            await mainSetBoolOption(kOptionStopService, !on);\n"
     "            setState(() {});\n"
     "          },\n"
+    "          // Open at login (Mac): the user's own LaunchAgent opens the window; remote access never depends on it.\n"
+    "          openAtLogin: isMacOS\n"
+    "              ? File(openAtLoginPath(Platform.environment['HOME'] ?? '')).existsSync()\n"
+    "              : null,\n"
+    "          onOpenAtLogin: (on) {\n"
+    "            final f = File(openAtLoginPath(Platform.environment['HOME'] ?? ''));\n"
+    "            try {\n"
+    f"              on ? (f..createSync(recursive: true)).writeAsStringSync(openAtLoginPlist('{AGENT_ID}')) : f.deleteSync();\n"
+    "            } catch (e) {\n"
+    "              debugPrint('Settings: open at login: $e');\n"
+    "            }\n"
+    "          },\n"
+    "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n"
     "          checkUpdates: mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
     "          onCheckUpdates: (on) async {\n"
     "            await mainSetLocalBoolOption(kBoringUpdateCheckOption, on);\n"
@@ -1955,6 +1974,101 @@ PATCHES += [
      LOOK_INSTALL_METHOD + "  @override\n  Widget build(BuildContext context) {\n"
      f"    if {LOOK_GATE} return boringInstallScreen();\n    final double em = 13;\n",
      "install screen in the kit"),
+]
+
+# --- v1.7 t17 follow-up: Access (Settings) and "not ready" (Home) --------------------------
+# kit/access.dart is ours and bridge-free; this is the one place its checks meet the bridge.
+# Each check is something that has to hold for the process that serves sessions (--server)
+# before another computer can connect. Fix asks macOS first (so Boring Remote shows in the list),
+# then opens the exact pane.
+T17_ACCESS_CHECKS = (
+    "// boring-remote: v1.7 t17. What has to be true before another computer can connect.\n"
+    "Future<String>? _boringUid;\n"
+    "List<AccessCheck> boringAccessChecks() {\n"
+    "  Future<bool> listening() => Socket.connect('127.0.0.1', kDirectLinkPort, timeout: const Duration(seconds: 1))\n"
+    "      .then((s) {\n"
+    "        s.destroy();\n"
+    "        return true;\n"
+    "      }).catchError((_) => false);\n"
+    "  bool stopped() => mainGetBoolOptionSync(kOptionStopService);\n"
+    "  Future<void> turnOn() async {\n"
+    "    if (stopped()) await mainSetBoolOption(kOptionStopService, false);\n"
+    "    if (!bind.mainIsInstalledDaemon(prompt: false)) bind.mainIsInstalledDaemon(prompt: true);\n"
+    "  }\n"
+    "  final on = AccessCheck(\n"
+    "      label: AccessWords.on,\n"
+    "      why: AccessWords.onWhy,\n"
+    "      read: () async => bind.mainIsInstalledDaemon(prompt: false) && !stopped(),\n"
+    "      fix: turnOn);\n"
+    "  if (isWindows) {\n"
+    "    Future<bool> running() => Process.run('sc', ['query', 'BoringRemote'])\n"
+    "        .then((r) => '${r.stdout}'.contains('RUNNING'))\n"
+    "        .catchError((_) => false);\n"
+    "    return [\n"
+    "      AccessCheck(\n"
+    "          label: AccessWords.reach,\n"
+    "          why: AccessWords.reachWhy,\n"
+    "          read: () => Process.run('netsh', windowsRuleShowArgs())\n"
+    "              .then((r) => r.exitCode == 0 && windowsRuleAllowsExe('${r.stdout}', Platform.resolvedExecutable))\n"
+    "              .catchError((_) => false),\n"
+    "          fix: () => Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))\n"
+    "              .then<void>((_) {}).catchError((e) => debugPrint('Access: $e'))),\n"
+    "      on,\n"
+    "      AccessCheck(label: AccessWords.running, why: AccessWords.runningWhy, read: running, fix: turnOn),\n"
+    "      AccessCheck(label: AccessWords.listening, why: AccessWords.listeningWhy, read: listening, fix: turnOn),\n"
+    "    ];\n"
+    "  }\n"
+    "  Future<String> uid() => _boringUid ??= Process.run('id', ['-u']).then((r) => '${r.stdout}'.trim());\n"
+    "  // launchctl's own line for the job, not its endpoints' (those say active).\n"
+    "  final up = RegExp(r'^\\tstate = running$', multiLine: true);\n"
+    "  Future<bool> running() async => Process.run('launchctl', ['print', 'gui/${await uid()}/$kAgentLabel'])\n"
+    "      .then((r) => r.exitCode == 0 && up.hasMatch('${r.stdout}'))\n"
+    "      .catchError((_) => false);\n"
+    "  Future<void> startAgent() async {\n"
+    "    await turnOn();\n"
+    "    final u = await uid();\n"
+    "    final k = await Process.run('launchctl', ['kickstart', '-k', 'gui/$u/$kAgentLabel']);\n"
+    "    if (k.exitCode != 0) await Process.run('launchctl', ['bootstrap', 'gui/$u', kAgentPlist]);\n"
+    "  }\n"
+    "  void pane(String url) => launchUrl(Uri.parse(url));\n"
+    "  return [\n"
+    "    AccessCheck(\n"
+    "        label: AccessWords.screen,\n"
+    "        why: AccessWords.screenWhy,\n"
+    "        read: () async => bind.mainIsCanScreenRecording(prompt: false),\n"
+    "        fix: () async {\n"
+    "          bind.mainIsCanScreenRecording(prompt: true); // CGRequestScreenCaptureAccess: macOS asks, and lists us\n"
+    "          pane(kScreenRecordingPane);\n"
+    "        }),\n"
+    "    AccessCheck(\n"
+    "        label: AccessWords.control,\n"
+    "        why: AccessWords.controlWhy,\n"
+    "        read: () async => bind.mainIsProcessTrusted(prompt: false),\n"
+    "        fix: () async {\n"
+    "          bind.mainIsProcessTrusted(prompt: true);\n"
+    "          pane(kAccessibilityPane);\n"
+    "        }),\n"
+    "    AccessCheck(\n"
+    "        label: AccessWords.input,\n"
+    "        why: AccessWords.inputWhy,\n"
+    "        read: () async => bind.mainIsCanInputMonitoring(prompt: false),\n"
+    "        fix: () async {\n"
+    "          bind.mainIsCanInputMonitoring(prompt: true);\n"
+    "          pane(kInputMonitoringPane);\n"
+    "        }),\n"
+    "    on,\n"
+    "    AccessCheck(label: AccessWords.running, why: AccessWords.runningWhy, read: running, fix: startAgent),\n"
+    "    AccessCheck(label: AccessWords.listening, why: AccessWords.listeningWhy, read: listening, fix: startAgent),\n"
+    "  ];\n"
+    "}\n\n")
+T17_ACCESS_IMPORT = "import 'package:flutter_hbb/desktop/kit/access.dart';\n"
+PATCHES += [
+    (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
+     T17_ACCESS_CHECKS + "class _DesktopHomePageState extends State<DesktopHomePage>\n", "Access checks (t17)"),
+    (HOME, "import 'package:flutter_hbb/consts.dart';\n", "import 'package:flutter_hbb/consts.dart';\n" + T17_ACCESS_IMPORT,
+     "Access import (home)"),
+    (SETTINGS, "import 'package:flutter_hbb/desktop/kit/trust.dart';\n",
+     "import 'package:flutter_hbb/desktop/kit/trust.dart';\n" + T17_ACCESS_IMPORT, "Access import (settings)"),
 ]
 
 COPIES = [

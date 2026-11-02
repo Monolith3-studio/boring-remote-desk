@@ -269,6 +269,17 @@ class InstallUpdate(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: any(a.endswith(f"[open] [{self.app}]") for a in self.args("launchctl")))
                         or console_is_root(), self.args("launchctl"))
 
+    def test_move_bundle_rewrites_an_agent_plist_that_stays_down_after_a_clean_exit(self):
+        self.stub("launchctl", '[ "$1" = print ] && exit 1\nexit 0\n')
+        for p in self.plists():
+            p.write_text("<string>/Applications/Boring Remote.app/Contents/MacOS/service</string>"
+                         "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>")
+        r = self.run_script("--move-bundle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.marker(self.app), "old")
+        self.assertIn("service --write-plists", self.log.read_text())
+        self.assertNotIn("SuccessfulExit", self.plists()[1].read_text())
+
     def test_move_bundle_keeps_the_newer_of_two_bundles(self):
         old = self.old_install("1.6.4")
         make_app(self.root / "Applications", "1.7.0", "dmg")  # 1.7 dragged from the DMG beside 1.6.x
