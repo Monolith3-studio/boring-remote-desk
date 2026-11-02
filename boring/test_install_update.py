@@ -309,7 +309,8 @@ class InstallUpdate(unittest.TestCase):
         spec.loader.exec_module(rb)
         hits = [p for p in rb.PATCHES if p[0] == "src/platform/privileges_scripts/install-update.sh"]
         self.assertEqual([(p[1], p[2]) for p in hits],
-                         [('SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{rb.HOSTD_ID}"')])
+                         [('SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{rb.HOSTD_ID}"'),
+                          ('AGENT_LABEL="com.carriez.RustDesk_server"', f'AGENT_LABEL="{rb.AGENT_ID}"')])  # t17
         daemon = [p[2] for p in rb.PATCHES if p[0].endswith("daemon.plist") and "RustDesk_service" in p[1]]
         self.assertEqual(daemon, [rb.HOSTD_ID])
 

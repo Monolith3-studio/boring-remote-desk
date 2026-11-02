@@ -563,7 +563,7 @@ class RebrandSeam(unittest.TestCase):
         for rel in crlf:
             data = (self.root / rel).read_bytes()
             self.assertEqual(data.count(b"\n"), data.count(b"\r\n"), f"{rel} lost CRLF")
-        self.assertIn(b"PRODUCT_NAME = BoringRemote\r\n", (self.root / crlf[0]).read_bytes())
+        self.assertIn(b"PRODUCT_NAME = Boring Remote\r\nEXECUTABLE_NAME = BoringRemote\r\n", (self.root / crlf[0]).read_bytes())
         for rel in ("src/common.rs", "flutter/windows/runner/Runner.rc"):  # LF stays LF
             self.assertNotIn(b"\r", (self.root / rel).read_bytes(), rel)
         self.assertIn("rebrand: 0 changed, 0 moved", self.rebrand().stdout)
