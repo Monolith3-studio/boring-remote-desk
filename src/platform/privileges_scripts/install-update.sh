@@ -45,8 +45,12 @@ PREV="$APP.previous"
 SUPPORT="$ROOT/Library/Application Support/Boring Remote"
 DAEMON_PLIST="$ROOT/Library/LaunchDaemons/$SERVICE_LABEL.plist"
 AGENT_PLIST="$ROOT/Library/LaunchAgents/$AGENT_LABEL.plist"
-CONSOLE_USER=$(stat -f %Su /dev/console)
-CONSOLE_UID=$(stat -f %u /dev/console)
+# The logged-in user, from the dynamic store as the app reads it (/dev/console can stay owned by
+# root while someone is logged in); stat only when the store has no answer.
+console() { echo "show State:/Users/ConsoleUser" | scutil 2>/dev/null | awk -v k="$1" '$1 == k && $2 == ":" { print $3; exit }'; }
+CONSOLE_USER=$(console Name); CONSOLE_UID=$(console UID)
+[ -n "$CONSOLE_USER" ] && [ -n "$CONSOLE_UID" ] || { CONSOLE_USER=$(stat -f %Su /dev/console); CONSOLE_UID=$(stat -f %u /dev/console); }
+[ "$CONSOLE_USER" = loginwindow ] && CONSOLE_USER=root
 
 fail() { echo "install-update: $*" >&2; exit 1; }
 
@@ -68,12 +72,25 @@ needs_move() {
   [ -d "$OLD" ] || grep -qsF "/Applications/$OLD_BUNDLE/" "$DAEMON_PLIST" "$AGENT_PLIST"
 }
 
+# The per-user agent (--server, the screen capturer) lives in the user's GUI domain, not root's.
+agent_out() {
+  launchctl bootout "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
+  i=0  # bootout returns before the job is gone; bootstrap fails while it is still there
+  while [ $i -lt 20 ] && launchctl print "gui/$CONSOLE_UID/$AGENT_LABEL" >/dev/null 2>&1; do
+    sleep 0.5; i=$((i + 1))
+  done
+}
+agent_in() {
+  launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT_PLIST" 2>/dev/null \
+    || launchctl kickstart -k "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
+}
+
 # Keep the newer bundle (the new path wins a tie) at the new path, then point both jobs at it.
 move_bundle() {
   service=; [ -f "$DAEMON_PLIST" ] && service=1
   if [ -n "$service" ]; then
     launchctl bootout "system/$SERVICE_LABEL" 2>/dev/null || true
-    user_session && { launchctl bootout "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true; }
+    user_session && agent_out
   fi
   if [ -d "$OLD" ]; then
     old_v=$(bundle_version "$OLD" 2>/dev/null) || old_v=0.0.0
@@ -87,9 +104,12 @@ move_bundle() {
   fi
   [ -x "$APP/Contents/MacOS/$APP_NAME" ] || fail "no app at $APP"
   [ -n "$service" ] || return 0
+  # Whatever still runs from the old path (its --server, a 1.6.x window) would hold on to it.
+  pkill -f "$OLD/Contents/MacOS/" 2>/dev/null || true
+  [ -n "$service" ] || return 0
   "$APP/Contents/MacOS/service" --write-plists || fail "cannot rewrite the launchd plists"
   launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null || launchctl load -w "$DAEMON_PLIST" || true
-  user_session && { launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT_PLIST" 2>/dev/null || true; }
+  user_session && agent_in
   return 0
 }
 

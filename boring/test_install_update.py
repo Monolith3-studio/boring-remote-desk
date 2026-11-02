@@ -231,6 +231,7 @@ class InstallUpdate(unittest.TestCase):
         """A 1.6.x Mac: BoringRemote.app, and plists that run it (the daemon through sh -c)."""
         shutil.rmtree(self.app)
         old = make_app(self.root / "Applications", version, "old16", OLD_BUNDLE)
+        self.stub("launchctl", '[ "$1" = print ] && exit 1\nexit 0\n')  # booted-out jobs are gone
         if plists:
             for p in self.plists():
                 p.write_text("<string>/bin/sh</string><string>-c</string>"
@@ -255,6 +256,15 @@ class InstallUpdate(unittest.TestCase):
         self.assertIn(f"launchctl [bootstrap] [system] [{self.plists()[0]}]", args)
         self.assertLess(args.index(f"launchctl [bootout] [system/{daemon_label()}]"),
                         args.index(f"launchctl [bootstrap] [system] [{self.plists()[0]}]"))
+        # the agent (--server) is reloaded in the logged-in user's GUI domain, not root's
+        if not console_is_root():
+            uid = console_uid()
+            self.assertIn(f"launchctl [bootout] [gui/{uid}/{agent_label()}]", args)
+            self.assertIn(f"launchctl [bootstrap] [gui/{uid}] [{self.plists()[1]}]", args)
+            self.assertLess(args.index(f"launchctl [bootstrap] [system] [{self.plists()[0]}]"),
+                            args.index(f"launchctl [bootstrap] [gui/{uid}] [{self.plists()[1]}]"))
+        # nothing keeps running from the old path
+        self.assertIn(f"pkill [-f] [{old}/Contents/MacOS/]", self.args("pkill"))
         # reopened from the new path, which stays one argument with its space
         self.assertTrue(self.wait_for(lambda: any(a.endswith(f"[open] [{self.app}]") for a in self.args("launchctl")))
                         or console_is_root(), self.args("launchctl"))
@@ -325,12 +335,25 @@ def agent_label():
     return re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", t).group(1)
 
 
+def console(key):
+    """The logged-in user as the script reads it: the dynamic store first, /dev/console after."""
+    out = subprocess.run(["scutil"], input="show State:/Users/ConsoleUser\n", capture_output=True, text=True).stdout
+    store = {l.split()[0]: l.split()[2] for l in out.splitlines() if len(l.split()) == 3 and l.split()[1] == ":"}
+    if store.get("Name") and store.get("UID"):
+        return store["Name" if key == "%Su" else "UID"]
+    return subprocess.run(["stat", "-f", key, "/dev/console"], capture_output=True, text=True).stdout.strip()
+
+
 def console_user():
-    return subprocess.run(["stat", "-f", "%Su", "/dev/console"], capture_output=True, text=True).stdout.strip()
+    return console("%Su")
+
+
+def console_uid():
+    return console("%u")
 
 
 def console_is_root():
-    return subprocess.run(["stat", "-f", "%Su", "/dev/console"], capture_output=True, text=True).stdout.strip() in ("", "root")
+    return console_user() in ("", "root", "loginwindow")
 
 
 if __name__ == "__main__":

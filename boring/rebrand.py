@@ -329,6 +329,10 @@ IPC_AUTH_OLD = (
 WIN_SC_NAME = 'start= auto DisplayName= \\"{app_name} Service\\"'
 WIN_FW_DELETE = '    netsh advfirewall firewall delete rule name=\\"{app_name} Service\\"\n'
 PATCHES += [
+    # Jason (2026-11-02): Settings is a gear, not upstream's three-line menu icon (Mac and Windows tab bar).
+    ("flutter/lib/desktop/pages/desktop_tab_page.dart", "                  icon: IconFont.menu,\n",
+     "                  icon: Icons.settings_outlined, // boring-remote (v1.7 t17): a gear opens Settings\n",
+     "Settings button is a gear"),
     ("src/platform/macos.rs", MAC_INSTALLED,
      MAC_INSTALLED + f"        // boring-remote (v1.7 t17): {MAC_BUNDLE}; 1.6.x's name below counts until it moves.\n"
      f'        if p.starts_with("/Applications/{MAC_BUNDLE}") {{\n            return true;\n        }}\n',

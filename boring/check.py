@@ -1010,6 +1010,10 @@ def bundle_checks(c):
     c.fact("a 1.6.x BoringRemote.app is moved once; both paths count as installed until then (t17)",
            not bad, "; ".join(bad))
 
+    tab = c.read(rebrand.LOOK_TAB_PAGE)
+    c.fact("Settings opens from a gear, not the three-line menu (t17)",
+           "message: 'Settings',\n                  icon: Icons.settings_outlined," in tab and "IconFont.menu" not in tab)
+
     rule, fw, win = rebrand.WINDOWS_RULE, c.read("res/msi/CustomActions/FirewallRules.cpp"), c.read("src/platform/windows.rs")
     wxl = c.read(f"{MSI_DIR}/Language/Package.en-us.wxl")
     bad = [n for n, ok in [

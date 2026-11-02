@@ -38,6 +38,7 @@ TRUST_TOKENS = "trust tokens: 256-bit, constant-time, option names agree in Rust
 MAC_BUNDLE = "Mac bundle is Boring Remote.app; its exe stays BoringRemote (t17)"
 MAC_PLISTS = "launchd plists run Boring Remote.app directly, no sh -c (t17)"
 MAC_MOVE = "a 1.6.x BoringRemote.app is moved once; both paths count as installed until then (t17)"
+SETTINGS_GEAR = "Settings opens from a gear, not the three-line menu (t17)"
 WIN_NAMES = "Windows service, firewall rule and Apps list say Boring Remote; exe and install dir unchanged (t17)"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
@@ -654,7 +655,7 @@ class RebrandSeam(unittest.TestCase):
     def test_bundle_name_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
-        for fact in (MAC_BUNDLE, MAC_PLISTS, MAC_MOVE, WIN_NAMES):
+        for fact in (MAC_BUNDLE, MAC_PLISTS, MAC_MOVE, WIN_NAMES, SETTINGS_GEAR):
             self.assertIn(f"PASS {fact}", r.stdout)
         xc = (self.root / "flutter/macos/Runner/Configs/AppInfo.xcconfig").read_text()
         self.assertIn("PRODUCT_NAME = Boring Remote\n", xc)
@@ -680,6 +681,11 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("src/ipc/auth.rs", '["Boring Remote.app", "BoringRemote.app"]', '["Boring Remote.app"]')
         self.assert_check_fails(MAC_MOVE)
+
+    def test_three_line_settings_icon_back_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.LOOK_TAB_PAGE, "icon: Icons.settings_outlined,", "icon: IconFont.menu,")
+        self.assert_check_fails(SETTINGS_GEAR)
 
     def test_firewall_rule_named_after_the_exe_fails_check(self):
         self.rebrand()
