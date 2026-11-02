@@ -33,4 +33,16 @@ void main() {
       expect(isBareIp(s), isFalse, reason: s);
     }
   });
+
+  test('a Mac that misses one discovery round stays listed, in place, until the grace runs out', () {
+    final memory = <String, LanSeen>{};
+    final t0 = DateTime(2026, 11, 2, 13, 0, 0);
+    expect(keepRecentLanMacs(memory, all, t0), all);
+    // One round where stage-left's answer was missed: still listed, same order.
+    expect(keepRecentLanMacs(memory, [studio], t0.add(const Duration(seconds: 6))), all);
+    // It answers again: back to fresh, nothing doubled.
+    expect(keepRecentLanMacs(memory, [stage, studio], t0.add(const Duration(seconds: 12))), all);
+    // Gone past the grace: dropped.
+    expect(keepRecentLanMacs(memory, [studio], t0.add(const Duration(seconds: 33))), [studio]);
+  });
 }

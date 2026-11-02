@@ -28,6 +28,20 @@ List<LanMac> lanMacsFromJson(String json) {
   }
 }
 
+/// When a listed Mac last answered. Keyed by IP in [keepRecentLanMacs]'s memory.
+typedef LanSeen = ({LanMac mac, DateTime at});
+
+/// One LAN Discovery round can miss a reply; without this the row blinks out under the cursor.
+/// Keeps each Mac listed, in first-seen order, until it has been silent for [grace].
+List<LanMac> keepRecentLanMacs(Map<String, LanSeen> memory, List<LanMac> fresh, DateTime now,
+    {Duration grace = const Duration(seconds: 20)}) {
+  for (final m in fresh) {
+    memory[m.ip] = (mac: m, at: now);
+  }
+  memory.removeWhere((_, s) => now.difference(s.at) > grace);
+  return [for (final s in memory.values) s.mac];
+}
+
 /// Name substring (any case) or IP prefix.
 List<LanMac> filterLanMacs(List<LanMac> macs, String query) {
   final q = query.trim().toLowerCase();
