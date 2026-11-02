@@ -35,12 +35,7 @@ class Kit {
   static const Color coral = Color(0xFFFF5949); // accent, non-text only
   static const Color ok = Color(0xFF0DBC79); // done / allowed: Setup's green checks
 
-  // Boring Type is not ours to publish (public AGPL repo), so no font files are committed. CI's
-  // boring/fonts.py bundles them under these family names when the BORING_TYPE_URL secret is set;
-  // without it (and locally) the system UI font is used.
-  static const String fontUi = 'Neue Corp';
-  static const String fontText = 'Söhne';
-  static const List<String> fontFallback = [fontText, '.AppleSystemUIFont', 'Helvetica Neue', 'Segoe UI'];
+  // The app uses the platform UI font (SF Pro on Mac, Segoe UI on Windows): Jason, 2026-11-02.
 
   static const double s1 = 4, s2 = 8, s3 = 12, s4 = 16, s5 = 24, s6 = 32, s7 = 48;
   static const double radius = 10;
@@ -49,8 +44,6 @@ class Kit {
     final base = ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
-      fontFamily: fontUi,
-      fontFamilyFallback: fontFallback,
     );
     final text = base.textTheme.apply(bodyColor: paper, displayColor: paper);
     final border = OutlineInputBorder(

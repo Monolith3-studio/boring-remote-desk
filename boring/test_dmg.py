@@ -343,13 +343,9 @@ class Workflow(unittest.TestCase):
 
     def test_secrets_reach_only_the_sign_step(self):
         text = WORKFLOW.read_text()
-        # The signing secrets go to the sign step only; the font store URL (ADR 0006) only to the
-        # two steps that bundle Boring Type.
+        # The signing secrets go to the sign step only.
         self.assertEqual(sorted(re.findall(r"secrets\.\w+", text)),
-                         ["secrets.BORING_TYPE_URL", "secrets.BORING_TYPE_URL",
-                          "secrets.MAC_SIGN_P12", "secrets.MAC_SIGN_P12_PASSWORD"])
-        for j in ("build-macos", "build-windows"):
-            self.assertIn("BORING_TYPE_URL: ${{ secrets.BORING_TYPE_URL }}", step(job(j), "Bundle Boring Type"))
+                         ["secrets.MAC_SIGN_P12", "secrets.MAC_SIGN_P12_PASSWORD"])
         sign = step(job("build-macos"), "Sign, build DMG, mount and verify")
         self.assertIn("MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}", sign)
         self.assertIn("MAC_SIGN_P12_PASSWORD: ${{ secrets.MAC_SIGN_P12_PASSWORD }}", sign)
