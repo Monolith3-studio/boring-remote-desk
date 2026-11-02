@@ -86,7 +86,9 @@ def main(root):
         print(f"Boring Type: {SECRET} is not set; this build uses the system font.")
         return 0
     try:
-        with urllib.request.urlopen(url, timeout=60) as r:
+        # r2.dev answers 403 to urllib's default User-Agent
+        req = urllib.request.Request(url, headers={"User-Agent": "boring-remote-ci"})
+        with urllib.request.urlopen(req, timeout=60) as r:
             data = r.read()
     except Exception as e:  # its message can carry the URL, which is the secret: name the error only
         print(f"Boring Type: could not download the fonts ({type(e).__name__})", file=sys.stderr)
