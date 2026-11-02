@@ -16,6 +16,9 @@ void main() {
     final list = parseTrusted(trustedJson);
     expect(list.map((c) => c.name), ['Edit Bay 2', 'Stage Left']);
     expect(parseTrusted(removeTrusted(trustedJson, 'aa11')).map((c) => c.key), ['bb22']);
+    // Removed stays in the JSON, hidden, so the Target still knows that token and asks (A2 step 5).
+    expect(removeTrusted(trustedJson, 'aa11'), contains('"key":"aa11","name":"Edit Bay 2","added":1761955200,"removed":true'));
+    expect(parseTrusted('[{"key":"aa11","name":"x","removed":true}]'), isEmpty);
     expect(parseTrusted(''), isEmpty);
     expect(parseTrusted('not json'), isEmpty);
   });

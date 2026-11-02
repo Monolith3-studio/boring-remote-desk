@@ -739,6 +739,14 @@ T04_TRUSTED_SKIP = (
     "                }\n"
     "                self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n"
     "                return true;\n"
+    "            }\n"
+    "            // A Controller removed from Trusted Controllers waits for Allow here, whatever\n"
+    "            // password it brings: Remove is not undone quietly (device check A2 step 5).\n"
+    "            if self.boring_trust.must_ask() {\n"
+    "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+    "                self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)\n"
+    "                    .await;\n"
+    "                return true;\n"
     "            }\n")
 # ADR 0005: Allow here or the Unattended Password makes a Controller Trusted; a one-time code
 # (or the recent-session password) lets it in for this session only.

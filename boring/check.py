@@ -753,6 +753,7 @@ def windows_checks(c):
 
 
 TRUST_RS = "libs/base/src/trust.rs"
+REMOVED_ASKS = "a removed Trusted Controller is asked again; its password does not undo Remove (A2 step 5)"
 TRUST_DART = "flutter/lib/desktop/kit/trust.dart"
 PASSWORDISH = re.compile(r"password|salt", re.I)
 
@@ -801,6 +802,16 @@ def trust_checks(c, cfg):
         ("approve_into stores nothing for ThisSessionOnly", "Some(key) if how != SignIn::ThisSessionOnly => {" in grant),
     ] if not ok]
     c.fact("a one-time code lets a Controller in for that session only (ADR 0005)", not once, "; ".join(once))
+
+    removed = [n for n, ok in [
+        ("connection.rs sends a removed Controller to the ask before any password path",
+         "if self.boring_trust.must_ask() {" in rebrand.T04_TRUSTED_SKIP and rebrand.T04_TRUSTED_SKIP in conn),
+        ("approve_into re-trusts a removed Controller only on Allow",
+         "if how != SignIn::Allowed {" in grant and "t.reinstate(key, name)" in grant),
+        ("Remove in Settings keeps the entry, hidden, so the token is still known",
+         "'removed': true" in (fn_body(dart, "String removeTrusted(") or "")),
+    ] if not ok]
+    c.fact(REMOVED_ASKS, not removed, "; ".join(removed))
 
     why = [f"rebrand map sets {k}" for d in (rebrand.LOCKED, rebrand.DEFAULTS, rebrand.LOCKED_LOCAL)
            for k in d if PASSWORDISH.search(k)]

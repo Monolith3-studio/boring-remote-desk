@@ -62,7 +62,17 @@ fn digest(token: &[u8]) -> Vec<u8> {
     sha256::hash(token).0.to_vec()
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// One Trusted Controller as the Target keeps it. `key` is the hash of its token, never the token.
+/// A removed one stays as a hidden entry (`removed`) so that when it comes back with that token
+/// this Mac knows it was removed and asks, whatever password it brings (device check A2 step 5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedController {
     pub key: String,
@@ -70,6 +80,8 @@ pub struct TrustedController {
     pub name: String,
     #[serde(default)]
     pub added: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub removed: bool,
 }
 
 /// The Target's Trusted Controllers (Settings → Advanced → Trusted Controllers lists and removes).
@@ -94,12 +106,13 @@ impl Trusted {
         Config::set_option(TRUSTED_OPTION.to_owned(), self.to_json());
     }
 
-    pub fn list(&self) -> &[TrustedController] {
-        &self.0
+    /// The Trusted Controllers Settings lists: removed ones are not.
+    pub fn list(&self) -> Vec<&TrustedController> {
+        self.0.iter().filter(|t| !t.removed).collect()
     }
 
-    /// Who holds `token`, if anyone. Only a full-length token can match, and every entry is
-    /// compared in constant time.
+    /// Who holds `token`, if anyone, removed or not (the caller looks at `removed`). Only a
+    /// full-length token can match, and every entry is compared in constant time.
     pub fn check(&self, token: &[u8]) -> Option<&TrustedController> {
         if token.len() != TOKEN_LEN {
             return None;
@@ -118,17 +131,33 @@ impl Trusted {
     fn add(&mut self, key: &[u8], name: &str) {
         let key = hex(key);
         self.0.retain(|t| t.key != key);
-        let added = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        self.0.push(TrustedController { key, name: name.to_owned(), added });
+        self.0.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false });
     }
 
-    /// Removing an entry revokes its token: the next connect asks again.
+    /// Removing an entry revokes its token: the next connect from that Controller is asked on
+    /// this Mac, and only Allow here trusts it again (not the Unattended Password).
+    /// flutter/lib/desktop/kit/trust.dart `removeTrusted` does the same to the option JSON.
     pub fn remove(&mut self, key: &str) -> bool {
-        let n = self.0.len();
-        self.0.retain(|t| t.key != key);
-        self.0.len() != n
+        match self.0.iter_mut().find(|t| t.key == key && !t.removed) {
+            Some(t) => {
+                t.removed = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Allow on this Mac for a removed Controller: its token is Trusted again.
+    fn reinstate(&mut self, key: &str, name: &str) -> bool {
+        match self.0.iter_mut().find(|t| t.key == key) {
+            Some(t) => {
+                t.removed = false;
+                t.name = name.to_owned();
+                t.added = now();
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -143,12 +172,13 @@ pub enum SignIn {
     ThisSessionOnly,
 }
 
-/// What the Target learned in the exchange: already Trusted, or the hash of the token it just
-/// issued, waiting for approval.
+/// What the Target learned in the exchange: already Trusted, removed from Trusted Controllers
+/// (its key), or the hash of the token it just issued, waiting for approval.
 #[derive(Debug, Clone, Default)]
 pub struct Admission {
     trusted: Option<String>,
     pending: Option<Vec<u8>>,
+    removed: Option<String>,
 }
 
 impl Admission {
@@ -157,16 +187,44 @@ impl Admission {
         self.trusted.is_some()
     }
 
+    /// Presented a token this Mac issued and then removed: the session waits for Allow here,
+    /// whatever password it brings (src/server/connection.rs, rebrand T04_TRUSTED_SKIP).
+    pub fn must_ask(&self) -> bool {
+        self.removed.is_some()
+    }
+
     /// The session got in. If someone clicked Allow here or the Unattended Password was right,
     /// the token just issued becomes Trusted under `name`; any other sign-in leaves it worthless.
     pub fn approve(&mut self, how: SignIn, name: &str) {
+        if self.trusted.is_some() {
+            hbb_common::log::info!("Direct Link: Trusted Controller {:?} came straight in", name);
+            return;
+        }
+        let was_removed = self.removed.is_some();
         let mut t = Trusted::load();
-        if self.approve_into(&mut t, how, name) {
+        let stored = self.approve_into(&mut t, how, name);
+        if stored {
             t.save();
         }
+        hbb_common::log::info!(
+            "Direct Link: {:?} got in by {:?}{}; Trusted now: {}",
+            name,
+            how,
+            if was_removed { " after being removed" } else { "" },
+            stored
+        );
     }
 
     fn approve_into(&mut self, t: &mut Trusted, how: SignIn, name: &str) -> bool {
+        // A removed Controller is Trusted again only by Allow here, never by a password.
+        if let Some(key) = self.removed.as_ref() {
+            if how != SignIn::Allowed {
+                return false;
+            }
+            let ok = t.reinstate(key, name);
+            self.removed = None;
+            return ok;
+        }
         match self.pending.take() {
             Some(key) if how != SignIn::ThisSessionOnly => {
                 t.add(&key, name);
@@ -204,13 +262,24 @@ pub async fn answer(stream: &mut Stream, trusted: &Trusted, ms: u64) -> ResultTy
         bail!("trust exchange needs an encrypted Direct Link");
     }
     let token = read(stream, ms).await?;
-    if let Some(t) = trusted.check(&token) {
-        stream.send(&frame(&[])).await?;
-        return Ok(Admission { trusted: Some(t.name.clone()), pending: None });
+    match trusted.check(&token) {
+        Some(t) if !t.removed => {
+            stream.send(&frame(&[])).await?;
+            Ok(Admission { trusted: Some(t.name.clone()), ..Default::default() })
+        }
+        Some(t) => {
+            // Removed: no fresh token, so the Controller keeps presenting this one and stays
+            // known as removed until someone clicks Allow here.
+            hbb_common::log::info!("Direct Link: removed Controller {:?} is back; asking on this Mac", t.name);
+            stream.send(&frame(&[])).await?;
+            Ok(Admission { removed: Some(t.key.clone()), ..Default::default() })
+        }
+        None => {
+            let fresh = randombytes(TOKEN_LEN);
+            stream.send(&frame(&fresh)).await?;
+            Ok(Admission { pending: Some(digest(&fresh)), ..Default::default() })
+        }
     }
-    let fresh = randombytes(TOKEN_LEN);
-    stream.send(&frame(&fresh)).await?;
-    Ok(Admission { trusted: None, pending: Some(digest(&fresh)) })
 }
 
 /// Controller side: present `token` (if any). Returns the fresh token the Target issued, if it
@@ -338,6 +407,52 @@ mod tests {
         assert!(trusted.remove(&key));
         let (again, _) = connect(&trusted, issued).await;
         assert!(!again.is_trusted());
+    }
+
+    /// Device check A2 step 5: Remove, then the same Controller connects again. It must be asked
+    /// on this Mac; the Unattended Password (typed or remembered on the Controller) must not
+    /// quietly make it Trusted again. Only Allow here does.
+    #[tokio::test]
+    async fn a_removed_controller_is_asked_again_and_the_password_does_not_undo_remove() {
+        let mut trusted = Trusted::default();
+        let (mut a, issued) = connect(&trusted, None).await;
+        a.approve_into(&mut trusted, SignIn::Allowed, "Jason M Studio");
+        let key = trusted.list()[0].key.clone();
+        assert!(trusted.remove(&key));
+        assert!(trusted.list().is_empty(), "Settings no longer lists it");
+        let mut trusted = Trusted::parse(&trusted.to_json());
+
+        // It comes back with the token it holds.
+        let (mut back, reissued) = connect(&trusted, issued.clone()).await;
+        assert!(!back.is_trusted());
+        assert!(back.must_ask(), "a removed Controller is asked here, password or not");
+        assert!(!back.approve_into(&mut trusted, SignIn::UnattendedPassword, "Jason M Studio"),
+                "the Unattended Password does not undo Remove");
+        assert!(!back.approve_into(&mut trusted, SignIn::ThisSessionOnly, "Jason M Studio"));
+        assert!(trusted.list().is_empty());
+
+        // Still removed next time, whatever token it now holds.
+        let holding = reissued.or(issued);
+        let (mut again, kept) = connect(&trusted, holding.clone()).await;
+        assert!(again.must_ask());
+        assert!(!again.approve_into(&mut trusted, SignIn::UnattendedPassword, "Jason M Studio"));
+
+        // Allow on this Mac trusts it again, and the next connect skips the ask.
+        let holding = kept.or(holding);
+        assert!(again.approve_into(&mut trusted, SignIn::Allowed, "Jason M Studio"));
+        assert_eq!(trusted.list().len(), 1);
+        let (fourth, _) = connect(&trusted, holding).await;
+        assert!(fourth.is_trusted());
+        assert!(!fourth.must_ask());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_controller_is_not_forced_to_the_ask() {
+        // ADR 0005 unchanged for strangers: the Unattended Password still works and trusts.
+        let mut trusted = Trusted::default();
+        let (mut a, _) = connect(&trusted, None).await;
+        assert!(!a.must_ask());
+        assert!(a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left"));
     }
 
     #[tokio::test]

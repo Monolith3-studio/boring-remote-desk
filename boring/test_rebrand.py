@@ -30,6 +30,7 @@ CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused b
 NOT_FOUND_TRANSLATED = "every connect error, Mac and Windows wording, is in every translation file"
 CONNECT_PIN = "Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)"
 ONE_TIME_CODE = "a one-time code lets a Controller in for that session only (ADR 0005)"
+REMOVED_ASKS = "a removed Trusted Controller is asked again; its password does not undo Remove (A2 step 5)"
 HE_WIRED = "High Efficiency wired: Target marks itself and answers the ask, badge waits for the answer"
 RUST_HOOKS = "v1.7 Rust hooks landed: base modules, Direct Link meta, LAN end of cycle, Controller name"
 NO_DEFAULT_PASSWORD = "no default or blank password ships (ADR 0002)"
@@ -518,6 +519,16 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", rebrand.T04_GRANT,
                   "        self.boring_trust.approve(base::trust::SignIn::Allowed, &self.lr.my_name);\n")
         self.assert_check_fails(ONE_TIME_CODE)
+
+    def test_removed_controller_let_in_by_password_fails_check(self):  # device check A2 step 5
+        self.rebrand()
+        self.edit("src/server/connection.rs", "if self.boring_trust.must_ask() {", "if false {")
+        self.assert_check_fails(REMOVED_ASKS)
+
+    def test_remove_dropping_the_entry_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/trust.dart", "{...e, 'removed': true} else e", "{} else e")
+        self.assert_check_fails(REMOVED_ASKS)
 
     def test_lan_macs_that_left_deleted_from_the_stored_list_fails_check(self):
         self.rebrand()

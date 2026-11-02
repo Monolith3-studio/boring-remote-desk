@@ -28,7 +28,7 @@ List<TrustedController> parseTrusted(String json) {
     if (list is! List) return [];
     return [
       for (final e in list)
-        if (e is Map && e['key'] is String)
+        if (e is Map && e['key'] is String && e['removed'] != true)
           TrustedController(
             key: e['key'] as String,
             name: (e['name'] as String?) ?? '',
@@ -40,14 +40,16 @@ List<TrustedController> parseTrusted(String json) {
   }
 }
 
-/// The Trusted Controllers JSON without `key`. Removing revokes: that Controller is asked again.
+/// The Trusted Controllers JSON with `key` removed. Removing revokes: that Controller is asked
+/// again on this Mac, password or not, until someone clicks Allow here. The entry stays, hidden
+/// (`removed`), so this Mac still knows the token when it comes back (trust.rs `Trusted::remove`).
 String removeTrusted(String json, String key) {
   try {
     final list = jsonDecode(json);
     if (list is! List) return '[]';
     return jsonEncode([
       for (final e in list)
-        if (!(e is Map && e['key'] == key)) e
+        if (e is Map && e['key'] == key) {...e, 'removed': true} else e
     ]);
   } catch (_) {
     return '[]';
