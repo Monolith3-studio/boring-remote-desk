@@ -47,6 +47,9 @@ fn service_responds() -> bool {
 /// `{"failed":"X.Y.Z","running":"A.B.C"}` once after an update was rolled back.
 /// Called by the home banner, so the main window is up.
 pub fn check_now() -> Option<String> {
+    // v1.7 t17: once per launch, move a 1.6.x BoringRemote.app to Boring Remote.app.
+    #[cfg(target_os = "macos")]
+    base::bundle_move::start(crate::update_rollback::SUPPORT_DIR, crate::platform::quit_gui);
     let dir = std::path::Path::new(crate::update_rollback::SUPPORT_DIR);
     let pending = dir.join("update-pending").exists();
     if let Some(to) = crate::update_rollback::on_launch(dir, crate::VERSION, pending && service_responds()) {

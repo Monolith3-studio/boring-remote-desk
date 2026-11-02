@@ -15,9 +15,9 @@ const kSetupStepOption = 'boring-setup-step';
 const kScreenRecordingPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture';
 const kAccessibilityPane = 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility';
 
-/// The inbound app rule the MSI installs (res/msi CustomActions: "<exe name> Service"): any port,
-/// every network type, so it covers Direct Link (TCP 21118) and LAN Discovery (UDP 21119). v1.7 t12.
-const kWindowsRuleName = 'BoringRemote Service';
+/// The inbound app rule the MSI installs (res/msi CustomActions, named for people since v1.7 t17):
+/// any port, every network type, so it covers Direct Link (TCP 21118) and LAN Discovery (UDP 21119). v1.7 t12.
+const kWindowsRuleName = 'Boring Remote Service';
 
 /// `netsh` arguments that read the rule, with its program path; exit code 0 means a rule by that
 /// name is there ([windowsRuleAllowsExe] says whether it is for this exe). Needs no admin.

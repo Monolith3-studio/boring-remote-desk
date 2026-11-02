@@ -69,7 +69,8 @@ class FirewallRuleInCI(unittest.TestCase):
 
     def test_install_leaves_an_inbound_any_port_rule_for_the_exe(self):
         st = self.smoke()
-        self.assertIn("Get-NetFirewallRule -DisplayName 'BoringRemote Service'", st)
+        self.assertIn("Get-NetFirewallRule -DisplayName 'Boring Remote Service'", st)  # t17: what people read
+        self.assertIn("(Get-Service -Name BoringRemote).DisplayName -ne 'Boring Remote Service'", st)
         for needle in ("'Inbound'", "'Allow'", "Profile)\" -ne 'Any'", "LocalPort)\" -ne 'Any'",
                        "Protocol)\" -ne 'Any'", "$af.Program -ne $exe"):
             self.assertIn(needle, st)

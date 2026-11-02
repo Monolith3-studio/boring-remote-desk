@@ -311,19 +311,19 @@ void main() {
 
     test('the rule commands: read without admin, add asks Windows once, path quoted', () {
       expect(windowsRuleShowArgs(),
-          ['advfirewall', 'firewall', 'show', 'rule', 'name=BoringRemote Service', 'dir=in', 'verbose']);
+          ['advfirewall', 'firewall', 'show', 'rule', 'name=Boring Remote Service', 'dir=in', 'verbose']);
       final add = windowsRuleAddArgs(r"C:\Program Files\BoringRemote\BoringRemote.exe");
       expect(add.take(2), ['-NoProfile', '-Command']);
       expect(add.last,
           "Start-Process -FilePath netsh -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList "
-          "'advfirewall firewall add rule name=\"BoringRemote Service\" dir=in action=allow "
+          "'advfirewall firewall add rule name=\"Boring Remote Service\" dir=in action=allow "
           "program=\"C:\\Program Files\\BoringRemote\\BoringRemote.exe\" enable=yes profile=any'");
       expect(windowsRuleAddArgs(r"C:\it's\BoringRemote.exe").last, contains(r"C:\it''s\BoringRemote.exe"));
     });
 
     test('the reach check counts the rule only when it is for this copy of Boring Remote', () {
-      // `netsh advfirewall firewall show rule name="BoringRemote Service" dir=in verbose`, trimmed.
-      const installed = 'Rule Name:                            BoringRemote Service\r\n'
+      // `netsh advfirewall firewall show rule name="Boring Remote Service" dir=in verbose`, trimmed.
+      const installed = 'Rule Name:                            Boring Remote Service\r\n'
           '----------------------------------------------------------------------\r\n'
           'Enabled:                              Yes\r\n'
           'Direction:                            In\r\n'

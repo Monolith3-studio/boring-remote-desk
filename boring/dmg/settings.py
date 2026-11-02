@@ -1,5 +1,5 @@
 # dmgbuild settings for the Boring Remote Mac DMG. boring/dmg/release-mac.sh runs:
-#   dmgbuild -s boring/dmg/settings.py -D app=<BoringRemote.app> -D art=boring/dmg "Boring Remote" out.dmg
+#   dmgbuild -s boring/dmg/settings.py -D app="<Boring Remote.app>" -D art=boring/dmg "Boring Remote" out.dmg
 # Art: background.png + background@2x.png next to this file (boring/dmg/make_art.py);
 # dmgbuild finds the @2x file and joins both into one HiDPI TIFF.
 # House DMG minimum: sized window, no toolbar/sidebar/path bar/status bar, app left,

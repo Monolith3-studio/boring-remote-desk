@@ -36,7 +36,7 @@ def run(cmd, env=None, **kw):
 
 
 def make_app(where, version="1.5.0"):
-    app = pathlib.Path(where) / "BoringRemote.app"
+    app = pathlib.Path(where) / "Boring Remote.app"  # t17: the name people see; the exe stays BoringRemote
     (app / "Contents" / "MacOS").mkdir(parents=True)
     (app / "Contents" / "Resources").mkdir()
     for exe in ("BoringRemote", "service"):
@@ -127,7 +127,7 @@ class ReleaseMac(unittest.TestCase):
         mnt.mkdir()
         subprocess.run(["hdiutil", "attach", dmg, "-readonly", "-nobrowse", "-mountpoint", mnt, "-quiet"], check=True)
         try:
-            d = subprocess.run(["codesign", "-d", "-r-", mnt / "BoringRemote.app"], capture_output=True, text=True)
+            d = subprocess.run(["codesign", "-d", "-r-", mnt / "Boring Remote.app"], capture_output=True, text=True)
         finally:
             subprocess.run(["hdiutil", "detach", mnt, "-quiet", "-force"])
         self.assertIn(f'designated => identifier "io.boringlabs.remote.agent" and certificate leaf = '
@@ -300,10 +300,17 @@ class VersionFile(unittest.TestCase):
         self.assertNotRegex(text, r"(curl|scp|rsync|wrangler)[^\n]*boringlabs")
         self.assertNotIn(".sig", job("build-macos") + j)
 
+    def test_workflow_builds_and_signs_boring_remote_app(self):  # t17
+        j = job("build-macos")
+        self.assertIn('APP="flutter/build/macos/Build/Products/Release/Boring Remote.app"', step(j, "Smoke test (binary starts)"))
+        self.assertIn('release-mac.sh "flutter/build/macos/Build/Products/Release/Boring Remote.app"',
+                      step(j, "Sign, build DMG, mount and verify"))
+        self.assertNotIn("Release/BoringRemote.app", j)
+
     def test_workflow_builds_the_update_package_from_the_signed_app(self):
         st = step(job("build-macos"), "Build update package")
         self.assertIn("boring/dmg/make-update-package.sh", st)
-        self.assertIn("Release/BoringRemote.app", st)
+        self.assertIn('"flutter/build/macos/Build/Products/Release/Boring Remote.app"', st)
         j = job("build-macos")
         self.assertLess(j.index("Sign, build DMG"), j.index("Build update package"))
         self.assertLess(j.index("Build update package"), j.index("path: dmg-out/*"))
@@ -324,8 +331,11 @@ class UpdatePackage(unittest.TestCase):
         self.assertEqual(r.stdout.strip().splitlines()[-1], str(pkg))
         with tarfile.open(pkg, "r:xz") as t:
             names = t.getnames()
+        # t17: "Boring Remote.app" goes in under 1.6.x's name, the only one its installer takes;
+        # 1.7's installer takes either and installs it as "Boring Remote.app".
         self.assertEqual({n.split("/")[0] for n in names}, {"BoringRemote.app"})
         self.assertIn("BoringRemote.app/Contents/Info.plist", names)
+        self.assertIn("BoringRemote.app/Contents/MacOS/BoringRemote", names)
 
     def test_missing_app_fails(self):
         tmp = pathlib.Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, tmp, True)
@@ -403,7 +413,7 @@ class Workflow(unittest.TestCase):
 
 class Settings(unittest.TestCase):
     def settings(self):
-        g = {"defines": {"app": "/x/BoringRemote.app", "art": str(DMG)}}
+        g = {"defines": {"app": "/x/Boring Remote.app", "art": str(DMG)}}
         exec(compile((DMG / "settings.py").read_text(), "settings.py", "exec"), g)
         return g
 
@@ -413,10 +423,10 @@ class Settings(unittest.TestCase):
             self.assertIs(s[k], False, k)
         self.assertEqual(s["window_rect"][1], (640, 468))
         self.assertEqual(s["symlinks"], {"Applications": "/Applications"})
-        self.assertEqual(s["files"], ["/x/BoringRemote.app"])
-        self.assertEqual(s["icon"], "/x/BoringRemote.app/Contents/Resources/AppIcon.icns")
+        self.assertEqual(s["files"], ["/x/Boring Remote.app"])
+        self.assertEqual(s["icon"], "/x/Boring Remote.app/Contents/Resources/AppIcon.icns")
         self.assertEqual(s["background"], str(DMG / "background.png"))
-        self.assertEqual(s["icon_locations"], {"BoringRemote.app": (160, 178), "Applications": (480, 178)})
+        self.assertEqual(s["icon_locations"], {"Boring Remote.app": (160, 178), "Applications": (480, 178)})
 
     def test_art_is_committed_at_1x_and_2x_and_not_blank(self):
         import struct

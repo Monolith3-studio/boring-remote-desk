@@ -4,6 +4,8 @@
 
 use base::message_proto;
 
+#[path = "../src/bundle_move.rs"]
+mod bundle_move;
 #[path = "../src/direct_link.rs"]
 mod direct_link;
 #[path = "../src/high_efficiency.rs"]

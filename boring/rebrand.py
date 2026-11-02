@@ -21,6 +21,9 @@ import sys
 
 APP_NAME = "BoringRemote"        # internal name: paths, IPC, launchd, exe; no space on purpose
 DISPLAY_NAME = "Boring Remote"   # what people read
+MAC_BUNDLE = f"{DISPLAY_NAME}.app"     # v1.7 t17: the Mac app file people see; its exe stays APP_NAME
+OLD_MAC_BUNDLE = f"{APP_NAME}.app"     # 1.6.x's, moved once by libs/base/src/bundle_move.rs
+WINDOWS_RULE = f"{DISPLAY_NAME} Service"  # t17: Windows firewall rule and service display name
 AGENT_ID = "io.boringlabs.remote.agent"   # app bundle + LaunchAgent (TCC holder)
 HOSTD_ID = "io.boringlabs.remote.hostd"   # root LaunchDaemon
 ORG = "io.boringlabs"                      # Mac config dir: ~/Library/Preferences/io.boringlabs.BoringRemote
@@ -113,17 +116,19 @@ PATCHES = [
      f'pub static ref ORG: RwLock<String> = RwLock::new("{ORG}".to_owned());',
      "Mac config dir org"),
     ("flutter/macos/Runner/Configs/AppInfo.xcconfig", "PRODUCT_NAME = RustDesk\n",
-     f"PRODUCT_NAME = {APP_NAME}\n", "Mac .app and executable name"),
+     f"PRODUCT_NAME = {DISPLAY_NAME}\nEXECUTABLE_NAME = {APP_NAME}\nPRODUCT_MODULE_NAME = {APP_NAME}\n",
+     "Mac .app is Boring Remote.app (t17); exe and Swift module keep the internal name"),
     ("flutter/macos/Runner/Configs/AppInfo.xcconfig",
      "PRODUCT_BUNDLE_IDENTIFIER = com.carriez.flutterHbb",
      f"PRODUCT_BUNDLE_IDENTIFIER = {AGENT_ID}", "Mac bundle id (xcconfig)"),
     ("flutter/macos/Runner.xcodeproj/project.pbxproj",
      "PRODUCT_BUNDLE_IDENTIFIER = com.carriez.rustdesk;",
      f"PRODUCT_BUNDLE_IDENTIFIER = {AGENT_ID};", "Mac bundle id (project)"),
-    ("flutter/macos/Runner.xcodeproj/project.pbxproj", "RustDesk.app", f"{APP_NAME}.app",
-     "Mac product reference"),
+    ("flutter/macos/Runner.xcodeproj/project.pbxproj", "path = RustDesk.app;", f'path = "{MAC_BUNDLE}";',
+     "Mac product reference (quoted: the name has a space)"),
+    ("flutter/macos/Runner.xcodeproj/project.pbxproj", "RustDesk.app", MAC_BUNDLE, "Mac product reference"),
     ("flutter/macos/Runner.xcodeproj/xcshareddata/xcschemes/Runner.xcscheme",
-     'BuildableName = "RustDesk.app"', f'BuildableName = "{APP_NAME}.app"', "Mac scheme"),
+     'BuildableName = "RustDesk.app"', f'BuildableName = "{MAC_BUNDLE}"', "Mac scheme"),
     ("flutter/macos/Runner/Info.plist",
      "<key>CFBundleName</key>\n\t<string>$(PRODUCT_NAME)</string>",
      f"<key>CFBundleName</key>\n\t<string>{DISPLAY_NAME}</string>\n"
@@ -144,8 +149,9 @@ PATCHES = [
      f'set(BINARY_NAME "{APP_NAME}")', "Windows exe = <app name>.exe, as the app expects"),
     ("build.py", "-e ../../{flutter_build_dir_2}/rustdesk.exe",
      "-e ../../{flutter_build_dir_2}/" + APP_NAME + ".exe", "portable packer exe"),
-    ("build.py", "./build/macos/Build/Products/Release/RustDesk.app/",
-     f"./build/macos/Build/Products/Release/{APP_NAME}.app/", "Mac service binary copy"),
+    ("build.py", "cp -rf ../target/release/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/",
+     f'cp -rf ../target/release/service "./build/macos/Build/Products/Release/{MAC_BUNDLE}/Contents/MacOS/"',
+     "Mac service binary copy"),
     ("flutter/windows/runner/Runner.rc", 'VALUE "FileDescription", "RustDesk Remote Desktop"',
      f'VALUE "FileDescription", "{DISPLAY_NAME}"', "Windows file description"),
     ("flutter/windows/runner/Runner.rc", 'VALUE "ProductName", "RustDesk"',
@@ -166,8 +172,16 @@ PATCHES = [
     for f, old, new, why in (
         ("agent.plist", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("agent.plist", "<string>com.carriez.rustdesk</string>", f"<string>{AGENT_ID}</string>", "agent bundle id"),
+        # t17: the app file is "Boring Remote.app"; the exe in it keeps the internal name
+        ("agent.plist", "/Applications/RustDesk.app/", f"/Applications/{MAC_BUNDLE}/", "agent runs Boring Remote.app"),
+        ("agent.plist", "Contents/MacOS/RustDesk</string>", f"Contents/MacOS/{APP_NAME}</string>", "agent exe"),
         ("daemon.plist", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("daemon.plist", "<string>com.carriez.rustdesk</string>", f"<string>{AGENT_ID}</string>", "daemon bundle id"),
+        # t17: run the service directly; through `sh -c` the space in the path splits the command
+        ("daemon.plist", "        <string>/bin/sh</string>\n        <string>-c</string>\n"
+         "        <string>/Applications/RustDesk.app/Contents/MacOS/service</string>\n",
+         f"        <string>/Applications/{MAC_BUNDLE}/Contents/MacOS/service</string>\n", "hostd runs the service, no sh -c"),
+        ("daemon.plist", "/Applications/RustDesk.app/", f"/Applications/{MAC_BUNDLE}/", "hostd working directory"),
         ("install.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("install.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         # the app's config dir is ~/Library/Preferences/<ORG>.<APP_NAME>, files <APP_NAME>.toml / 2.toml
@@ -178,9 +192,12 @@ PATCHES = [
         ("uninstall.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("update.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("update.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
+        ("update.scpt", '"/Applications/RustDesk.app"', f'"/Applications/{MAC_BUNDLE}"', "upstream updater bundle path"),
         # ours (Install update, slice 6): same label as daemon.plist, from the same constant
         ("install-update.sh", 'SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{HOSTD_ID}"',
          "LaunchDaemon label (install update)"),
+        ("install-update.sh", 'AGENT_LABEL="com.carriez.RustDesk_server"', f'AGENT_LABEL="{AGENT_ID}"',
+         "LaunchAgent label (bundle move, t17)"),
     )
 ] + [
     # --- servers: none ------------------------------------------------------
@@ -289,6 +306,59 @@ PATCHES = [
     ("flutter/ios_arm64.sh", "--features flutter,hwcodec", "--features flutter", "ios helper"),
     ("flutter/ndk_arm.sh", "--features flutter,hwcodec", "--features flutter", "android helper"),
     ("flutter/ndk_arm64.sh", "--features flutter,hwcodec", "--features flutter", "android helper"),
+]
+
+# --- v1.7 t17: the Mac app file is "Boring Remote.app" ---------------------------
+# What runs from /Applications names the new bundle; 1.6.x's bundle still counts as installed
+# (and its exe as the user server) until libs/base/src/bundle_move.rs moves it. Upstream's
+# updater (update_me, update_from_dmg_as_root, update_extracted) is dead code here and keeps
+# its paths. Windows: only what people read changes; exe, install dir and service name stay.
+MAC_INSTALLED = (
+    "pub fn is_installed() -> bool {\n"
+    "    if let Ok(p) = std::env::current_exe() {\n")
+IPC_AUTH_OLD = (
+    "    let expected_path = PathBuf::from(format!(\n"
+    "        \"/Applications/{}.app/Contents/MacOS/{}\",\n"
+    "        crate::get_app_name(),\n"
+    "        crate::get_app_name()\n"
+    "    ));\n"
+    "    let Ok(expected_path) = fs::canonicalize(expected_path) else {\n"
+    "        return false;\n"
+    "    };\n"
+    "    paths_refer_to_same_file(&peer_exe, &expected_path)\n")
+WIN_SC_NAME = 'start= auto DisplayName= \\"{app_name} Service\\"'
+WIN_FW_DELETE = '    netsh advfirewall firewall delete rule name=\\"{app_name} Service\\"\n'
+PATCHES += [
+    ("src/platform/macos.rs", MAC_INSTALLED,
+     MAC_INSTALLED + f"        // boring-remote (v1.7 t17): {MAC_BUNDLE}; 1.6.x's name below counts until it moves.\n"
+     f'        if p.starts_with("/Applications/{MAC_BUNDLE}") {{\n            return true;\n        }}\n',
+     "the new bundle counts as installed"),
+    ("src/platform/macos.rs", '.arg(&format!("/Applications/{}.app", crate::get_app_name()))',
+     f'.arg("/Applications/{MAC_BUNDLE}")', "reopen the app from the new bundle"),
+    ("src/ipc.rs", '.arg(&format!("/Applications/{}.app", crate::get_app_name()))',
+     f'.arg("/Applications/{MAC_BUNDLE}")', "reopen the app from the new bundle"),
+    ("src/ipc/auth.rs", IPC_AUTH_OLD,
+     f"    // boring-remote (v1.7 t17): {MAC_BUNDLE}, or 1.6.x's bundle until bundle_move moves it.\n"
+     f'    ["{MAC_BUNDLE}", "{OLD_MAC_BUNDLE}"].iter().any(|bundle| {{\n'
+     '        fs::canonicalize(format!("/Applications/{}/Contents/MacOS/{}", bundle, crate::get_app_name()))\n'
+     "            .is_ok_and(|expected_path| paths_refer_to_same_file(&peer_exe, &expected_path))\n"
+     "    })\n",
+     "the user server may run from the new bundle (or the old one until it moves)"),
+    # Windows, what people read
+    ("res/msi/CustomActions/FirewallRules.cpp", 'L"%ls Service", exeName);',
+     f'L"{WINDOWS_RULE}"); // boring-remote (v1.7 t17): what people read, not the exe name',
+     "MSI firewall rule display name"),
+    ("src/platform/windows.rs", 'firewall add rule name=\\"{app_name} Service\\"',
+     f'firewall add rule name=\\"{WINDOWS_RULE}\\"', "self-install firewall rule display name"),
+    ("src/platform/windows.rs", WIN_FW_DELETE,
+     WIN_FW_DELETE + f'    netsh advfirewall firewall delete rule name=\\"{WINDOWS_RULE}\\"\n',
+     "uninstall removes the rule under both names"),
+    ("src/platform/windows.rs", WIN_SC_NAME, f'start= auto DisplayName= \\"{WINDOWS_RULE}\\"',
+     "self-install service display name"),
+    ("src/platform/windows.rs", 'reg add {subkey} /f /v DisplayName /t REG_SZ /d \\"{app_name}\\"',
+     f'reg add {{subkey}} /f /v DisplayName /t REG_SZ /d \\"{DISPLAY_NAME}\\"', "Apps list name (self-install)"),
+    ("src/platform/windows.rs", 'reg add {subkey} /f /v Publisher /t REG_SZ /d \\"{app_name}\\"',
+     f'reg add {{subkey}} /f /v Publisher /t REG_SZ /d \\"{DISPLAY_NAME}\\"', "Apps list publisher (self-install)"),
 ]
 
 # --- Windows MSI (res/msi, WiX v4) ---------------------------------------------
@@ -590,7 +660,7 @@ CONN = "src/server/connection.rs"
 IO_LOOP = "src/client/io_loop.rs"
 MEDIATOR = "src/rendezvous_mediator.rs"
 BASE_MODS = ("// boring-remote (v1.7): ours, see libs/base/tests/boring.rs\n"
-             "pub mod direct_link;\npub mod high_efficiency;\npub mod lan;\npub mod trust;\npub mod update_feed;\n")
+             "pub mod bundle_move;\npub mod direct_link;\npub mod high_efficiency;\npub mod lan;\npub mod trust;\npub mod update_feed;\n")
 # Target: the direct listener asks for encryption off Tailscale (ADR 0005) and marks the Direct Link.
 T03_LISTENER = (
     "                // boring-remote: encrypted everywhere but Tailscale (v1.7 t03, ADR 0005).\n"

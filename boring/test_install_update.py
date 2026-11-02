@@ -9,6 +9,7 @@ launchctl / xattr / pkill / osascript / sudo are stubs that only log their args.
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -31,16 +32,32 @@ FAKE_BIN = """#!/bin/sh
 echo "$0 $*" >> "$STUB_LOG"
 [ "$1" = --boring-verify-package ] && [ -f "$2" ] && [ "$3" = "{sig}" ]
 """
-STUB = '#!/bin/sh\necho "$(basename "$0") $*" >> "$STUB_LOG"\n'
+STUB = ('#!/bin/sh\necho "$(basename "$0") $*" >> "$STUB_LOG"\n'
+        # one [arg] per argument, so a path with a space shows whether it stayed one argument
+        'if [ -n "$ARGS_LOG" ]; then { printf %s "$(basename "$0")"; for a in "$@"; do printf " [%s]" "$a"; done; echo; }'
+        ' >> "$ARGS_LOG"; fi\n')
+# t17: `service --write-plists` writes both plists for the new bundle (as the real one does, as root).
+FAKE_SERVICE = """#!/bin/sh
+echo "service $*" >> "$STUB_LOG"
+[ "$1" = --write-plists ] || exit 1
+for p in "$BORING_TEST_ROOT/Library/LaunchDaemons/{daemon}.plist" "$BORING_TEST_ROOT/Library/LaunchAgents/{agent}.plist"; do
+  echo "<string>/Applications/Boring Remote.app/Contents/MacOS/service</string>" > "$p"
+done
+"""
+BUNDLE = "Boring Remote.app"   # t17: what people see
+OLD_BUNDLE = "BoringRemote.app"  # 1.6.x, and the top-level name inside the update package
 
 
-def make_app(parent, version, marker):
-    app = parent / "BoringRemote.app"
+def make_app(parent, version, marker, name=BUNDLE):
+    app = parent / name
     (app / "Contents/MacOS").mkdir(parents=True)
     (app / "Contents/Info.plist").write_text(INFO_PLIST.format(v=version))
     b = app / "Contents/MacOS/BoringRemote"
     b.write_text(FAKE_BIN.format(sig=GOOD_SIG))
     b.chmod(0o755)
+    svc = app / "Contents/MacOS/service"
+    svc.write_text(FAKE_SERVICE.format(daemon=daemon_label(), agent=agent_label()))
+    svc.chmod(0o755)
     (app / "Contents/marker").write_text(marker)
     return app
 
@@ -59,12 +76,14 @@ class InstallUpdate(unittest.TestCase):
             p.chmod(0o755)
         self.log = self.tmp / "stub.log"
         self.log.write_text("")
+        self.args_log = self.tmp / "args.log"
+        self.args_log.write_text("")
+        for d in ("LaunchDaemons", "LaunchAgents"):
+            (self.root / "Library" / d).mkdir(parents=True)
 
-    def package(self, version="1.6.0", name="BoringRemote.app"):
+    def package(self, version="1.6.0", name=OLD_BUNDLE):
         src = self.tmp / f"src-{version}-{name}"
-        app = make_app(src, version, "new")
-        if name != app.name:
-            app.rename(src / name)
+        make_app(src, version, "new", name)
         pkg = self.tmp / f"pkg-{version}-{name}.tar.xz"
         with tarfile.open(pkg, "w:xz") as t:
             t.add(src / name, arcname=name)
@@ -72,6 +91,7 @@ class InstallUpdate(unittest.TestCase):
 
     def run_script(self, *args, root=True, wait=2):
         env = {"PATH": f"{self.stubs}:/usr/bin:/bin:/usr/sbin:/sbin", "STUB_LOG": str(self.log),
+               "ARGS_LOG": str(self.args_log),
                "TMPDIR": str(self.tmp), "BORING_ROLLBACK_WAIT": str(wait)}
         if root:
             env["BORING_TEST_ROOT"] = str(self.root)
@@ -199,6 +219,85 @@ class InstallUpdate(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(self.marker(self.app), "old")
 
+    # --- v1.7 t17: the bundle is "Boring Remote.app"; 1.6.x left "BoringRemote.app" ----------
+    def args(self, tool):
+        return [l for l in self.args_log.read_text().splitlines() if l.startswith(tool + " ")]
+
+    def plists(self):
+        return [self.root / f"Library/LaunchDaemons/{daemon_label()}.plist",
+                self.root / f"Library/LaunchAgents/{agent_label()}.plist"]
+
+    def old_install(self, version="1.6.4", plists=True):
+        """A 1.6.x Mac: BoringRemote.app, and plists that run it (the daemon through sh -c)."""
+        shutil.rmtree(self.app)
+        old = make_app(self.root / "Applications", version, "old16", OLD_BUNDLE)
+        if plists:
+            for p in self.plists():
+                p.write_text("<string>/bin/sh</string><string>-c</string>"
+                             "<string>/Applications/BoringRemote.app/Contents/MacOS/service</string>")
+        return old
+
+    def assert_new_plists(self):
+        for p in self.plists():
+            self.assertIn("/Applications/Boring Remote.app/", p.read_text())
+            self.assertNotIn("/Applications/BoringRemote.app/", p.read_text())
+
+    def test_move_bundle_renames_a_16x_install_and_rewrites_its_plists(self):
+        old = self.old_install()
+        r = self.run_script("--move-bundle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(old.exists())
+        self.assertEqual(self.marker(self.app), "old16")
+        self.assert_new_plists()
+        self.assertIn("service --write-plists", self.log.read_text())
+        args = self.args("launchctl")
+        self.assertIn(f"launchctl [bootout] [system/{daemon_label()}]", args)
+        self.assertIn(f"launchctl [bootstrap] [system] [{self.plists()[0]}]", args)
+        self.assertLess(args.index(f"launchctl [bootout] [system/{daemon_label()}]"),
+                        args.index(f"launchctl [bootstrap] [system] [{self.plists()[0]}]"))
+        # reopened from the new path, which stays one argument with its space
+        self.assertTrue(self.wait_for(lambda: any(a.endswith(f"[open] [{self.app}]") for a in self.args("launchctl")))
+                        or console_is_root(), self.args("launchctl"))
+
+    def test_move_bundle_keeps_the_newer_of_two_bundles(self):
+        old = self.old_install("1.6.4")
+        make_app(self.root / "Applications", "1.7.0", "dmg")  # 1.7 dragged from the DMG beside 1.6.x
+        r = self.run_script("--move-bundle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(old.exists())
+        self.assertEqual(self.marker(self.app), "dmg")
+        self.assert_new_plists()
+
+    def test_move_bundle_once_moved_does_nothing(self):
+        r = self.run_script("--move-bundle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.marker(self.app), "old")
+        self.assertEqual(self.calls("launchctl"), [])
+        self.assertEqual(self.calls("service"), [])
+
+    def test_move_bundle_without_a_service_only_renames(self):
+        old = self.old_install(plists=False)
+        r = self.run_script("--move-bundle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(old.exists())
+        self.assertEqual(self.marker(self.app), "old16")
+        self.assertEqual([c for c in self.calls("launchctl") if " asuser " not in f" {c} "], [])
+        self.assertEqual(self.calls("service"), [])
+
+    def test_update_over_a_16x_install_moves_it_first(self):
+        old = self.old_install("1.6.4")
+        r = self.run_script(self.package("1.7.0"), GOOD_SIG, "1.7.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(old.exists())
+        self.assertEqual(self.marker(self.app), "new")
+        self.assertEqual(self.marker(pathlib.Path(str(self.app) + ".previous")), "old16")
+        self.assert_new_plists()
+
+    def test_package_with_the_new_bundle_name_installs_too(self):
+        r = self.run_script(self.package(name=BUNDLE), GOOD_SIG, "1.6.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.marker(self.app), "new")
+
     def test_service_label_is_the_daemon_plist_label(self):
         m = re.search(r'^SERVICE_LABEL="([^"]+)"$', SCRIPT.read_text(), re.M)
         self.assertEqual(m.group(1), daemon_label())
@@ -217,6 +316,11 @@ class InstallUpdate(unittest.TestCase):
 
 def daemon_label():
     t = (SCRIPTS / "daemon.plist").read_text()
+    return re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", t).group(1)
+
+
+def agent_label():
+    t = (SCRIPTS / "agent.plist").read_text()
     return re.search(r"<key>Label</key>\s*<string>([^<]+)</string>", t).group(1)
 
 

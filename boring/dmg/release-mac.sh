@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sign the Mac app, build the branded DMG with dmgbuild, mount and verify it, write its sha256.
-#   boring/dmg/release-mac.sh <BoringRemote.app> <version> <out dir>     (run from the repo root)
+#   boring/dmg/release-mac.sh "<Boring Remote.app>" <version> <out dir>     (run from the repo root)
 #
 # Signing identity comes from the environment (GitHub Actions secrets):
 #   MAC_SIGN_P12           base64 of a PKCS#12 holding ONLY "Boring Remote Code Signing"

@@ -35,6 +35,10 @@ RUST_HOOKS = "v1.7 Rust hooks landed: base modules, Direct Link meta, LAN end of
 NO_DEFAULT_PASSWORD = "no default or blank password ships (ADR 0002)"
 TRUST_WIRED = "LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)"
 TRUST_TOKENS = "trust tokens: 256-bit, constant-time, option names agree in Rust and Dart"
+MAC_BUNDLE = "Mac bundle is Boring Remote.app; its exe stays BoringRemote (t17)"
+MAC_PLISTS = "launchd plists run Boring Remote.app directly, no sh -c (t17)"
+MAC_MOVE = "a 1.6.x BoringRemote.app is moved once; both paths count as installed until then (t17)"
+WIN_NAMES = "Windows service, firewall rule and Apps list say Boring Remote; exe and install dir unchanged (t17)"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 
@@ -644,6 +648,43 @@ class RebrandSeam(unittest.TestCase):
                   "TextStyle(color: Kit.coral, fontSize: 18")
         r = run(CHECK, self.root)
         self.assertRegex(r.stdout, r"FAIL look kit wired: .*kit_look.dart: coral text")
+
+
+    # --- v1.7 t17: the app file is "Boring Remote.app" ---------------------------------
+    def test_bundle_name_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (MAC_BUNDLE, MAC_PLISTS, MAC_MOVE, WIN_NAMES):
+            self.assertIn(f"PASS {fact}", r.stdout)
+        xc = (self.root / "flutter/macos/Runner/Configs/AppInfo.xcconfig").read_text()
+        self.assertIn("PRODUCT_NAME = Boring Remote\n", xc)
+        self.assertIn("EXECUTABLE_NAME = BoringRemote\n", xc)
+        pbx = (self.root / "flutter/macos/Runner.xcodeproj/project.pbxproj").read_text()
+        self.assertIn('path = "Boring Remote.app";', pbx)  # unquoted, the space breaks the project file
+
+    def test_bundle_name_back_to_the_internal_name_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/macos/Runner/Configs/AppInfo.xcconfig", "PRODUCT_NAME = Boring Remote\n",
+                  "PRODUCT_NAME = BoringRemote\n")
+        self.assert_check_fails(MAC_BUNDLE)
+
+    def test_daemon_back_through_an_unquoted_sh_c_fails_check(self):
+        self.rebrand()
+        self.edit("src/platform/privileges_scripts/daemon.plist",
+                  "<string>/Applications/Boring Remote.app/Contents/MacOS/service</string>",
+                  "<string>/bin/sh</string>\n        <string>-c</string>\n"
+                  "        <string>/Applications/Boring Remote.app/Contents/MacOS/service</string>")
+        self.assert_check_fails(MAC_PLISTS)
+
+    def test_old_path_no_longer_trusted_by_ipc_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc/auth.rs", '["Boring Remote.app", "BoringRemote.app"]', '["Boring Remote.app"]')
+        self.assert_check_fails(MAC_MOVE)
+
+    def test_firewall_rule_named_after_the_exe_fails_check(self):
+        self.rebrand()
+        self.edit("res/msi/CustomActions/FirewallRules.cpp", 'L"Boring Remote Service"', 'L"%ls Service", exeName')
+        self.assert_check_fails(WIN_NAMES)
 
 
 if __name__ == "__main__":

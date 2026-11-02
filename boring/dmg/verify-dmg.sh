@@ -10,7 +10,7 @@
 set -uo pipefail
 DMG=${1:?usage: verify-dmg.sh <dmg> <version> [pin]}; WANT=${2:?usage: verify-dmg.sh <dmg> <version> [pin]}
 PIN=${3:-}
-APP="BoringRemote.app"
+APP="Boring Remote.app"  # v1.7 t17; the exe inside stays BoringRemote
 ID="io.boringlabs.remote.agent"
 MNT=$(mktemp -d)
 hdiutil attach "$DMG" -readonly -nobrowse -noautoopen -mountpoint "$MNT" -quiet || { echo "FAIL: cannot mount $DMG"; exit 1; }

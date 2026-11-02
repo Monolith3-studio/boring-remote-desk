@@ -620,6 +620,7 @@ INSTALL_SCRIPT = "src/platform/privileges_scripts/install-update.sh"
 # Every `with administrator privileges` site, as file or file:enclosing fn/const.
 ROOT_CALLERS = {
     "src/update_install_run.rs:OSA": "runs Resources/boring-install-update.sh (slice 6), the one update path",
+    "libs/base/src/bundle_move.rs:OSA": "runs the same script --move-bundle: 1.6.x's bundle to Boring Remote.app (t17)",
     "src/platform/macos.rs:elevate": "upstream daemon install/uninstall elevation, not an update",
     "src/platform/macos.rs:update_me": "upstream updater; dead because start_auto_update_macos returns first",
     "src/platform/privileges_scripts/update.scpt": "upstream updater script, only reached from update_me",
@@ -710,7 +711,7 @@ def windows_checks(c):
            not off and words, "; ".join(off) or "main.dart does not set the Windows kit words")
 
     home, kit = c.read(rebrand.HOME), c.read(SETUP_DART)
-    rule = f"{rebrand.APP_NAME} Service"
+    rule = rebrand.WINDOWS_RULE
     hooks = ["isWindows ? SetupPlatform.windows : SetupPlatform.mac", "platform: platform,",
              "Process.run('netsh', windowsRuleShowArgs())",
              "Process.run('powershell', windowsRuleAddArgs(Platform.resolvedExecutable))"]
@@ -720,17 +721,17 @@ def windows_checks(c):
     c.fact("Windows Setup step 2 lets other computers reach this one, through the installer's rule (t12)",
            not missing, "; ".join(missing))
 
-    # The MSI's custom action names the rule "<exe name> Service" (BoringRemote.exe -> the name above).
+    # The MSI's custom action names the rule for people (t17), not after the exe as upstream does.
     wxs = c.read(f"{MSI_DIR}/Components/RustDesk.wxs")
     fw = strip_tests_and_comments(c.read("res/msi/CustomActions/FirewallRules.cpp"))
     win = c.read("src/platform/windows.rs")
     bad = [n for n, ok in [
         ("added on install", '<Custom Action="AddFirewallRules" Before="InstallFinalize"' in wxs),
         ("removed on uninstall", '<Custom Action="RemoveFirewallRules" Before="RemoveFiles"/>' in wxs),
-        ("named <exe> Service", 'L"%ls Service"' in fw),
+        (f"named {rule}", f'L"{rule}");' in fw and 'L"%ls Service"' not in fw),
         ("every network type", "CurrentProfilesBitMask = NET_FW_PROFILE2_ALL;" in fw),
         ("any protocol and port", not re.search(r"put_(Protocol|LocalPorts|RemotePorts|Profiles\(NET_FW_PROFILE2_(DOMAIN|PRIVATE|PUBLIC))", fw)),
-        ("self-install adds the same rule", f'netsh advfirewall firewall add rule name=\\"{{app_name}} Service\\" dir=in action=allow program=' in win),
+        ("self-install adds the same rule", f'netsh advfirewall firewall add rule name=\\"{rule}\\" dir=in action=allow program=' in win),
     ] if not ok]
     c.fact("installer's app rule lets other computers reach Direct Link 21118: any port, every network type (t12)",
            not bad, "; ".join(bad))
@@ -956,6 +957,76 @@ def activate_link_checks(c):
     c.fact("incoming links (and the key in them) are never logged", not logged, "; ".join(logged))
 
 
+def bundle_checks(c):
+    """v1.7 t17: the Mac app file is "Boring Remote.app" and Windows shows Boring Remote; exe,
+    bundle id, launchd labels, config dirs and the Windows install dir keep the internal name,
+    so settings, Trusted Controllers and TCC grants carry over."""
+    bundle, old, apps = rebrand.MAC_BUNDLE, rebrand.OLD_MAC_BUNDLE, f"/Applications/{rebrand.MAC_BUNDLE}"
+    xc = dict(re.findall(r"(?m)^(\w+) = (.*)$", c.read("flutter/macos/Runner/Configs/AppInfo.xcconfig")))
+    scheme = c.read("flutter/macos/Runner.xcodeproj/xcshareddata/xcschemes/Runner.xcscheme")
+    wf = c.read(".github/workflows/boring-build.yml")
+    bad = [n for n, ok in [
+        (f"PRODUCT_NAME is {xc.get('PRODUCT_NAME')}", xc.get("PRODUCT_NAME") == SHOWN),
+        (f"EXECUTABLE_NAME is {xc.get('EXECUTABLE_NAME')}", xc.get("EXECUTABLE_NAME") == APP),
+        ("project's product path not quoted", f'path = "{bundle}";' in c.read("flutter/macos/Runner.xcodeproj/project.pbxproj")),
+        ("scheme", set(re.findall(r'BuildableName = "([^"]*\.app)"', scheme)) == {bundle}),
+        ("build.py service copy", f'"./build/macos/Build/Products/Release/{bundle}/Contents/MacOS/"' in c.read("build.py")),
+        ("verify-dmg.sh", f'APP="{bundle}"' in c.read("boring/dmg/verify-dmg.sh")),
+        ("workflow", f'"flutter/build/macos/Build/Products/Release/{bundle}"' in wf and f"Release/{old}" not in wf),
+    ] if not ok]
+    c.fact(f"Mac bundle is {bundle}; its exe stays {APP} (t17)", not bad, "; ".join(bad))
+
+    def plist(name):  # as the app writes it: correct_app_name turns RustDesk into APP
+        try:
+            text = c.read(f"src/platform/privileges_scripts/{name}").replace("RustDesk", APP)
+            return plistlib.loads(text.encode())
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)}
+    agent, daemon = plist("agent.plist"), plist("daemon.plist")
+    wd = f"{apps}/Contents/MacOS/"
+    bad = [n for n, ok in [
+        (f"agent runs {agent.get('ProgramArguments')}", agent.get("ProgramArguments") == [f"{wd}{APP}", "--server"]),
+        (f"daemon runs {daemon.get('ProgramArguments')}", daemon.get("ProgramArguments") == [f"{wd}service"]),
+        ("working directories", agent.get("WorkingDirectory") == wd and daemon.get("WorkingDirectory") == wd),
+    ] if not ok]
+    c.fact(f"launchd plists run {bundle} directly, no sh -c (t17)", not bad, "; ".join(bad))
+
+    mac, ipc, auth = c.read("src/platform/macos.rs"), c.read("src/ipc.rs"), c.read("src/ipc/auth.rs")
+    move, script = c.read("libs/base/src/bundle_move.rs"), c.read(INSTALL_SCRIPT)
+    stale = '.arg(&format!("/Applications/{}.app", crate::get_app_name()))'
+    bad = [n for n, ok in [
+        ("is_installed", rebrand.MAC_INSTALLED + "        // boring-remote (v1.7 t17)" in mac
+         and f'if p.starts_with("{apps}") {{' in mac),
+        ("reopen paths", stale not in mac + ipc and f'.arg("{apps}")' in mac and f'.arg("{apps}")' in ipc),
+        ("IPC trusts the user server from both bundles", f'["{bundle}", "{old}"].iter().any(|bundle| {{' in auth),
+        ("base mod", "pub mod bundle_move;" in c.read(rebrand.BASE_LIB)),
+        ("move hook", "base::bundle_move::start(crate::update_rollback::SUPPORT_DIR, crate::platform::quit_gui);"
+         in c.read("src/update_notice_run.rs")),
+        ("bundle_move paths", f'BUNDLE: &str = "{apps}";' in move and f'OLD_BUNDLE: &str = "/Applications/{old}";' in move
+         and f'"/Library/LaunchDaemons/{HOSTD}.plist"' in move and f'"/Library/LaunchAgents/{AGENT}.plist"' in move),
+        ("install-update.sh", f'BUNDLE="{bundle}"' in script and f'AGENT_LABEL="{AGENT}"' in script
+         and '"${1:-}" = --move-bundle' in script and "needs_move && move_bundle" in script),
+    ] if not ok]
+    c.fact("a 1.6.x BoringRemote.app is moved once; both paths count as installed until then (t17)",
+           not bad, "; ".join(bad))
+
+    rule, fw, win = rebrand.WINDOWS_RULE, c.read("res/msi/CustomActions/FirewallRules.cpp"), c.read("src/platform/windows.rs")
+    wxl = c.read(f"{MSI_DIR}/Language/Package.en-us.wxl")
+    bad = [n for n, ok in [
+        ("MSI firewall rule", f'L"{rule}");' in fw and 'L"%ls Service"' not in fw),
+        ("MSI service", f'<String Id="Service_DisplayName" Value="{rule}" />' in wxl),
+        ("self-install firewall rule", 'rule name=\\"{app_name} Service\\" dir=' not in win
+         and win.count(f'firewall add rule name=\\"{rule}\\"') == 2
+         and f'firewall delete rule name=\\"{rule}\\"' in win),
+        ("self-install service", 'DisplayName= \\"{app_name} Service\\"' not in win),
+        ("self-install Apps list", f'/v DisplayName /t REG_SZ /d \\"{SHOWN}\\"' in win),
+        (f"exe and install dir are {APP}", f'set(BINARY_NAME "{APP}")' in c.read("flutter/windows/CMakeLists.txt")
+         and 'format!("{}\\\\{}", pf, crate::get_app_name())' in win),
+    ] if not ok]
+    c.fact("Windows service, firewall rule and Apps list say Boring Remote; exe and install dir unchanged (t17)",
+           not bad, "; ".join(bad))
+
+
 def updater_checks(c):
     for name, (rel, want) in UPDATE_ENDPOINTS.items():
         m = re.search(rf'pub const {name}: &str = "([^"]*)";', c.read(rel))
@@ -1175,6 +1246,7 @@ def run_checks(root):
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
 
     updater_checks(c)
+    bundle_checks(c)  # v1.7 t17
 
     # The notice hooks into upstream files only through rebrand.py; each must have landed.
     hooks = [
