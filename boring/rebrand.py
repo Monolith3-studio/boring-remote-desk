@@ -129,6 +129,10 @@ PATCHES = [
      f"<key>CFBundleName</key>\n\t<string>{DISPLAY_NAME}</string>\n"
      f"\t<key>CFBundleDisplayName</key>\n\t<string>{DISPLAY_NAME}</string>",
      "Mac display name (menu bar, About panel, Finder)"),
+    ("flutter/macos/Podfile", "    flutter_additional_macos_build_settings(target)\n",
+     "    flutter_additional_macos_build_settings(target)\n"
+     "    target.build_configurations.each { |c| c.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '12.3' }\n",
+     "pods at macOS 12.3 (Xcode 27 rejects pod targets below 12.0)"),
     ("flutter/macos/Runner/Info.plist", "<string>com.carriez.rustdesk</string>",
      f"<string>{AGENT_ID}</string>", "Mac URL type name"),
     ("flutter/macos/Runner/Info.plist", "<string>rustdesk</string>\n\t\t\t</array>",
