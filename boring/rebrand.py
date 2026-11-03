@@ -353,6 +353,11 @@ PATCHES += [
      "            .is_ok_and(|expected_path| paths_refer_to_same_file(&peer_exe, &expected_path))\n"
      "    })\n",
      "the user server may run from the new bundle (or the old one until it moves)"),
+    # v1.7 t05: encoder threads. Upstream caps them at free RAM GB / 2, so a PC with 3 GB free
+    # encoded 3440x1440 VP9 on 1 thread (9 fps, device check 2026-11-03). A thread needs MBs, not GBs.
+    ("libs/scrap/src/common/codec.rs", "    res = std::cmp::min(res, memory as usize / 2);",
+     "    if memory < 1 { res = 1; } // boring-remote (v1.7 t05): RAM only limits threads when under 1 GB is free",
+     "encoder threads follow the CPU, not free RAM"),
     # Windows, what people read
     ("res/msi/CustomActions/FirewallRules.cpp", 'L"%ls Service", exeName);',
      f'L"{WINDOWS_RULE}"); // boring-remote (v1.7 t17): what people read, not the exe name',
