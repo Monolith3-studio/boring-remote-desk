@@ -923,7 +923,7 @@ def high_efficiency_checks(c):
     software codec captures its points size while High Efficiency is on."""
     he = c.read("libs/base/src/high_efficiency.rs")
     st = re.search(r'pub const STREAM_TYPE: &str = "([^"]+)";', he)
-    hooks = [("src/server/connection.rs", rebrand.T05_MARKER), ("src/server/connection.rs", rebrand.T05_ANSWER),
+    hooks = [("src/server/connection.rs", rebrand.T05_MARKER), ("src/server/connection.rs", rebrand.T05_ANSWER), ("src/server.rs", rebrand.T05_RETINA),
              ("src/client/io_loop.rs", rebrand.T05_LINK_SET), ("src/client/io_loop.rs", rebrand.T05_ASK_FN),
              ("src/client/io_loop.rs", rebrand.T05_ASK_CALL), ("src/client/io_loop.rs", rebrand.T05_BADGE),
              ("flutter/lib/desktop/kit/session_toolbar.dart",
