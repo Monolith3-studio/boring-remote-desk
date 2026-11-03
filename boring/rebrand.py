@@ -770,8 +770,26 @@ T05_ANSWER = (
     "                            // boring-remote (v1.7 t05): tell a Boring Remote Controller its\n"
     "                            // High Efficiency ask took; only then does its badge say so.\n"
     "                            if let Some(answer) = base::high_efficiency::ack_for(&o) {\n"
+    "                                // A Retina Mac on a software codec encodes its points size, a\n"
+    "                                // quarter of the pixels (ADR 0006 amendment, device check A3).\n"
+    "                                #[cfg(target_os = \"macos\")]\n"
+    "                                if base::high_efficiency::captures_points(matches!(\n"
+    "                                    scrap::codec::Encoder::negotiated_codec(),\n"
+    "                                    scrap::CodecFormat::H264 | scrap::CodecFormat::H265\n"
+    "                                )) {\n"
+    "                                    base::high_efficiency::POINTS_CAPTURE.hold(self.inner.id());\n"
+    "                                    if let Some(s) = self.server.upgrade() {\n"
+    "                                        s.write().unwrap().update_enable_retina();\n"
+    "                                    }\n"
+    "                                }\n"
     "                                self.send(answer).await;\n"
     "                            }\n")
+# Target (macOS): upstream's Retina rule (points while two displays stream) plus High Efficiency's.
+T05_RETINA_OLD = "        *scrap::quartz::ENABLE_RETINA.lock().unwrap() = video_service_count < 2;\n"
+T05_RETINA = (
+    "        // boring-remote (ADR 0006 amendment): High Efficiency on a software codec captures points.\n"
+    "        *scrap::quartz::ENABLE_RETINA.lock().unwrap() = base::high_efficiency::POINTS_CAPTURE\n"
+    "            .retina(video_service_count, self.connections.keys().copied());\n")
 T05_LINK_FIELD = (
     "    // boring-remote (v1.7 t05): this round's path until the Target answers High Efficiency.\n"
     "    boring_link: Option<base::high_efficiency::Link>,\n")
@@ -874,6 +892,7 @@ PATCHES += [
      "                    Some(misc::Union::Option(o)) => {\n"
      "                        if self.authed_conn_type() == Some(AuthConnType::Remote) {\n"
      "                            self.update_options(&o).await;\n" + T05_ANSWER, "answer the High Efficiency ask"),
+    (SERVER, T05_RETINA_OLD, T05_RETINA, "High Efficiency on a software codec captures points"),
     (IO_LOOP, "    is_connected: bool,\n", "    is_connected: bool,\n" + T05_LINK_FIELD, "High Efficiency link state"),
     (IO_LOOP, "            is_connected: false,\n", "            is_connected: false,\n            boring_link: None,\n",
      "High Efficiency link state"),
