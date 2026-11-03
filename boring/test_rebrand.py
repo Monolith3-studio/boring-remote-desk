@@ -729,6 +729,11 @@ class RebrandSeam(unittest.TestCase):
         self.edit(check.INSTALL_SCRIPT, "  user_session && agent_restart\n", "")
         self.assert_check_fails(AGENT_RESTART)
 
+    def test_lan_address_with_no_fallback_back_to_the_short_budget_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "is_tailscale(addr.ip()) || addr == last {", "is_tailscale(addr.ip()) {")
+        self.assert_check_fails(CONNECT_TAILNET)
+
     def test_three_line_settings_icon_back_fails_check(self):
         self.rebrand()
         self.edit(rebrand.LOOK_TAB_PAGE, "icon: Icons.settings_outlined,", "icon: IconFont.menu,")

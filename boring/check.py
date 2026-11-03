@@ -564,6 +564,11 @@ def connect_checks(c):
         why.append("race no longer ends in Not on this network, or falls back past a refusal")
     if "hbb_common::timeout(ms, connect(addr)).await" not in race or "match handshake(s, addr).await {" not in race:
         why.append("the ~1 s no-answer budget no longer covers the TCP connect only")
+    if "let ms = if is_tailscale(addr.ip()) || addr == last { slow_ms } else { direct_ms };" not in race:
+        why.append("a LAN address with no fallback after it gets the ~1 s budget, not the full one")
+    conn = fn_body(link, "pub async fn connect(") or ""
+    if conn.count("worded_for(") != 2:
+        why.append("connect errors say Mac without knowing the Target is one")
     c.fact("connect box dials only Tailscale or private-LAN addresses, else the plain error", not why, "; ".join(why))
 
     dial = fn_body(link, "pub async fn handshake(") or ""
