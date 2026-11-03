@@ -26,12 +26,14 @@ OLD_BUNDLE="$APP_NAME.app"  # 1.6.x, and the top-level name in the update packag
 
 if [ "$(id -u)" = 0 ]; then
   ROOT=""
+  OWNER=root
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
   TMPDIR=/private/tmp
   export PATH TMPDIR
 else
   # Tests only: a fake root holding Applications/ and Library/. Never set as root.
   ROOT="${BORING_TEST_ROOT:?run as root, or set BORING_TEST_ROOT for a test}"
+  OWNER=$(id -un)
 fi
 
 # Seconds the rollback watchdog waits for the new app to say it is healthy.
@@ -56,6 +58,15 @@ CONSOLE_USER=$(console Name); CONSOLE_UID=$(console UID)
 [ "$CONSOLE_USER" = loginwindow ] && CONSOLE_USER=root
 
 fail() { echo "install-update: $*" >&2; exit 1; }
+
+# Audit H3: root runs code from a bundle only once no one else can change it. root:wheel, no
+# group or other write; anything still writable (or not root's) and root refuses to run it.
+lock_bundle() {
+  chown -R root:wheel "$1" || fail "cannot make $1 root-owned"
+  chmod -R go-w "$1" || fail "cannot make $1 read-only for others"
+  loose=$(find "$1" ! -type l \( ! -user "$OWNER" -o -perm -020 -o -perm -002 \) -print 2>/dev/null | head -n 1)
+  [ -z "$loose" ] || fail "refusing to run $1 as root: $loose can be changed without an admin password"
+}
 
 semver() { echo "$1" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; }
 # 0 when $1 > $2, both strict X.Y.Z.
@@ -141,6 +152,7 @@ move_bundle() {
     fi
   fi
   [ -x "$APP/Contents/MacOS/$APP_NAME" ] || fail "no app at $APP"
+  lock_bundle "$APP"
   [ -n "$service" ] || return 0
   # Whatever still runs from the old path (its --server, a 1.6.x window) would hold on to it.
   pkill -f "$OLD/Contents/MacOS/" 2>/dev/null || true
@@ -171,6 +183,7 @@ needs_move && move_bundle
 [ -x "$APP/Contents/MacOS/$APP_NAME" ] || fail "no installed app at $APP"
 FROM=$(bundle_version "$APP") || fail "cannot read installed version"
 newer "$VERSION" "$FROM" || fail "$VERSION is not newer than $FROM"
+lock_bundle "$APP"
 
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/boring-update.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
@@ -185,7 +198,7 @@ NEW="$STAGE/x/$BUNDLE"
 [ -d "$NEW" ] || fail "package has no $BUNDLE"
 GOT=$(bundle_version "$NEW") || fail "cannot read new version"
 [ "$GOT" = "$VERSION" ] || fail "package is $GOT, expected $VERSION"
-[ -z "$ROOT" ] && chown -R root:wheel "$NEW"
+lock_bundle "$NEW"
 
 # Rollback state (spec slice 7). Root writes update-pending. The app writes its
 # version into update-healthy once its main window is up, and empties update-failed

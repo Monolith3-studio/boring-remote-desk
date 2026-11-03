@@ -305,6 +305,53 @@ class InstallUpdate(unittest.TestCase):
         self.assertEqual([c for c in self.calls("launchctl") if " asuser " not in f" {c} "], [])
         self.assertEqual(self.calls("service"), [])
 
+    # --- audit H3: root runs code only from a bundle no one else can change ------------
+    def loose(self, app):
+        """Files in `app` group or others can write (what lock_bundle clears)."""
+        return [p for p in [app, *app.rglob("*")] if not p.is_symlink() and p.stat().st_mode & 0o022]
+
+    def test_update_locks_the_installed_bundle_before_running_its_verifier(self):
+        (self.app / "Contents/MacOS/BoringRemote").chmod(0o777)
+        (self.app / "Contents/Info.plist").chmod(0o666)
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prev = pathlib.Path(str(self.app) + ".previous")
+        self.assertEqual(self.loose(prev), [])
+        self.assertEqual(self.loose(self.app), [], "the new bundle is locked too")
+        lines = self.log.read_text().splitlines()
+        lock = lines.index(f"chown -R root:wheel {self.app}")
+        verify = next(i for i, l in enumerate(lines) if "--boring-verify-package" in l)
+        self.assertLess(lock, verify, "locked before root runs anything from it")
+        self.assertTrue(any(l.startswith("chown -R root:wheel ") and l.endswith("/Boring Remote.app")
+                            and str(self.tmp) in l for l in lines), "the staged new bundle")
+
+    def test_a_bundle_that_stays_writable_is_refused(self):
+        self.stub("chmod", "exit 0\n")  # chmod "worked" but changed nothing
+        (self.app / "Contents/MacOS/BoringRemote").chmod(0o777)
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0")
+        self.assert_untouched(r)
+        self.assertIn("refusing to run", r.stderr)
+        self.assertIn("can be changed without an admin password", r.stderr)
+        self.assertNotIn("--boring-verify-package", self.log.read_text())
+
+    def test_move_bundle_locks_the_bundle_before_root_runs_its_service(self):
+        old = self.old_install()
+        (old / "Contents/MacOS/service").chmod(0o777)
+        r = self.run_script("--move-bundle")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.loose(self.app), [])
+        lines = self.log.read_text().splitlines()
+        self.assertLess(lines.index(f"chown -R root:wheel {self.app}"), lines.index("service --write-plists"))
+
+    def test_move_bundle_refuses_a_bundle_that_stays_writable(self):
+        old = self.old_install()
+        self.stub("chmod", "exit 0\n")
+        (old / "Contents/MacOS/service").chmod(0o777)
+        r = self.run_script("--move-bundle")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("refusing to run", r.stderr)
+        self.assertNotIn("service --write-plists", self.log.read_text())
+
     def test_update_over_a_16x_install_moves_it_first(self):
         old = self.old_install("1.6.4")
         r = self.run_script(self.package("1.7.0"), GOOD_SIG, "1.7.0", wait=30)  # look before any rollback

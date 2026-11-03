@@ -181,7 +181,38 @@ pub struct Admission {
     removed: Option<String>,
 }
 
+/// Hex characters of a Trusted Controllers key the ask carries (64 bits).
+pub const KEY_PREFIX_LEN: usize = 16;
+
+/// What the ask shows and what Settings matches a waiting ask on (audit H1): new, removed or
+/// trusted; the start of its Trusted Controllers key (the removed entry's, or the one Allow would
+/// store); its address. Never the name alone: the Controller picks that itself. Rides the
+/// connection window's `Data::Login` (src/ipc.rs) and its client JSON, flattened.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskInfo {
+    #[serde(default)]
+    pub boring_trust: String,
+    #[serde(default)]
+    pub boring_key: String,
+    #[serde(default)]
+    pub boring_ip: String,
+}
+
 impl Admission {
+    /// For the ask: "trusted", "removed" or "new", and the key prefix (empty when trusted, or
+    /// when no exchange ran).
+    pub fn ask_info(&self, ip: &str) -> AskInfo {
+        let prefix = |k: &str| k.get(..KEY_PREFIX_LEN).unwrap_or(k).to_owned();
+        let (trust, key) = if self.trusted.is_some() {
+            ("trusted", String::new())
+        } else if let Some(k) = &self.removed {
+            ("removed", prefix(k))
+        } else {
+            ("new", self.pending.as_deref().map(|d| prefix(&hex(d))).unwrap_or_default())
+        };
+        AskInfo { boring_trust: trust.to_owned(), boring_key: key, boring_ip: ip.to_owned() }
+    }
+
     /// Presented a token this Mac issued and still trusts.
     pub fn is_trusted(&self) -> bool {
         self.trusted.is_some()
@@ -444,6 +475,35 @@ mod tests {
         let (fourth, _) = connect(&trusted, holding).await;
         assert!(fourth.is_trusted());
         assert!(!fourth.must_ask());
+    }
+
+    /// Audit H1: the ask says new or removed, with the key Settings matches a waiting ask on.
+    #[tokio::test]
+    async fn the_ask_says_new_removed_or_trusted_with_the_key_settings_matches_on() {
+        let mut trusted = Trusted::default();
+        let (mut a, issued) = connect(&trusted, None).await;
+        let ask = a.ask_info("192.168.1.20");
+        assert_eq!((ask.boring_trust.as_str(), ask.boring_ip.as_str()), ("new", "192.168.1.20"));
+        assert_eq!(ask.boring_key.len(), KEY_PREFIX_LEN);
+        a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2");
+        let key = trusted.list()[0].key.clone();
+        assert!(key.starts_with(&ask.boring_key), "the stored key is the one the ask named");
+
+        let (b, _) = connect(&trusted, issued.clone()).await;
+        assert_eq!(b.ask_info("").boring_trust, "trusted");
+
+        trusted.remove(&key);
+        let (c, _) = connect(&trusted, issued).await;
+        let ask = c.ask_info("192.168.1.20");
+        assert_eq!(ask.boring_trust, "removed");
+        assert_eq!(ask.boring_key, key[..KEY_PREFIX_LEN]);
+
+        // A stranger using the removed one's name is new, with a key of its own.
+        let (d, _) = connect(&trusted, None).await;
+        let ask = d.ask_info("192.168.1.66");
+        assert_eq!(ask.boring_trust, "new");
+        assert!(!key.starts_with(&ask.boring_key));
+        assert_eq!(Admission::default().ask_info("").boring_trust, "new", "no exchange is never shown as known");
     }
 
     #[tokio::test]

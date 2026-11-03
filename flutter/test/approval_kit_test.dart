@@ -39,7 +39,12 @@ void main() {
   test('messages round-trip in the format src/boring_approval.rs carries', () {
     final ask = parseApproval(approvalAsk(7, 'Jason M Studio: edit bay'))!;
     expect((ask.kind, ask.id, ask.name), (ApprovalKind.ask, 7, 'Jason M Studio: edit bay'));
-    expect(approvalAsk(7, 'a b'), 'boring-approval-ask:7:a%20b');
+    expect(approvalAsk(7, 'a b'), 'boring-approval-ask:7::::a%20b');
+    // Audit H1: the ask carries new / removed, the trust key and the address, not just a name.
+    final v6 = parseApproval(approvalAsk(8, 'Edit Bay 2', trust: 'removed', key: 'bb22cc33dd44ee55', ip: 'fe80::1'))!;
+    expect((v6.id, v6.name, v6.trust, v6.key, v6.ip), (8, 'Edit Bay 2', 'removed', 'bb22cc33dd44ee55', 'fe80::1'));
+    final old = parseApproval('boring-approval-ask:7:a%20b')!;
+    expect((old.name, old.trust, old.key), ('a b', '', ''));
     final done = parseApproval(approvalDone(7))!;
     expect((done.kind, done.id), (ApprovalKind.done, 7));
     expect(parseApproval(approvalAnswer(7, true))!.allow, isTrue);
@@ -126,6 +131,36 @@ void main() {
     expect(find.text('Jason M Studio wants to control this Mac.'), findsNothing);
     desk.decide(9, true); // already answered: nothing sent twice
     expect(answers, ['9:true']);
+  });
+
+  testWidgets('the ask in the main window says new or removed, and where it is', (tester) async {
+    final nav = await mainWindow(tester, const Size(900, 600));
+    final desk = ApprovalDesk(overlay: () => nav.currentState?.overlay, toFront: () async {}, answer: (_, __) {});
+    desk.take(const ApprovalMsg(ApprovalKind.ask, 1, name: 'Edit Bay 2', trust: 'new', key: 'aa', ip: '192.168.1.66'));
+    await tester.pumpAndSettle();
+    expect(find.text('New computer, at 192.168.1.66.'), findsOneWidget);
+    desk.decide(1, false);
+    desk.take(const ApprovalMsg(ApprovalKind.ask, 2, name: 'Edit Bay 2', trust: 'removed', key: 'bb', ip: '192.168.1.20'));
+    await tester.pumpAndSettle();
+    expect(find.text('Removed earlier from the Trusted list, at 192.168.1.20.'), findsOneWidget);
+    final rows = WaitingApprovals(waiting: ApprovalDesk.waitingNow, onDecide: desk.decide);
+    await tester.pumpWidget(MaterialApp(theme: Kit.theme(), home: Scaffold(body: rows)));
+    expect(find.text('Removed earlier from the Trusted list, at 192.168.1.20.'), findsOneWidget);
+    desk.decide(2, false);
+  });
+
+  test('Allow on a removed row lets in only the ask that holds its key, never one with its name', () {
+    const removed = TrustedController(key: 'bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff001122334455', name: 'Jason M Studio');
+    const waiting = [
+      WaitingAsk(1, 'Jason M Studio', trust: 'new', key: '0123456789abcdef', ip: '192.168.1.66'),
+      WaitingAsk(2, 'Jason M Studio', trust: 'removed', key: 'bb22cc33dd44ee55', ip: '192.168.1.20'),
+      WaitingAsk(3, 'Jason M Studio', trust: 'removed', key: 'ffffffffffffffff', ip: '192.168.1.67'),
+      WaitingAsk(4, 'Jason M Studio', trust: 'new', key: 'bb22cc33dd44ee55', ip: '192.168.1.68'),
+      WaitingAsk(5, 'Jason M Studio'),
+      WaitingAsk(6, 'Someone', trust: 'removed', key: 'bb22', ip: '192.168.1.69'),
+    ];
+    expect(waitingFrom(removed, waiting), [2]);
+    expect(waitingFrom(const TrustedController(key: '', name: 'Jason M Studio'), waiting), isEmpty);
   });
 
   const trusted = '[{"key":"aa11","name":"Edit Bay 2","added":1761955200},'

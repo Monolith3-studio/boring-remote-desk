@@ -502,6 +502,7 @@ def branding_checks(c):
 
 
 DIRECT_LINK = "libs/base/src/direct_link.rs"
+CONNECT_ENCRYPTED = "Direct Link is always encrypted and pinned, Tailscale too; plaintext refused both ends (ADR 0005, 0004 amendment)"
 ROUTE_AROUND = re.compile(r"rendezvous|RENDEZVOUS|_start_inner|other_server|is_domain_port_str|get_lch")
 
 
@@ -571,21 +572,25 @@ def connect_checks(c):
         why.append("connect errors say Mac without knowing the Target is one")
     c.fact("connect box dials only Tailscale or private-LAN addresses, else the plain error", not why, "; ".join(why))
 
-    dial = fn_body(link, "pub async fn handshake(") or ""
-    must = fn_body(link, "pub fn must_encrypt(ip: IpAddr) -> bool {") or ""
+    dial = strip_tests_and_comments(fn_body(link, "pub async fn handshake(") or "")
+    need = strip_tests_and_comments(fn_body(link, "pub fn require_encrypted(peer: IpAddr, stream: &Stream) -> ResultType<()> {") or "")
     server = c.read("src/server.rs")
     mediator = c.read("src/rendezvous_mediator.rs")
     why = []
-    if must.strip() != "!is_tailscale(ip)":
-        why.append(f"must_encrypt is not exactly !is_tailscale: {must.strip()!r}")
-    if "if !must_encrypt(addr.ip()) {\n        return Ok((stream, None));\n    }\n    let who = secure(&mut stream, known, addr, ms).await?;\n" \
-            "    if !stream.is_secured() {\n        return Err(Failure::Refused(" not in dial:
-        why.append("controller: a non-Tailscale dial is not handshake-then-is_secured")
+    # Audit H2 (ADR 0004 amendment): no address range, Tailscale's included, skips the encryption.
+    if "must_encrypt" in link:
+        why.append("direct_link.rs still has a must_encrypt exemption")
+    if not dial.lstrip().startswith("let who = secure(&mut stream, known, addr, ms).await?;\n"
+                                    "    if !stream.is_secured() {\n        return Err(Failure::Refused("):
+        why.append("controller: a dial is not handshake-then-is_secured first thing")
+    if "is_tailscale" in dial or "is_tailscale" in need or "if !stream.is_secured() {" not in need:
+        why.append("an address decides whether a Direct Link is encrypted")
     if rebrand.T03_HANDSHAKE_CALL not in server:
         why.append("target: create_tcp_connection does not refuse an unkeyed Direct Link")
-    if rebrand.T03_LISTENER not in mediator:
-        why.append("target: the direct listener does not ask for encryption off Tailscale")
-    c.fact("Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)", not why, "; ".join(why))
+    if rebrand.T03_LISTENER not in mediator or "direct_link: true," not in rebrand.T03_LISTENER \
+            or "                            true,\n" not in rebrand.T03_LISTENER:
+        why.append("target: the direct listener does not ask for encryption on every Direct Link")
+    c.fact(CONNECT_ENCRYPTED, not why, "; ".join(why))
 
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [f"{p.name}: {text[:30]}" for p in langs for text in rebrand.CONNECT_ERROR_KEYS
@@ -602,7 +607,7 @@ def connect_checks(c):
     why = []
     if "if !known.pin_ok(dialled, &id_pk.id, &sign_pk) {\n        return Err(refused(IDENTITY_CHANGED));" not in secure:
         why.append("secure() does not check the pin for the address it dialled")
-    if "t.lan != lan || (known_id == id && t.pk == pk)" not in pin or "self.0.get(id).map_or(true, |t| t.pk == pk)" not in pin:
+    if "(t.lan != at && t.tailscale != at) || (known_id == id && t.pk == pk)" not in pin or "self.0.get(id).map_or(true, |t| t.pk == pk)" not in pin:
         why.append("pin_ok no longer keeps an address's Target and an ID's key")
     c.fact("Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)",
            not why, "; ".join(why))
@@ -894,12 +899,47 @@ def approval_checks(c):
          and "mainSetLocalOption(key: kTrustedControllersOption" not in settings),
         ("reinstateTrusted does what trust.rs reinstate does", "f.key != 'removed'" in reinstate
          and "'added': at" in reinstate and "t.removed = false;" in grant and "t.added = now();" in grant),
-        ("Allow there also lets in a live ask from it", "ApprovalDesk.main?.decide(w.id, true);" in settings),
+        ("Allow there also lets in a live ask from it, matched by its trust key, never its name (audit H1)",
+         "for (final id in waitingFrom(c, ApprovalDesk.waitingNow.value)) {" in settings
+         and "w.name" not in (fn_body(settings, "onAllow: (c) async {") or "x")
+         and "w.trust == 'removed' && w.key.length >= kTrustKeyPrefixLen && c.key.startsWith(w.key)"
+         in kit[kit.find("List<int> waitingFrom("):][:400]),
         ("whoever is waiting shows in Trusted Controllers and above Access",
          settings.count("waiting: WaitingApprovals(") == 2 and "widget.waiting!," in simple),
     ] if not ok]
     c.fact("Settings: Allow next to removed and waiting Controllers, over the service like Remove (t04)",
            not bad, "; ".join(bad))
+    ask_info_checks(c, kit, trust)
+
+
+ASK_INFO = "the ask says new or removed and the address; its trust key rides to Settings (audit H1)"
+
+
+def ask_info_checks(c, kit, trust):
+    """Audit H1: the Controller picks its own name, so the ask also carries what the Target's trust
+    exchange found (new / removed, a key prefix) and the peer address, from try_start_cm to both
+    prompts and to Settings' Allow."""
+    rs = c.read(TRUST_RS)
+    hooks = [("src/ipc.rs", rebrand.H1_LOGIN_FIELD), ("src/server/connection.rs", rebrand.H1_LOGIN_SEND),
+             (rebrand.CM_IFACE, "    #[serde(flatten)]\n" + rebrand.H1_ASK_INFO),
+             (rebrand.CM_IFACE, "privacy_mode, from_switch, boring, self.tx.clone());\n"),
+             (rebrand.SERVER_MODEL, rebrand.H1_CLIENT_FIELDS), (rebrand.SERVER_MODEL, rebrand.H1_CLIENT_JSON),
+             (rebrand.CM_PAGE, "            trust: client.boringTrust,\n            ip: client.boringIp,\n"),
+             (rebrand.SERVER_MODEL, "trust: client.boringTrust, key: client.boringKey, ip: client.boringIp)")]
+    bad = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
+    ask = fn_body(rs, "    pub fn ask_info(&self, ip: &str) -> AskInfo {") or ""
+    if '("removed", prefix(k))' not in ask or '"new", self.pending' not in ask:
+        bad.append("trust.rs ask_info does not name removed and new by their keys")
+    r = re.search(r"pub const KEY_PREFIX_LEN: usize = (\d+);", rs)
+    d = re.search(r"const kTrustKeyPrefixLen = (\d+);", trust)
+    if not r or not d or r.group(1) != d.group(1) or int(r.group(1)) < 16:
+        bad.append("key prefix length differs in Rust and Dart, or is under 64 bits")
+    prompt = trust.split("class ApprovalPrompt", 1)[-1]
+    view = kit.split("class ApprovalRequestView", 1)[-1].split("class ApprovalDesk", 1)[0]
+    if "approvalWho(trust, ip)" not in prompt or "approvalWho(trust, ip)" not in view \
+            or "approvalWho(w.trust, w.ip)" not in kit:
+        bad.append("a prompt shows only the name: connection window, main window or Settings row")
+    c.fact(ASK_INFO, not bad, "; ".join(bad))
 
 
 def firewall_upgrade_checks(c):
@@ -1294,6 +1334,39 @@ def look_checks(c):
     c.fact("Windows install screen in the kit, plain words", not missing, "; ".join(missing))
 
 
+ROOT_BUNDLE = "root runs only a bundle no user can change: root:wheel, go-w, or it refuses (audit H3)"
+
+
+def root_bundle_checks(c):
+    """Audit H3: the root LaunchDaemon and the root scripts run code from the bundle, so every
+    path that installs, moves or replaces it leaves it root:wheel and not group/other-writable,
+    and root refuses to run anything from a bundle a user could still change."""
+    scpt = "src/platform/privileges_scripts/"
+    install, update = c.read(scpt + "install.scpt"), c.read(scpt + "update.scpt")
+    mac, script = c.read("src/platform/macos.rs"), c.read(INSTALL_SCRIPT)
+    verify = fn_body(c.read("src/update_install.rs"), "pub fn verify_cli(args: &[String]) -> i32 {") or ""
+    bm = c.read("libs/base/src/bundle_move.rs")
+    lock = fn_body(script, "lock_bundle() {") or ""
+    move = fn_body(script, "move_bundle() {") or ""
+    main = script.split('[ $# -eq 3 ] || fail "usage: <package> <sig> <version>"', 1)[-1]
+    bad = [n for n, ok in [
+        ("install.scpt locks the bundle first, or installs nothing", rebrand.H3_INSTALL_LOCK in install
+         and "set sh to sh0 & sh1" in install and '|| exit 1;"' in rebrand.H3_INSTALL_LOCK),
+        ("no upstream path hands the bundle to the user (:staff)", ":staff " not in install + update + mac),
+        ("lock_bundle: chown root:wheel, chmod go-w, then refuses anything still loose",
+         'chown -R root:wheel "$1"' in lock and 'chmod -R go-w "$1"' in lock and "-perm -020 -o -perm -002" in lock
+         and '! -user "$OWNER"' in lock and 'fail "refusing to run' in lock and "OWNER=root\n" in script),
+        ("update: the installed bundle is locked before root runs its verifier",
+         0 <= main.find('lock_bundle "$APP"') < main.find("--boring-verify-package") and 'lock_bundle "$NEW"' in main),
+        ("move: the bundle is locked before root runs its service",
+         0 <= move.find('lock_bundle "$APP"') < move.find("--write-plists")),
+        ("--boring-verify-package refuses as root from a loose bundle",
+         0 <= verify.find("base::bundle_move::refuse_as_root(&e)") < verify.find("match args {")
+         and "libc::geteuid() } != 0" in bm and "first_loose(bundle, 0)" in bm),
+    ] if not ok]
+    c.fact(ROOT_BUNDLE, not bad, "; ".join(bad))
+
+
 def run_checks(root):
     c = Check(root)
     cfg = c.read(HBB)
@@ -1392,6 +1465,7 @@ def run_checks(root):
     c.fact("version check endpoint empty", 'const URL: &str = "";' in lib)
 
     updater_checks(c)
+    root_bundle_checks(c)
     bundle_checks(c)  # v1.7 t17
 
     # The notice hooks into upstream files only through rebrand.py; each must have landed.

@@ -26,7 +26,7 @@ WIN_RULE = "installer's app rule lets other computers reach Direct Link 21118: a
 WIN_UPDATE = "Windows reads its own signed feed entry and installs the checked MSI (ADR 0007)"
 CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
 CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
-CONNECT_ENCRYPTED = "Direct Link is encrypted off Tailscale; plaintext refused both ends (ADR 0005)"
+CONNECT_ENCRYPTED = check.CONNECT_ENCRYPTED
 NOT_FOUND_TRANSLATED = "every connect error, Mac and Windows wording, is in every translation file"
 CONNECT_PIN = "Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)"
 ONE_TIME_CODE = "a one-time code lets a Controller in for that session only (ADR 0005)"
@@ -43,6 +43,9 @@ ACCESS = "Access: Settings and Home check what serves sessions; remote access is
 AGENT_RESTART = "the agent restart checks --server came up; a job stuck at spawn failed is booted out and in again (t17)"
 SETTINGS_GEAR = "Settings opens from a gear, not the three-line menu (t17)"
 WIN_NAMES = "Windows service, firewall rule and Apps list say Boring Remote; exe and install dir unchanged (t17)"
+ASK_INFO = check.ASK_INFO
+ROOT_BUNDLE = check.ROOT_BUNDLE
+SETTINGS_ALLOW = "Settings: Allow next to removed and waiting Controllers, over the service like Remove (t04)"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 
@@ -102,7 +105,7 @@ class RebrandSeam(unittest.TestCase):
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
                      "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
                      CONNECT_DIRECT, NOT_FOUND_TRANSLATED, CONNECT_ENCRYPTED, TRUST_WIRED, ONE_TIME_CODE,
-                     HE_WIRED, RUST_HOOKS):
+                     HE_WIRED, RUST_HOOKS, ASK_INFO, ROOT_BUNDLE):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -481,12 +484,26 @@ class RebrandSeam(unittest.TestCase):
 
     def test_identity_pinned_on_the_id_alone_fails_check(self):
         self.rebrand()
-        self.edit("libs/base/src/direct_link.rs", "t.lan != lan || (known_id == id && t.pk == pk)", "true")
+        self.edit("libs/base/src/direct_link.rs", "(t.lan != at && t.tailscale != at) || (known_id == id && t.pk == pk)", "true")
         self.assert_check_fails(CONNECT_PIN)
 
-    def test_plaintext_direct_link_on_the_lan_fails_check(self):
+    def test_plaintext_tailscale_dial_fails_check(self):  # audit H2
         self.rebrand()
-        self.edit("libs/base/src/direct_link.rs", "    !is_tailscale(ip)\n", "    false\n")
+        self.edit("libs/base/src/direct_link.rs", "    let who = secure(&mut stream, known, addr, ms).await?;\n",
+                  "    if is_tailscale(addr.ip()) {\n        return Ok((stream, None));\n    }\n"
+                  "    let who = secure(&mut stream, known, addr, ms).await?;\n")
+        self.assert_check_fails(CONNECT_ENCRYPTED)
+
+    def test_must_encrypt_exemption_back_fails_check(self):  # audit H2
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "pub fn is_tailscale(ip: IpAddr) -> bool {",
+                  "pub fn must_encrypt(ip: IpAddr) -> bool {\n    !is_tailscale(ip)\n}\n\npub fn is_tailscale(ip: IpAddr) -> bool {")
+        self.assert_check_fails(CONNECT_ENCRYPTED)
+
+    def test_target_letting_tailscale_in_unkeyed_fails_check(self):  # audit H2
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "    if !stream.is_secured() {\n        bail!(\"plaintext",
+                  "    if !is_tailscale(peer) && !stream.is_secured() {\n        bail!(\"plaintext")
         self.assert_check_fails(CONNECT_ENCRYPTED)
 
     def test_target_accepting_an_unkeyed_direct_link_fails_check(self):
@@ -496,8 +513,53 @@ class RebrandSeam(unittest.TestCase):
 
     def test_direct_listener_back_to_plaintext_fails_check(self):
         self.rebrand()
-        self.edit("src/rendezvous_mediator.rs", "direct_link: encrypt,", "direct_link: false,")
+        self.edit("src/rendezvous_mediator.rs", "direct_link: true,", "direct_link: false,")
         self.assert_check_fails(CONNECT_ENCRYPTED)
+
+    # --- audit H1: who the ask is, and Allow by key -----------------------------------
+    def test_settings_allow_matching_by_name_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "for (final id in waitingFrom(c, ApprovalDesk.waitingNow.value)) {",
+                  "for (final id in [for (final w in ApprovalDesk.waitingNow.value) if (w.name == c.name) w.id]) {")
+        self.assert_check_fails(SETTINGS_ALLOW)
+
+    def test_waiting_from_matching_any_key_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/approval.dart", "if (w.trust == 'removed' && ", "if (")
+        self.assert_check_fails(SETTINGS_ALLOW)
+
+    def test_prompt_back_to_the_name_alone_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CM_PAGE, "            trust: client.boringTrust,\n            ip: client.boringIp,\n", "")
+        self.assert_check_fails(ASK_INFO)
+
+    def test_ask_info_not_sent_to_the_connection_window_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.H1_LOGIN_SEND, "")
+        self.assert_check_fails(ASK_INFO)
+
+    # --- audit H3: root runs only a root-owned bundle ----------------------------------
+    def test_daemon_install_without_locking_the_bundle_fails_check(self):
+        self.rebrand()
+        self.edit("src/platform/privileges_scripts/install.scpt", "set sh to sh0 & sh1", "set sh to sh1")
+        self.assert_check_fails(ROOT_BUNDLE)
+
+    def test_verifier_run_before_the_lock_fails_check(self):
+        self.rebrand()
+        self.edit("src/platform/privileges_scripts/install-update.sh",
+                  'newer "$VERSION" "$FROM" || fail "$VERSION is not newer than $FROM"\nlock_bundle "$APP"\n',
+                  'newer "$VERSION" "$FROM" || fail "$VERSION is not newer than $FROM"\n')
+        self.assert_check_fails(ROOT_BUNDLE)
+
+    def test_bundle_handed_back_to_the_user_fails_check(self):
+        self.rebrand()
+        self.edit("src/platform/privileges_scripts/update.scpt", rebrand.H3_ROOT_SCPT, rebrand.H3_STAFF_SCPT)
+        self.assert_check_fails(ROOT_BUNDLE)
+
+    def test_verify_package_without_the_root_refusal_fails_check(self):
+        self.rebrand()
+        self.edit("src/update_install.rs", "base::bundle_move::refuse_as_root(&e)", "None::<String>")
+        self.assert_check_fails(ROOT_BUNDLE)
 
     def test_not_found_key_missing_from_a_language_fails_check(self):
         self.rebrand()

@@ -92,6 +92,17 @@ void main() {
     expect(got, ['deny', 'allow']);
   });
 
+  testWidgets('the connection window prompt says new or removed, and the address', (tester) async {
+    await tester.pumpWidget(host(ApprovalPrompt(
+        name: 'Edit Bay 2', trust: 'removed', ip: '192.168.1.20', onAllow: () {}, onDeny: () {})));
+    expect(find.text('Edit Bay 2 wants to control this Mac.'), findsOneWidget);
+    expect(find.text('Removed earlier from the Trusted list, at 192.168.1.20.'), findsOneWidget);
+    await tester.pumpWidget(host(ApprovalPrompt(name: 'Edit Bay 2', onAllow: () {}, onDeny: () {})));
+    expect(find.text('New computer.'), findsOneWidget, reason: 'no trust facts is never shown as known');
+    expect(approvalWho('new', 'fe80::1'), 'New computer, at fe80::1.');
+    expect(approvalWho('trusted', '192.168.1.20'), '');
+  });
+
   testWidgets('a nameless Mac is still described in plain words', (tester) async {
     await tester.pumpWidget(host(ApprovalPrompt(name: '  ', onAllow: () {}, onDeny: () {})));
     expect(find.text('A Mac on this network wants to control this Mac.'), findsOneWidget);

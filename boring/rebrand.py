@@ -67,7 +67,7 @@ CONNECT_ERROR_KEYS = [t for v in CONNECT_ERRORS.values() for t in (v, on_windows
 DIRECT_LINK_CALL = (
     "        // boring-remote (v1.7 t03): every peer is a name or IP for a Direct Link, never an\n"
     "        // ID. base::direct_link dials the Target's own address, then its Tailscale address,\n"
-    "        // else \"Not on this network\"; off Tailscale it is encrypted or refused (ADR 0004,\n"
+    "        // else \"Not on this network\"; always encrypted or refused, Tailscale too (ADR 0004,\n"
     "        // 0005). There is no rendezvous server, so the ID path below can't be reached.\n"
     "        if true {\n"
     "            let (stream, path, pk) = base::direct_link::connect(peer, CONNECT_TIMEOUT).await?;\n"
@@ -104,6 +104,20 @@ def _rust_map(d):
             ".map(|(k, v)| (k.to_string(), v.to_string())).collect())")
 
 
+# Audit H3: a bundle root runs is root:wheel and not group/other-writable (install.scpt,
+# upstream's update.scpt and update_me; install-update.sh's lock_bundle is ours).
+H3_BUNDLE_Q = f'quoted form of "/Applications/{MAC_BUNDLE}"'
+H3_INSTALL_LOCK = (
+    "  -- boring-remote (audit H3): the root daemon runs this bundle, so no user may change it.\n"
+    f"  set bundle_q to {H3_BUNDLE_Q}\n"
+    '  set sh0 to "chown -R root:wheel " & bundle_q & " && chmod -R go-w " & bundle_q & " || exit 1;"\n'
+    "\n  set sh to sh0 & sh1 & sh2 & sh3 & sh4 & sh5\n")
+H3_STAFF_SCPT = '" && chown -R " & quoted form of user & ":staff " & quoted form of app_bundle & "'
+H3_ROOT_SCPT = '" && chown -R root:wheel " & quoted form of app_bundle & " && chmod -R go-w " & quoted form of app_bundle & "'
+H3_STAFF_ME = '" && chown -R " & user_name_q & ":staff " & app_bundle_q & "'
+H3_ROOT_ME = '" && chown -R root:wheel " & app_bundle_q & " && chmod -R go-w " & app_bundle_q & "'
+
+HBB = "libs/hbb_common/src/config.rs"
 HBB = "libs/hbb_common/src/config.rs"
 
 # (file, old, new, why). `old` may be a compiled regex. Every occurrence is replaced.
@@ -198,6 +212,10 @@ PATCHES = [
         ("update.scpt", "com.carriez.RustDesk_server", AGENT_ID, "LaunchAgent label"),
         ("update.scpt", "com.carriez.RustDesk_service", HOSTD_ID, "LaunchDaemon label"),
         ("update.scpt", '"/Applications/RustDesk.app"', f'"/Applications/{MAC_BUNDLE}"', "upstream updater bundle path"),
+        # audit H3: the root LaunchDaemon runs the bundle, so no user may write it. Installing the
+        # daemon makes it root:wheel and not group/other-writable first, or installs nothing.
+        ("install.scpt", "  set sh to sh1 & sh2 & sh3 & sh4 & sh5\n", H3_INSTALL_LOCK, "daemon install locks the bundle (audit H3)"),
+        ("update.scpt", H3_STAFF_SCPT, H3_ROOT_SCPT, "upstream updater leaves the bundle root-owned (audit H3)"),
         # ours (Install update, slice 6): same label as daemon.plist, from the same constant
         ("install-update.sh", 'SERVICE_LABEL="com.carriez.RustDesk_service"', f'SERVICE_LABEL="{HOSTD_ID}"',
          "LaunchDaemon label (install update)"),
@@ -338,6 +356,7 @@ PATCHES += [
     ("flutter/lib/desktop/pages/desktop_tab_page.dart", "                  icon: IconFont.menu,\n",
      "                  icon: Icons.settings_outlined, // boring-remote (v1.7 t17): a gear opens Settings\n",
      "Settings button is a gear"),
+    ("src/platform/macos.rs", H3_STAFF_ME, H3_ROOT_ME, "upstream update_me leaves the bundle root-owned (audit H3)"),
     ("src/platform/macos.rs", MAC_INSTALLED,
      MAC_INSTALLED + f"        // boring-remote (v1.7 t17): {MAC_BUNDLE}; 1.6.x's name below counts until it moves.\n"
      f'        if p.starts_with("/Applications/{MAC_BUNDLE}") {{\n            return true;\n        }}\n',
@@ -678,19 +697,19 @@ IO_LOOP = "src/client/io_loop.rs"
 MEDIATOR = "src/rendezvous_mediator.rs"
 BASE_MODS = ("// boring-remote (v1.7): ours, see libs/base/tests/boring.rs\n"
              "pub mod bundle_move;\npub mod direct_link;\npub mod high_efficiency;\npub mod lan;\npub mod trust;\npub mod update_feed;\n")
-# Target: the direct listener asks for encryption off Tailscale (ADR 0005) and marks the Direct Link.
+# Target: the direct listener asks for encryption on every Direct Link, Tailscale too (ADR 0005,
+# 0004 amendment: a 100.64/10 address proves nothing about WireGuard) and marks it a Direct Link.
 T03_LISTENER = (
-    "                // boring-remote: encrypted everywhere but Tailscale (v1.7 t03, ADR 0005).\n"
-    "                let encrypt = base::direct_link::must_encrypt(hbb_common::try_into_v4(addr).ip());\n"
+    "                // boring-remote: every Direct Link is encrypted, Tailscale too (ADR 0005, 0004 amendment).\n"
     "                tokio::spawn(async move {\n"
     "                    allow_err!(\n"
     "                        crate::server::create_tcp_connection(\n"
     "                            server,\n"
     "                            hbb_common::Stream::from(stream, local_addr),\n"
     "                            addr,\n"
-    "                            encrypt,\n"
+    "                            true,\n"
     "                            ConnectionMeta {\n"
-    "                                direct_link: encrypt,\n"
+    "                                direct_link: true,\n"
     "                                ..Default::default()\n"
     "                            }, // Direct connections don't have server-side user context.\n")
 T03_META_FIELDS = (
@@ -862,7 +881,7 @@ PATCHES += [
      "                            addr,\n"
      "                            false,\n"
      "                            ConnectionMeta::default(), // Direct connections don't have server-side user context.\n",
-     T03_LISTENER, "direct listener: encrypted Direct Link off Tailscale (ADR 0005)"),
+     T03_LISTENER, "direct listener: every Direct Link encrypted (ADR 0005, 0004 amendment)"),
     (SERVER, "    pub controlled_context: Option<ControlledContext>,\n",
      "    pub controlled_context: Option<ControlledContext>,\n" + T03_META_FIELDS, "Direct Link + trust on ConnectionMeta"),
     (SERVER,
@@ -1476,8 +1495,9 @@ T04_SETTINGS_LINK = (
     "                        await bind.mainSetOption(\n"
     "                            key: kTrustedControllersOption,\n"
     "                            value: reinstateTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption), c.key));\n"
-    "                        for (final w in ApprovalDesk.waitingNow.value) {\n"
-    "                          if (w.name.trim() == c.name.trim()) ApprovalDesk.main?.decide(w.id, true);\n"
+    "                        // Only the ask that presented its token, never one using its name (audit H1).\n"
+    "                        for (final id in waitingFrom(c, ApprovalDesk.waitingNow.value)) {\n"
+    "                          ApprovalDesk.main?.decide(id, true);\n"
     "                        }\n"
     "                      },\n"
     "                      waiting: WaitingApprovals(\n"
@@ -1498,6 +1518,8 @@ T04_PROMPT = (
     "          color: Kit.ink,\n"
     "          child: ApprovalPrompt(\n"
     "            name: client.name,\n"
+    "            trust: client.boringTrust,\n"
+    "            ip: client.boringIp,\n"
     "            onAllow: () {\n"
     "              handleAccept(context);\n"
     "              windowManager.minimize();\n"
@@ -1589,7 +1611,8 @@ T04B_ASK = (
     f"      if ({T04B_GATE}) {{\n"
     "        bind.boringApprovalSend(\n"
     "            msg: !client.authorized && approveMode != 'password'\n"
-    "                ? approvalAsk(client.id, client.name)\n"
+    "                ? approvalAsk(client.id, client.name,\n"
+    "                    trust: client.boringTrust, key: client.boringKey, ip: client.boringIp)\n"
     "                : approvalDone(client.id));\n"
     "      }\n")
 T04B_DONE_REMOVE = (
@@ -1638,6 +1661,48 @@ PATCHES += [
      "import 'package:url_launcher/url_launcher.dart';\n" + APPROVAL_IMPORT, "approval import (settings)"),
     (CM_PAGE, "                client.disconnected\n            ? Offstage()\n", T04B_CARD,
      "connection window: the ask gets the whole card"),
+]
+
+# --- Audit H1: the ask carries who it is, Settings matches by key ------------------
+# The Target's trust exchange knows whether a waiting Controller is new or removed (and its key);
+# the connection window and the main window only saw the name the Controller picked. These carry
+# base::trust::AskInfo (new / removed, a key prefix, the address) from try_start_cm through the
+# connection window's Data::Login and client JSON to Flutter's Client, then into the ask.
+CM_IFACE = "src/ui_cm_interface.rs"
+H1_ASK_INFO = "    pub boring: base::trust::AskInfo, // boring-remote: audit H1 (boring_trust, _key, _ip)\n"
+H1_LOGIN_FIELD = "        #[serde(default)]\n        boring: base::trust::AskInfo, // boring-remote: audit H1\n"
+H1_LOGIN_SEND = "            boring: self.boring_trust.ask_info(&self.ip), // boring-remote: audit H1\n"
+H1_CLIENT_FIELDS = (
+    "  // boring-remote (audit H1): new / removed, its trust key and address (base::trust::AskInfo).\n"
+    "  String boringTrust = '';\n  String boringKey = '';\n  String boringIp = '';\n")
+H1_CLIENT_JSON = (
+    "    boringTrust = json['boring_trust'] ?? '';\n"
+    "    boringKey = json['boring_key'] ?? '';\n"
+    "    boringIp = json['boring_ip'] ?? '';\n")
+PATCHES += [
+    ("src/ipc.rs", "        from_switch: bool,\n    },\n    ChatMessage {\n",
+     "        from_switch: bool,\n" + H1_LOGIN_FIELD + "    },\n    ChatMessage {\n", "ask info on Data::Login"),
+    (CONN, "            from_switch: self.from_switch,\n        });\n",
+     "            from_switch: self.from_switch,\n" + H1_LOGIN_SEND + "        });\n", "ask info to the connection window"),
+    (CM_IFACE, "    pub from_switch: bool,\n    pub in_voice_call: bool,\n",
+     "    pub from_switch: bool,\n    #[serde(flatten)]\n" + H1_ASK_INFO + "    pub in_voice_call: bool,\n",
+     "ask info in the client JSON"),
+    (CM_IFACE, "        from_switch: bool,\n        #[cfg(not(any(target_os = \"ios\")))] tx: mpsc::UnboundedSender<Data>,\n",
+     "        from_switch: bool,\n        boring: base::trust::AskInfo,\n"
+     "        #[cfg(not(any(target_os = \"ios\")))] tx: mpsc::UnboundedSender<Data>,\n", "ask info into add_connection"),
+    (CM_IFACE, "            from_switch,\n            #[cfg(not(any(target_os = \"ios\")))]\n            tx,\n",
+     "            from_switch,\n            boring,\n            #[cfg(not(any(target_os = \"ios\")))]\n            tx,\n",
+     "ask info on the client"),
+    (CM_IFACE, "privacy_mode, from_switch} => {\n", "privacy_mode, from_switch, boring} => {\n", "ask info from Data::Login"),
+    (CM_IFACE, "privacy_mode, from_switch, self.tx.clone());\n", "privacy_mode, from_switch, boring, self.tx.clone());\n",
+     "ask info into add_connection (desktop)"),
+    (CM_IFACE, "                    from_switch,\n                    tx.clone(),\n                );\n",
+     "                    from_switch,\n                    Default::default(), // boring-remote: audit H1, no ask info here\n"
+     "                    tx.clone(),\n                );\n", "ask info into add_connection (Android)"),
+    (SERVER_MODEL, "  bool incomingVoiceCall = false;\n\n  RxInt unreadChatMessageCount",
+     "  bool incomingVoiceCall = false;\n" + H1_CLIENT_FIELDS + "\n  RxInt unreadChatMessageCount", "ask info on Client"),
+    (SERVER_MODEL, "    incomingVoiceCall = json['incoming_voice_call'];\n  }\n",
+     "    incomingVoiceCall = json['incoming_voice_call'];\n" + H1_CLIENT_JSON + "  }\n", "ask info from the client JSON"),
 ]
 
 # --- One firewall rule each way after an upgrade (v1.7 t12/t17) --------------------

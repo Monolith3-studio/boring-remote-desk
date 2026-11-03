@@ -266,16 +266,36 @@ String approvalQuestion(String name) {
   return '$who wants to control this ${KitWords.one}.';
 }
 
+/// What the ask knows about who it is (audit H1): new or removed earlier, and its address.
+/// Nothing for a Trusted one, which never asks. Unknown counts as new.
+String approvalWho(String trust, String ip) {
+  final at = ip.trim().isNotEmpty ? ', at ${ip.trim()}.' : '.';
+  switch (trust) {
+    case 'trusted':
+      return '';
+    case 'removed':
+      return 'Removed earlier from the Trusted list$at';
+    default:
+      return 'New computer$at';
+  }
+}
+
+/// Hex characters of a Trusted Controllers key an ask carries (libs/base/src/trust.rs KEY_PREFIX_LEN).
+const kTrustKeyPrefixLen = 16;
+
 const kApprovalWhy = "If you allow it, it can get in next time without asking. You can remove it in Settings.";
 
 /// What the Target shows when an unknown Mac asks to come in. Plain words, two choices.
 /// It scrolls rather than clips when the connection window is short.
 class ApprovalPrompt extends StatelessWidget {
   final String name;
+  final String trust;
+  final String ip;
   final VoidCallback onAllow;
   final VoidCallback onDeny;
 
-  const ApprovalPrompt({super.key, required this.name, required this.onAllow, required this.onDeny});
+  const ApprovalPrompt(
+      {super.key, required this.name, this.trust = '', this.ip = '', required this.onAllow, required this.onDeny});
 
   @override
   Widget build(BuildContext context) {
@@ -287,6 +307,7 @@ class ApprovalPrompt extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(approvalQuestion(name), style: t.titleMedium),
+          if (approvalWho(trust, ip).isNotEmpty) Text(approvalWho(trust, ip), style: t.bodyMedium),
           const SizedBox(height: Kit.s2),
           Text(kApprovalWhy, style: t.bodySmall),
           const SizedBox(height: Kit.s4),
