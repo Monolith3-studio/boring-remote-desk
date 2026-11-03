@@ -266,6 +266,27 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/lan.rs", sig, f"{sig}    {rebrand.GUARD_OK}\n")
         self.assert_check_fails(self.LAN_LISTENER)
 
+    LAN_BOTH_WAYS = "LAN Discovery both ways: asks known computers directly, skips loopback and Tailscale (t21)"
+
+    def test_lan_both_ways_passes_after_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {self.LAN_BOTH_WAYS}", run(CHECK, self.root).stdout)
+
+    def test_lan_broadcast_only_again_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T21_SEND, rebrand.T21_SEND_OLD)
+        self.assert_check_fails(self.LAN_BOTH_WAYS)
+
+    def test_lan_listener_not_noting_pings_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T21_HEARD, "")
+        self.assert_check_fails(self.LAN_BOTH_WAYS)
+
+    def test_setup_without_ready_line_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "        readyChecks: boringAccessChecks(),\n", "")
+        self.assert_check_fails("Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)")
+
     def test_lan_discovery_locked_off_fails_check(self):
         self.rebrand()
         self.edit(rebrand.HBB, '("direct-server", "Y")',

@@ -97,11 +97,26 @@ void main() {
 
   testWidgets('no Macs yet: says how to reach one', (tester) async {
     await tester.pumpWidget(host(home(list: const [])));
-    expect(
-        find.text("No other Macs found yet. Open Boring Remote on the other Mac. "
-            "You'll see it here once both are on the same network."),
-        findsOneWidget);
+    expect(find.text('No other Macs found on this network yet.'), findsOneWidget);
+    expect(find.text('1. Open Boring Remote on the other Mac and finish its Setup.'), findsOneWidget);
+    expect(find.text('2. Check both are on the same Wi-Fi or network.'), findsOneWidget);
+    expect(find.text('It shows up here by itself within a few seconds.'), findsOneWidget);
     expect(find.text('Or type its address above, like 192.168.1.20.'), findsOneWidget);
+  });
+
+  testWidgets('Macs used before but none on this network: still says what to do (ticket 21)', (tester) async {
+    await tester.pumpWidget(host(home()));
+    expect(find.text('Edit Bay 2'), findsOneWidget);
+    expect(find.text('No other Macs found on this network yet.'), findsOneWidget);
+  });
+
+  testWidgets('the empty note goes once a Mac on this network answers, or while searching', (tester) async {
+    await tester.pumpWidget(host(MacHome(macs: const [], lan: lan, tailscaleAddress: () async => null, onConnect: (_) {})));
+    expect(find.text('No other Macs found on this network yet.'), findsNothing);
+    await tester.pumpWidget(host(home(list: const [])));
+    await tester.enterText(find.byKey(MacHome.addressKey), 'edit');
+    await tester.pump();
+    expect(find.text('No other Macs found on this network yet.'), findsNothing);
   });
 
   testWidgets('Home leads with a name, never the word IP', (tester) async {

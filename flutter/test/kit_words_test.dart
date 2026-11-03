@@ -33,10 +33,8 @@ void main() {
     await tester.pumpWidget(host(MacHome(macs: const [], tailscaleAddress: () async => null, onConnect: (_) {})));
     expect(find.text('Connect to a computer'), findsOneWidget);
     expect(find.text('Computers'), findsOneWidget);
-    expect(
-        find.text("No other computers found yet. Open Boring Remote on the other computer. "
-            "You'll see it here once both are on the same network."),
-        findsOneWidget);
+    expect(find.text('No other computers found on this network yet.'), findsOneWidget);
+    expect(find.text('1. Open Boring Remote on the other computer and finish its Setup.'), findsOneWidget);
     expect(texts(tester).where((s) => s.contains('Mac')), isEmpty);
     await tester.tap(find.text('Connect from outside the building'));
     await tester.pumpAndSettle();
