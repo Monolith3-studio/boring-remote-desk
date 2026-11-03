@@ -382,6 +382,9 @@ PATCHES += [
      "        res = max / 2; // boring-remote (v1.7 t05): no CPU sample yet (None) counts as idle, not 1 thread\n"
      "        let percent = base::platform::windows::cpu_uage_one_minute();",
      "encoder threads: no CPU sample yet on Windows counts as idle"),
+    ("libs/scrap/src/common/codec.rs", "        _ if res >= 4 => 4,",
+     "        _ if res >= 4 => res, // boring-remote (v1.7 t05): keep 4-7 threads, a 12-thread PC gets 6 not 4",
+     "encoder threads: no rounding down from 6 to 4"),
     # Windows, what people read
     ("res/msi/CustomActions/FirewallRules.cpp", 'L"%ls Service", exeName);',
      f'L"{WINDOWS_RULE}"); // boring-remote (v1.7 t17): what people read, not the exe name',
