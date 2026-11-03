@@ -20,11 +20,20 @@ class ApprovalMsg {
   final ApprovalKind kind;
   final int id;
   final String name; // ask only
+  // Ask only (audit H1): 'new', 'removed' or '' (unknown), the start of its Trusted Controllers key
+  // (libs/base/src/trust.rs AskInfo) and its address. Settings matches on the key, never the name.
+  final String trust;
+  final String key;
+  final String ip;
   final bool allow; // answer only
-  const ApprovalMsg(this.kind, this.id, {this.name = '', this.allow = false});
+  const ApprovalMsg(this.kind, this.id,
+      {this.name = '', this.trust = '', this.key = '', this.ip = '', this.allow = false});
 }
 
-String approvalAsk(int id, String name) => '$kApprovalAsk$id:${Uri.encodeComponent(name)}';
+/// `ask:<id>:<trust>:<key>:<ip>:<name>`, ip and name percent-encoded (an IPv6 address has colons).
+String approvalAsk(int id, String name, {String trust = '', String key = '', String ip = ''}) =>
+    '$kApprovalAsk$id:${Uri.encodeComponent(trust)}:${Uri.encodeComponent(key)}:'
+    '${Uri.encodeComponent(ip)}:${Uri.encodeComponent(name)}';
 String approvalDone(int id) => '$kApprovalDone$id';
 String approvalAnswer(int id, bool allow) => '$kApprovalAnswer$id:${allow ? 'allow' : 'deny'}';
 
@@ -42,13 +51,16 @@ ApprovalMsg? parseApproval(String msg) {
     final tail = i < 0 ? '' : rest.substring(i + 1);
     switch (kind) {
       case ApprovalKind.ask:
-        String name;
-        try {
-          name = Uri.decodeComponent(tail);
-        } catch (_) {
-          name = '';
+        String dec(String s) {
+          try {
+            return Uri.decodeComponent(s);
+          } catch (_) {
+            return '';
+          }
         }
-        return ApprovalMsg(kind, id, name: name);
+        final f = tail.split(':');
+        if (f.length != 4) return ApprovalMsg(kind, id, name: dec(tail));
+        return ApprovalMsg(kind, id, trust: dec(f[0]), key: dec(f[1]), ip: dec(f[2]), name: dec(f[3]));
       case ApprovalKind.done:
         return ApprovalMsg(kind, id);
       case ApprovalKind.answer:
@@ -63,10 +75,13 @@ ApprovalMsg? parseApproval(String msg) {
 /// clips when the window is small, and the buttons stack when it is narrow.
 class ApprovalRequestView extends StatelessWidget {
   final String name;
+  final String trust;
+  final String ip;
   final VoidCallback onAllow;
   final VoidCallback onDeny;
 
-  const ApprovalRequestView({super.key, required this.name, required this.onAllow, required this.onDeny});
+  const ApprovalRequestView(
+      {super.key, required this.name, this.trust = '', this.ip = '', required this.onAllow, required this.onDeny});
 
   @override
   Widget build(BuildContext context) {
@@ -120,6 +135,10 @@ class ApprovalRequestView extends StatelessWidget {
                       Text(approvalQuestion(name),
                           textAlign: TextAlign.center,
                           style: t.headlineSmall?.copyWith(height: 1.25)),
+                      if (approvalWho(trust, ip).isNotEmpty) ...[
+                        const SizedBox(height: Kit.s2),
+                        Text(approvalWho(trust, ip), textAlign: TextAlign.center, style: t.titleMedium),
+                      ],
                       const SizedBox(height: Kit.s3),
                       Text(kApprovalWhy,
                           textAlign: TextAlign.center,
@@ -162,7 +181,7 @@ class ApprovalDesk {
   /// Who is waiting right now, for Settings (Access, Trusted Controllers). Empty until an ask.
   static final waitingNow = ValueNotifier<List<WaitingAsk>>(const []);
 
-  final _waiting = <int, String>{}; // id → name, in arrival order
+  final _waiting = <int, ApprovalMsg>{}; // id → its ask, in arrival order
   OverlayEntry? _entry;
   int? _showing;
 
@@ -171,7 +190,7 @@ class ApprovalDesk {
   void take(ApprovalMsg m) {
     switch (m.kind) {
       case ApprovalKind.ask:
-        _waiting[m.id] = m.name;
+        _waiting[m.id] = m;
         _publish();
         toFront();
         _show();
@@ -194,8 +213,9 @@ class ApprovalDesk {
     _show();
   }
 
-  void _publish() =>
-      waitingNow.value = [for (final e in _waiting.entries) WaitingAsk(e.key, e.value)];
+  void _publish() => waitingNow.value = [
+        for (final m in _waiting.values) WaitingAsk(m.id, m.name, trust: m.trust, key: m.key, ip: m.ip)
+      ];
 
   void _hide() {
     _entry?.remove();
@@ -211,14 +231,16 @@ class ApprovalDesk {
       Future.delayed(const Duration(milliseconds: 300), _show);
       return;
     }
-    final id = _waiting.keys.first;
-    final name = _waiting[id]!;
+    final ask = _waiting.values.first;
+    final id = ask.id;
     _showing = id;
     _entry = OverlayEntry(
       builder: (context) => Theme(
         data: Kit.theme(),
         child: ApprovalRequestView(
-          name: name,
+          name: ask.name,
+          trust: ask.trust,
+          ip: ask.ip,
           onAllow: () => decide(id, true),
           onDeny: () => decide(id, false),
         ),
@@ -231,8 +253,18 @@ class ApprovalDesk {
 class WaitingAsk {
   final int id;
   final String name;
-  const WaitingAsk(this.id, this.name);
+  final String trust;
+  final String key;
+  final String ip;
+  const WaitingAsk(this.id, this.name, {this.trust = '', this.key = '', this.ip = ''});
 }
+
+/// Settings → Trusted list → Allow on removed [c]: the waiting asks that presented its token
+/// (removed, and its key starts with theirs). Never by name: the Controller picks its own (audit H1).
+List<int> waitingFrom(TrustedController c, List<WaitingAsk> waiting) => [
+      for (final w in waiting)
+        if (w.trust == 'removed' && w.key.length >= kTrustKeyPrefixLen && c.key.startsWith(w.key)) w.id
+    ];
 
 /// Settings' rows for whoever is waiting right now (Access, Trusted Controllers): the question
 /// and big Allow / Don't allow buttons. Nothing when no one is waiting.
@@ -263,6 +295,7 @@ class WaitingApprovals extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Text(approvalQuestion(w.name), style: t.titleMedium),
+                  if (approvalWho(w.trust, w.ip).isNotEmpty) Text(approvalWho(w.trust, w.ip), style: t.bodyMedium),
                   const SizedBox(height: Kit.s3),
                   Row(children: [
                     Expanded(

@@ -98,12 +98,6 @@ pub fn is_tailscale(ip: IpAddr) -> bool {
     }
 }
 
-/// ADR 0005: everything but Tailscale (already WireGuard) must carry an encrypted session.
-/// Both ends apply this to the other's address, so they agree on whether to key the stream.
-pub fn must_encrypt(ip: IpAddr) -> bool {
-    !is_tailscale(ip)
-}
-
 /// Which way a session reached the Target; Flutter's Link Badge reads [`Path::stream_type`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Path {
@@ -183,7 +177,7 @@ where
     bail!(NOT_ON_THIS_NETWORK)
 }
 
-/// The Target's first Direct Link message (ADR 0005), sent only where [`must_encrypt`]: its
+/// The Target's first Direct Link message (ADR 0005), on every Direct Link: its
 /// identity key, so the Controller can pin it and check the signed handshake that follows
 /// (`identity_handshake` in src/server.rs), plus its Tailscale address if it has one, so the
 /// Controller can fall back to it later. Rides `PublicKey` (no proto change): the identity key in
@@ -201,10 +195,11 @@ pub async fn announce(stream: &mut Stream, sign_pk: &[u8], tailscale: Option<IpA
     stream.send(&msg).await
 }
 
-/// Target side, after the handshake: a Direct Link on a non-Tailscale address that did not end
-/// keyed is dropped before anything else is read from it.
+/// Target side, after the handshake: a Direct Link that did not end keyed is dropped before
+/// anything else is read from it. Tailscale too: a 100.64/10 address proves nothing about
+/// WireGuard (audit H2, ADR 0004 amendment).
 pub fn require_encrypted(peer: IpAddr, stream: &Stream) -> ResultType<()> {
-    if must_encrypt(peer) && !stream.is_secured() {
+    if !stream.is_secured() {
         bail!("plaintext Direct Link from {} refused (ADR 0005)", peer);
     }
     Ok(())
@@ -321,18 +316,25 @@ impl Known {
     /// nothing (it is signed by the key that just announced itself), so a new ID with its own key
     /// at a known address is a changed identity too.
     pub fn pin_ok(&self, dialled: SocketAddr, id: &str, sign_pk: &[u8]) -> bool {
-        let lan = dialled.to_string();
+        let at = dialled.to_string();
         let pk = hex(sign_pk);
-        let at_address = self.0.iter().all(|(known_id, t)| t.lan != lan || (known_id == id && t.pk == pk));
+        let at_address = self
+            .0
+            .iter()
+            .all(|(known_id, t)| (t.lan != at && t.tailscale != at) || (known_id == id && t.pk == pk));
         at_address && self.0.get(id).map_or(true, |t| t.pk == pk)
     }
 
-    /// Remember who answered at `addr`, after [`Known::pin_ok`] let it in.
+    /// Remember who answered at `addr`, after [`Known::pin_ok`] let it in. A Tailscale connect
+    /// keeps the LAN address it was met on.
     pub fn record(&mut self, who: &Verified, addr: SocketAddr) {
-        let lan = addr.to_string();
         let t = self.0.entry(who.id.clone()).or_default();
         t.pk = hex(&who.sign_pk);
-        t.lan = lan;
+        if is_tailscale(addr.ip()) {
+            t.tailscale = addr.to_string();
+            return;
+        }
+        t.lan = addr.to_string();
         if let Some(ts) = who.tailscale {
             t.tailscale = SocketAddr::new(ts, addr.port()).to_string();
         }
@@ -410,7 +412,7 @@ pub fn is_target_id(peer: &str) -> bool {
 
 /// The connect box (src/client.rs `_start`): Direct Link first, then Tailscale, else
 /// [`NOT_ON_THIS_NETWORK`]. A recent from Home (a Target ID) goes by [`plan_for_recent`].
-/// Non-Tailscale sessions come back encrypted or not at all. Returns the
+/// Every session comes back encrypted or not at all. Returns the
 /// stream, the path it took and the Target's identity key (the session fingerprint) when known.
 pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Option<Vec<u8>>)> {
     let known = Known::load();
@@ -449,17 +451,14 @@ async fn dial(plan: Plan, slow_ms: u64, mut known: Known) -> ResultType<(Stream,
     Ok((stream, Path::of(addr), pk))
 }
 
-/// A Target that picked up at `addr`: the encrypted handshake wherever [`must_encrypt`], then
-/// the trust token. Each read gets `ms`.
+/// A Target that picked up at `addr`: the encrypted, pinned handshake, then the trust token.
+/// Every address, Tailscale too (audit H2, ADR 0004 amendment). Each read gets `ms`.
 pub async fn handshake(
     mut stream: Stream,
     addr: SocketAddr,
     known: &Known,
     ms: u64,
 ) -> Result<(Stream, Option<Verified>), Failure> {
-    if !must_encrypt(addr.ip()) {
-        return Ok((stream, None));
-    }
     let who = secure(&mut stream, known, addr, ms).await?;
     if !stream.is_secured() {
         return Err(Failure::Refused(anyhow!(PLAINTEXT_REFUSED)));
@@ -585,14 +584,55 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_is_allowed_only_on_tailscale() {
-        for s in ["192.168.1.20", "10.0.0.5", "172.16.0.1", "fe80::1", "fd12::1", "127.0.0.1"] {
-            assert!(must_encrypt(s.parse().unwrap()), "{}", s);
-        }
+    fn tailscale_is_the_cgnat_and_tailnet_ranges() {
         for s in ["100.64.0.1", "100.127.255.254", "fd7a:115c:a1e0::1", "::ffff:100.100.1.1"] {
-            assert!(!must_encrypt(s.parse().unwrap()), "{}", s);
+            assert!(is_tailscale(s.parse().unwrap()), "{}", s);
         }
-        assert!(must_encrypt("100.128.0.1".parse().unwrap()));
+        for s in ["192.168.1.20", "10.0.0.5", "172.16.0.1", "fe80::1", "fd12::1", "127.0.0.1", "100.128.0.1"] {
+            assert!(!is_tailscale(s.parse().unwrap()), "{}", s);
+        }
+    }
+
+    /// Audit H2 (ADR 0004 amendment): a 100.64/10 address proves nothing about WireGuard, so a
+    /// Tailscale Direct Link is encrypted and pinned like any other. A plaintext Target there is
+    /// refused, never dialled in the clear.
+    #[tokio::test]
+    async fn a_plaintext_target_on_a_tailscale_address_is_refused_too() {
+        let (ctl, mut srv) = pair().await;
+        let mut hash = Message::new();
+        hash.set_hash(crate::message_proto::Hash { salt: "s".into(), challenge: "c".into(), ..Default::default() });
+        srv.send(&hash).await.unwrap();
+        match super::handshake(ctl, sa(TS), &Known::default(), 2_000).await {
+            Err(Failure::Refused(e)) => assert_eq!(e.to_string(), PLAINTEXT_REFUSED),
+            Err(Failure::Unreachable) => panic!("unreachable, not refused"),
+            Ok((s, who)) => panic!("not refused: secured {} {:?}", s.is_secured(), who.map(|w| w.id)),
+        }
+        for peer in ["100.101.102.103", "fd7a:115c:a1e0::1", "192.168.1.20"] {
+            assert!(require_encrypted(peer.parse().unwrap(), &srv).is_err(), "{}", peer);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tailscale_direct_link_is_encrypted_and_pinned() {
+        let (mut ctl, srv) = pair().await;
+        let (pk, sk) = sign::gen_keypair();
+        let t = tokio::spawn(target(srv, sk, pk, "123456789"));
+        let who = secure(&mut ctl, &Known::default(), sa(TS), 2_000).await.map_err(|_| "refused").unwrap();
+        let srv = t.await.unwrap();
+        assert!(ctl.is_secured() && srv.is_secured());
+        assert!(require_encrypted(sa(TS).ip(), &srv).is_ok());
+        assert_eq!(Path::of(sa(TS)), Path::ViaInternet, "the badge still says Via internet");
+
+        // Met on the LAN first, then over Tailscale: both addresses kept, both pinned.
+        let mut known = Known::default();
+        known.record(&Verified { tailscale: None, ..who.clone() }, sa(LAN));
+        known.record(&who, sa(TS));
+        assert_eq!(known.tailscale_for(sa(LAN)), Some(sa(TS)));
+        assert_eq!(known.id_at(sa(LAN)), Some("123456789"), "a Tailscale connect keeps the LAN address");
+        let (other, _) = sign::gen_keypair();
+        assert!(known.pin_ok(sa(TS), "123456789", &pk.0));
+        assert!(!known.pin_ok(sa(TS), "555000111", &other.0), "someone else at a known Tailscale address");
+        assert!(!known.pin_ok(sa(TS), "123456789", &other.0));
     }
 
     // --- the encrypted handshake, over loopback (127.0.0.1 is not Tailscale: must encrypt) ---
@@ -666,7 +706,7 @@ mod tests {
         }
         assert!(!ctl.is_secured());
         assert!(require_encrypted("192.168.1.20".parse().unwrap(), &srv).is_err());
-        assert!(require_encrypted("100.101.102.103".parse().unwrap(), &srv).is_ok());
+        assert!(require_encrypted("100.101.102.103".parse().unwrap(), &srv).is_err());
     }
 
     #[tokio::test]

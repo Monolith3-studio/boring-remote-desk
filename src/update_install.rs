@@ -137,7 +137,14 @@ fn download_and_check(d: &Deps, url: &str, key: &str, r: &Release, dest: &Path) 
 }
 
 /// `--boring-verify-package <file> <sig>`: the script's own sig check, against the embedded keys.
+/// As root it refuses (exit 3) to vouch for anything from a bundle a user could change (audit H3).
 pub fn verify_cli(args: &[String]) -> i32 {
+    #[cfg(target_os = "macos")]
+    if let Some(why) = std::env::current_exe().ok().and_then(|e| base::bundle_move::refuse_as_root(&e)) {
+        hbb_common::log::error!("{why}");
+        eprintln!("{why}");
+        return 3;
+    }
     match args {
         [file, sig] => match std::fs::read(file) {
             Ok(b) if verify_bytes(&crate::update_notice::embedded_keys(), &b, sig) => 0,

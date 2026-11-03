@@ -33,6 +33,55 @@ pub fn needs_move(root: &Path) -> bool {
         || std::fs::read_to_string(under(root, PLISTS[1])).is_ok_and(|t| t.contains("SuccessfulExit"))
 }
 
+/// The `.app` bundle `exe` runs from, if any.
+pub fn bundle_of(exe: &Path) -> Option<&Path> {
+    exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app"))
+}
+
+/// Audit H3: the first file or folder in `bundle` (itself first) that isn't `owner`'s or that
+/// group or others can write. Symlinks are skipped: changing one needs its folder writable.
+/// Unreadable counts as loose.
+#[cfg(unix)]
+pub fn first_loose(bundle: &Path, owner: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let md = match std::fs::symlink_metadata(bundle) {
+        Ok(md) => md,
+        Err(_) => return Some(bundle.to_path_buf()),
+    };
+    if md.file_type().is_symlink() {
+        return None;
+    }
+    if md.uid() != owner || md.mode() & 0o022 != 0 {
+        return Some(bundle.to_path_buf());
+    }
+    if !md.is_dir() {
+        return None;
+    }
+    let mut kids: Vec<_> = match std::fs::read_dir(bundle) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return Some(bundle.to_path_buf()),
+    };
+    kids.sort();
+    kids.iter().find_map(|k| first_loose(k, owner))
+}
+
+/// `--boring-verify-package` and anything else root runs from this app: as root, a bundle a
+/// non-root user could change is refused, with the line to log (audit H3). None = go ahead.
+#[cfg(unix)]
+pub fn refuse_as_root(exe: &Path) -> Option<String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let bundle = bundle_of(exe)?;
+    first_loose(bundle, 0).map(|p| {
+        format!(
+            "refusing to run {} as root: {} can be changed without an admin password",
+            bundle.display(),
+            p.display()
+        )
+    })
+}
+
 /// Some(true) when `exe` runs from the old bundle, Some(false) from the new one, None when
 /// it isn't installed (a DMG or Downloads copy, which never moves anything).
 pub fn running_from_old(exe: &Path) -> Option<bool> {
@@ -179,6 +228,34 @@ mod tests {
         fs::create_dir_all(d.join("Library/LaunchDaemons")).unwrap();
         fs::create_dir_all(d.join("Library/LaunchAgents")).unwrap();
         d
+    }
+
+    /// Audit H3: root runs nothing from a bundle someone other than root could change.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_anyone_but_its_owner_can_write_is_loose() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let app = root().join("Applications/Boring Remote.app");
+        let exe = app.join("Contents/MacOS/BoringRemote");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, "x").unwrap();
+        std::os::unix::fs::symlink("MacOS", app.join("Contents/Current")).unwrap();
+        for p in [&app, &app.join("Contents"), &app.join("Contents/MacOS")] {
+            fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let me = fs::metadata(&app).unwrap().uid();
+        assert_eq!(first_loose(&app, me), None);
+        assert_eq!(first_loose(&app, me + 1), Some(app.clone()), "not root's");
+        for mode in [0o775, 0o757, 0o777] {
+            fs::set_permissions(&exe, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(first_loose(&app, me), Some(exe.clone()), "{mode:o}");
+        }
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(app.join("Contents/MacOS"), fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(first_loose(&app, me), Some(app.join("Contents/MacOS")), "a writable folder too");
+        assert_eq!(bundle_of(&exe), Some(app.as_path()));
+        assert_eq!(bundle_of(std::path::Path::new("/usr/local/bin/boring")), None);
     }
 
     #[test]
