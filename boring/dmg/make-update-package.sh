@@ -13,5 +13,11 @@ OUT=${3:?usage: make-update-package.sh <app> <version> <out dir>}
 mkdir -p "$OUT"
 PKG="$(cd "$OUT" && pwd)/BoringRemote-$VER-macos-arm64.app.tar.xz"
 NAME=$(basename "$APP")
-COPYFILE_DISABLE=1 tar -cJf "$PKG" -s "|^${NAME//./\\.}|BoringRemote.app|" -C "$(dirname "$APP")" "$NAME"
+# Rename the top folder inside the archive: bsdtar (macOS) takes -s, GNU tar (Linux CI tests) --transform.
+RENAME="|^${NAME//./\\.}|BoringRemote.app|"
+if tar --version 2>/dev/null | grep -q GNU; then
+    COPYFILE_DISABLE=1 tar -cJf "$PKG" --transform "s${RENAME}" -C "$(dirname "$APP")" "$NAME"
+else
+    COPYFILE_DISABLE=1 tar -cJf "$PKG" -s "$RENAME" -C "$(dirname "$APP")" "$NAME"
+fi
 echo "$PKG"
