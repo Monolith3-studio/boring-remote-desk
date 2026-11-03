@@ -42,6 +42,8 @@ MAC_MOVE = "a 1.6.x BoringRemote.app is moved once; both paths count as installe
 ACCESS = "Access: Settings and Home check what serves sessions; remote access is its own switch (t17)"
 AGENT_RESTART = "the agent restart checks --server came up; a job stuck at spawn failed is booted out and in again (t17)"
 SETTINGS_GEAR = "Settings opens from a gear, not the three-line menu (t17)"
+SUPPORT = "support file and crash files wired: a panic hook at every startup, Settings Help, Home's notice (t20)"
+SUPPORT_REDACT = "the support file removes every secret by name and hashes IDs (t20)"
 WIN_NAMES = "Windows service, firewall rule and Apps list say Boring Remote; exe and install dir unchanged (t17)"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
@@ -102,7 +104,7 @@ class RebrandSeam(unittest.TestCase):
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
                      "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
                      CONNECT_DIRECT, NOT_FOUND_TRANSLATED, CONNECT_ENCRYPTED, TRUST_WIRED, ONE_TIME_CODE,
-                     HE_WIRED, RUST_HOOKS):
+                     HE_WIRED, RUST_HOOKS, SUPPORT):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -753,6 +755,38 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("res/msi/CustomActions/FirewallRules.cpp", 'L"Boring Remote Service"', 'L"%ls Service", exeName')
         self.assert_check_fails(WIN_NAMES)
+
+    # --- v1.7 t20: Save a support file, crash files ---------------------------------
+    def test_support_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (SUPPORT, SUPPORT_REDACT):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_panic_hook_missing_from_the_server_startup_fails_check(self):
+        self.rebrand()
+        self.edit("src/core_main.rs", rebrand.T20_HOOK_CORE, "")
+        self.assert_check_fails(SUPPORT)
+
+    def test_settings_without_the_support_button_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, rebrand.T20_HELP, "")
+        self.assert_check_fails(SUPPORT)
+
+    def test_home_without_the_crash_notice_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, rebrand.T20_NOTICE, "")
+        self.assert_check_fails(SUPPORT)
+
+    def test_a_secret_back_in_the_support_file_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/support.rs", '    "boring-trust-tokens",\n', "")
+        self.assert_check_fails(SUPPORT_REDACT)
+
+    def test_config_copied_raw_into_the_support_file_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/support.rs", "redact_toml(&text).as_bytes()", "text.as_bytes()")
+        self.assert_check_fails(SUPPORT_REDACT)
 
 
 if __name__ == "__main__":

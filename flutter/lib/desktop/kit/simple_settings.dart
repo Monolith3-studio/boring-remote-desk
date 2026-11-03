@@ -47,6 +47,9 @@ class SimpleSettings extends StatefulWidget {
   /// Whoever is waiting to get in right now (kit/approval.dart), shown above Access.
   final Widget? waiting;
 
+  /// Help: Save a support file (kit/support.dart, v1.7 t20); null hides it.
+  final Widget? help;
+
   final bool checkUpdates;
   final void Function(bool on) onCheckUpdates;
 
@@ -71,6 +74,7 @@ class SimpleSettings extends StatefulWidget {
     this.onOpenAtLogin,
     this.access,
     this.waiting,
+    this.help,
     required this.checkUpdates,
     required this.onCheckUpdates,
     this.advanced = const [],
@@ -288,6 +292,10 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         ],
         const SizedBox(height: Kit.s6),
         _anotherSection(t),
+        if (widget.help != null) ...[
+          const SizedBox(height: Kit.s6),
+          widget.help!,
+        ],
         if (widget.advanced.isNotEmpty) ...[
           const SizedBox(height: Kit.s5),
           Text('Advanced', style: t.bodySmall),

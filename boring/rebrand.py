@@ -2295,6 +2295,97 @@ PATCHES += [
      "import 'package:flutter_hbb/desktop/kit/trust.dart';\n" + T17_ACCESS_IMPORT, "Access import (settings)"),
 ]
 
+# --- Save a support file and crash files (v1.7 ticket 20) ---------------------------------
+# libs/base/src/support.rs (zip, redaction, panic hook, crash notice) and desktop/kit/support.dart
+# (bridge-free) are ours; these wire them in. Every process that logs installs the panic hook right
+# after init_log, so crash-<time>.txt lands next to that process's log. Settings → Help saves the
+# zip on the Desktop; Home offers it once after a crash. Nothing is uploaded.
+T20_MOD = "pub mod support; // v1.7 t20: support file, crash files\n"
+T20_HOOK_CORE = "    base::support::install_panic_hook(&log_name, crate::VERSION); // boring-remote (v1.7 t20): crash files\n"
+T20_HOOK_FFI = "        base::support::install_panic_hook(\"flutter_ffi\", crate::VERSION); // boring-remote (v1.7 t20)\n"
+T20_HOOK_SERVICE = "    base::support::install_panic_hook(\"service\", librustdesk::VERSION); // boring-remote (v1.7 t20)\n"
+T20_FFI = (
+    "/// boring-remote (v1.7 t20): Save a support file on the Desktop (base::support). `access` is the\n"
+    "/// Access rows as Settings shows them. File work, so not Sync. Returns the zip's path, or \"\".\n"
+    "pub fn main_boring_save_support_file(access: String) -> String {\n"
+    "    let enc = scrap::codec::Encoder::supported_encoding();\n"
+    "    let codecs = format!(\n"
+    "        \"encode: VP8 {}, VP9 true, AV1 {}, H.264 {}, H.265 {}\\nhardware decode: {}\",\n"
+    "        enc.vp8,\n"
+    "        enc.av1,\n"
+    "        enc.h264,\n"
+    "        enc.h265,\n"
+    "        main_supported_hwdecodings().0\n"
+    "    );\n"
+    "    let rows = [\n"
+    "        (\"Version\", format!(\"{} (built {})\", crate::VERSION, crate::BUILD_DATE)),\n"
+    "        (\"Displays\", main_get_displays().0),\n"
+    "        (\"Codecs\", codecs),\n"
+    "        (\"Access\", access),\n"
+    "    ];\n"
+    "    match base::support::save(&rows) {\n"
+    "        Ok(p) => p.to_string_lossy().into_owned(),\n"
+    "        Err(e) => {\n"
+    "            log::error!(\"support file not saved: {}\", e);\n"
+    "            String::new()\n"
+    "        }\n"
+    "    }\n"
+    "}\n\n"
+    "/// boring-remote (v1.7 t20): Boring Remote closed unexpectedly since Home last offered the file.\n"
+    "pub fn main_boring_crash_to_offer() -> SyncReturn<bool> {\n"
+    "    SyncReturn(base::support::crash_to_offer())\n"
+    "}\n\n"
+    "/// boring-remote (v1.7 t20): Home's notice was answered; these crashes aren't offered again.\n"
+    "pub fn main_boring_crash_offered() {\n"
+    "    base::support::crash_offered()\n"
+    "}\n\n")
+T20_SAVE_FN = (
+    "// boring-remote: v1.7 t20. Save a support file on the Desktop, with the Access rows as Settings shows them.\n"
+    "Future<String> boringSaveSupportFile() async =>\n"
+    "    bind.mainBoringSaveSupportFile(access: await accessReport(boringAccessChecks()));\n\n")
+T20_NOTICE = (
+    "              CrashNotice( // v1.7 t20: closed unexpectedly last time, offer the support file once\n"
+    "                  crashed: () => bind.mainBoringCrashToOffer(),\n"
+    "                  save: boringSaveSupportFile,\n"
+    "                  onDone: () => bind.mainBoringCrashOffered()),\n")
+T20_HELP = "          help: SupportSection(save: boringSaveSupportFile), // v1.7 t20\n"
+T20_IMPORT = "import 'package:flutter_hbb/desktop/kit/support.dart';\n"
+PATCHES += [
+    (BASE_LIB, "pub mod update_feed;\n", "pub mod update_feed;\n" + T20_MOD, "base: support module (t20)"),
+    ("src/core_main.rs", "    hbb_common::init_log(false, &log_name);\n",
+     "    hbb_common::init_log(false, &log_name);\n" + T20_HOOK_CORE, "crash files: every core_main process (t20)"),
+    ("src/flutter_ffi.rs", "        hbb_common::init_log(false, \"flutter_ffi\");\n",
+     "        hbb_common::init_log(false, \"flutter_ffi\");\n" + T20_HOOK_FFI, "crash files: the window (t20)"),
+    ("src/service.rs", "    hbb_common::init_log(false, \"service\");\n",
+     "    hbb_common::init_log(false, \"service\");\n" + T20_HOOK_SERVICE, "crash files: the Mac service (t20)"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     T20_FFI + "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n", "support file bridge calls (t20)"),
+    (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
+     T20_SAVE_FN + "class _DesktopHomePageState extends State<DesktopHomePage>\n", "save a support file (t20)"),
+    (HOME, T17_ACCESS_IMPORT, T17_ACCESS_IMPORT + T20_IMPORT, "support import (home)"),
+    (SETTINGS, T17_ACCESS_IMPORT, T17_ACCESS_IMPORT + T20_IMPORT, "support import (settings)"),
+]
+# Home's notices and Settings' slots live inside t01's and t09's own blocks, so t20 writes into
+# that patch text (as t04/t06/t12 do) rather than patching over it.
+T20_FOLDS = [
+    (HOME, "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n",
+     T20_NOTICE + "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n"),
+    (SETTINGS, "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n",
+     "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n" + T20_HELP),
+]
+_require(all(sum(r == rel and a in new for r, _, new, _ in PATCHES) == 1 for rel, a, _ in T20_FOLDS),
+         "t20's Home notice or Settings Help anchor moved")
+
+
+def _fold_t20(r, old, new, why):
+    for rel, a, b in T20_FOLDS:
+        if r == rel and isinstance(new, str):
+            new = new.replace(a, b)
+    return r, old, new, why
+
+
+PATCHES[:] = [_fold_t20(*p) for p in PATCHES]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

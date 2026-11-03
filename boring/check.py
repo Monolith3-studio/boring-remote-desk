@@ -945,6 +945,44 @@ def high_efficiency_checks(c):
            not missing, "; ".join(missing))
 
 
+def support_checks(c):
+    """v1.7 t20: Save a support file (Settings → Help) and crash files. Every process that logs
+    installs the panic hook right after init_log; Home offers the file once after a crash. The
+    zip never carries a secret: each one is removed by name, config only goes in redacted, and
+    IDs are hashed in config and logs."""
+    after_log = [("src/core_main.rs", "    hbb_common::init_log(false, &log_name);\n", rebrand.T20_HOOK_CORE),
+                 ("src/flutter_ffi.rs", '        hbb_common::init_log(false, "flutter_ffi");\n', rebrand.T20_HOOK_FFI),
+                 ("src/service.rs", '    hbb_common::init_log(false, "service");\n', rebrand.T20_HOOK_SERVICE)]
+    missing = [f"{rel}: panic hook not right after init_log" for rel, log, hook in after_log
+               if log + hook not in c.read(rel)]
+    hooks = [(rebrand.BASE_LIB, rebrand.T20_MOD), ("src/flutter_ffi.rs", rebrand.T20_FFI),
+             (rebrand.HOME, rebrand.T20_SAVE_FN), (rebrand.HOME, rebrand.T20_NOTICE), (rebrand.SETTINGS, rebrand.T20_HELP)]
+    missing += [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
+    c.fact("support file and crash files wired: a panic hook at every startup, Settings Help, Home's notice (t20)",
+           not missing, "; ".join(missing))
+
+    sup = c.read("libs/base/src/support.rs")
+    m = re.search(r"pub const SECRET_KEYS: &\[&str\] = &\[(.*?)\];", sup, re.S)
+    keys = set(re.findall(r'"([^"]+)"', m.group(1))) if m else set()
+    bad = [f"{k} not removed" for k in ("password", "salt", "key_pair", "enc_id", "trusted_devices",
+                                        "boring-trust-tokens") if k not in keys]
+    # the JSON options keep their names and drop the secret inside, under the names Rust stores them as
+    opt = lambda rel, const: (re.search(rf'pub const {const}: &str = "([^"]+)";', c.read(rel)) or [None, "?"])[1]
+    for name, field in ((opt("libs/base/src/trust.rs", "TRUSTED_OPTION"), "key"),
+                        (opt("libs/base/src/direct_link.rs", "KNOWN_OPTION"), "pk")):
+        if f'"{name}" =>' not in sup or f'.insert("{field}".into(), Json::String(REMOVED.into()))' not in sup:
+            bad.append(f"{name}: {field} not removed")
+    if opt("libs/base/src/trust.rs", "TOKENS_OPTION") not in keys:
+        bad.append("trust tokens option name differs from trust.rs")
+    for needle, why in (("redact_toml(&text).as_bytes()", "config goes in unredacted"),
+                        ("scrub_ids(&String::from_utf8_lossy(&data), &s.ids)", "logs keep the ID"),
+                        ('if key == "id" {', "the ID is not hashed in config"),
+                        ('pub const ZIP_PREFIX: &str = "Boring Remote support";', "zip name")):
+        if needle not in sup:
+            bad.append(why)
+    c.fact("the support file removes every secret by name and hashes IDs (t20)", not bad, "; ".join(bad))
+
+
 def rust_hook_checks(c):
     """v1.7: our Rust lives in new files under libs/base/src; upstream files only get these hooks,
     through rebrand.py. On a raw checkout every one of them is missing."""
@@ -1437,6 +1475,7 @@ def run_checks(root):
     windows_checks(c)  # v1.7 t12
     high_efficiency_checks(c)  # v1.7 t05
     rust_hook_checks(c)  # v1.7 t02-t05
+    support_checks(c)  # v1.7 t20
     home_checks(c)  # v1.7 review: Home, Settings, copy
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",

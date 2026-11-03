@@ -12,6 +12,8 @@ mod direct_link;
 mod high_efficiency;
 #[path = "../src/lan.rs"]
 mod lan;
+#[path = "../src/support.rs"]
+mod support;
 #[path = "../src/trust.rs"]
 mod trust;
 #[path = "../src/update_feed.rs"]
