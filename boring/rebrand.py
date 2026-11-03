@@ -358,6 +358,11 @@ PATCHES += [
     ("libs/scrap/src/common/codec.rs", "    res = std::cmp::min(res, memory as usize / 2);",
      "    if memory < 1 { res = 1; } // boring-remote (v1.7 t05): RAM only limits threads when under 1 GB is free",
      "encoder threads follow the CPU, not free RAM"),
+    ("libs/scrap/src/common/codec.rs",
+     "        res = 0;\n        let percent = base::platform::windows::cpu_uage_one_minute();",
+     "        res = max / 2; // boring-remote (v1.7 t05): no CPU sample yet (None) counts as idle, not 1 thread\n"
+     "        let percent = base::platform::windows::cpu_uage_one_minute();",
+     "encoder threads: no CPU sample yet on Windows counts as idle"),
     # Windows, what people read
     ("res/msi/CustomActions/FirewallRules.cpp", 'L"%ls Service", exeName);',
      f'L"{WINDOWS_RULE}"); // boring-remote (v1.7 t17): what people read, not the exe name',
