@@ -47,7 +47,7 @@ NOT_FOUND = "Couldn't find a Mac with that name. Pick it from the list, or check
 NOT_ON_NETWORK = "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again."
 PLAINTEXT_REFUSED = "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again."
 IDENTITY_CHANGED = ("This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was "
-                    "reinstalled, open Settings, click Trusted Controllers, click Forget next to it, "
+                    "reinstalled, open Settings, click Trusted list, click Forget next to it, "
                     "then try again.")
 NO_ADDRESS = ("Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, "
               "then try again.")
@@ -1442,7 +1442,7 @@ T04_HOOK = "            // boring-remote: v1.7 t04 adds Trusted Controllers here
 T04_SETTINGS_LINK = (
     "            // boring-remote: v1.7 t04 Trusted Controllers (base::trust, kit/trust.dart).\n"
     "            SettingsLink(\n"
-    "              label: 'Trusted Controllers',\n"
+    "              label: kTrustedTitle,\n"
     "              onTap: () => Navigator.of(context).push(MaterialPageRoute(\n"
     "                builder: (_) => Theme(\n"
     "                  data: Kit.theme(),\n"

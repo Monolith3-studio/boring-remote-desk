@@ -179,7 +179,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
     return ListView(
       padding: const EdgeInsets.all(Kit.s6),
       children: [
-        Text('Trusted Controllers', style: t.headlineSmall),
+        Text(kTrustedTitle, style: t.headlineSmall),
         const SizedBox(height: Kit.s2),
         if (widget.waiting != null) widget.waiting!,
         Text('These ${KitWords.many} get into this one without asking. Remove one and it has to ask again.',
@@ -256,6 +256,9 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
     );
   }
 }
+
+/// The Settings link and page title for who gets in without asking ("Controller" stays internal).
+const kTrustedTitle = 'Trusted list';
 
 /// The ask in plain words: who, and what it wants (the connection window and the main window).
 String approvalQuestion(String name) {

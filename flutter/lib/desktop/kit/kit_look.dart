@@ -286,9 +286,9 @@ const _byText = <String, (String, String?, String?)>{
       (_couldNot, null, null),
   "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again.":
       (_couldNot, null, null),
-  "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.":
+  "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.":
       (_couldNot, null, null),
-  "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.":
+  "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.":
       (_couldNot, null, null),
 };
 

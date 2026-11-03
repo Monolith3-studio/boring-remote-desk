@@ -39,6 +39,8 @@ void main() {
       onForget: (_) async {},
     )));
     expect(find.text('Edit Bay 2'), findsOneWidget);
+    expect(find.text('Trusted list'), findsOneWidget);
+    expect(find.textContaining('Controller'), findsNothing, reason: 'Controller is an internal word');
     await tester.tap(find.text('Remove').first);
     await tester.pumpAndSettle();
     expect(removed, ['aa11']);

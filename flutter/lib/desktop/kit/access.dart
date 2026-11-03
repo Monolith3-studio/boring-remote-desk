@@ -80,15 +80,15 @@ class AccessWords {
   static const screen = 'Screen Recording';
   static const screenWhy = 'So people who connect can see this screen.';
   static const control = 'Accessibility';
-  static const controlWhy = 'So they can use the mouse and keyboard.';
+  static const controlWhy = 'So people who connect can use the mouse and keyboard.';
   static const input = 'Input Monitoring';
   static String get inputWhy => 'So keyboard shortcuts reach this ${KitWords.one}.';
   static String get on => 'Let your other ${KitWords.many} in';
-  static const onWhy = 'Turned on in Settings.';
+  static const onWhy = 'The switch above.';
   static const running = 'Boring Remote running in the background';
-  static const runningWhy = 'It takes sessions even with this window closed.';
+  static String get runningWhy => 'So your other ${KitWords.many} can get in with this window closed.';
   static const listening = 'Open for connections';
-  static String get listeningWhy => 'Your other ${KitWords.many} can reach it on this network.';
+  static String get listeningWhy => 'So your other ${KitWords.many} on this network can reach this one.';
   static String get reach => 'Let computers on this network reach Boring Remote';
   static const reachWhy = 'Windows asks once. Click “Yes”.';
 }
