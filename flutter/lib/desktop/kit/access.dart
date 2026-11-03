@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -10,6 +11,40 @@ export 'setup.dart' show kScreenRecordingPane, kAccessibilityPane, kInputMonitor
 const kAgentLabel = 'io.boringlabs.remote.agent';
 const kAgentPlist = '/Library/LaunchAgents/$kAgentLabel.plist';
 const kDirectLinkPort = 21118;
+
+/// launchctl's own line for the job, not its endpoints' (those say active).
+final _agentUp = RegExp(r'^\tstate = running$', multiLine: true);
+bool agentRunning(String launchctlPrint) => _agentUp.hasMatch(launchctlPrint);
+
+typedef RunProcess = Future<ProcessResult> Function(String exe, List<String> args);
+
+/// Start the agent (`--server`) and check it came up. `kickstart -k` alone is not enough: after
+/// the app bundle is replaced, launchd can hold the job at "spawn failed" (EX_CONFIG 78, "needs
+/// LWCR update"), and kickstart exits 0 without starting it. Only bootout + bootstrap clears that.
+/// True once launchctl says running; false if it is still down after the bootstrap.
+Future<bool> restartAgent(RunProcess run, String uid,
+    {Future<void> Function(Duration) sleep = Future.delayed, int tries = 10}) async {
+  final job = 'gui/$uid/$kAgentLabel';
+  Future<ProcessResult> show() => run('launchctl', ['print', job]);
+  Future<bool> cameUp() async {
+    for (var i = 0; i < tries; i++) {
+      final p = await show();
+      if (p.exitCode == 0 && agentRunning('${p.stdout}')) return true;
+      if (i < tries - 1) await sleep(const Duration(milliseconds: 500));
+    }
+    return false;
+  }
+
+  await run('launchctl', ['kickstart', '-k', job]);
+  if (await cameUp()) return true;
+  await run('launchctl', ['bootout', job]);
+  for (var i = 0; i < tries && (await show()).exitCode == 0; i++) {
+    await sleep(const Duration(milliseconds: 500)); // bootout returns before the job is gone
+  }
+  await run('launchctl', ['bootstrap', 'gui/$uid', kAgentPlist]);
+  await run('launchctl', ['kickstart', job]); // loaded but not started
+  return cameUp();
+}
 
 /// "Open Boring Remote at login" (Mac): a LaunchAgent of the user's own that opens the app.
 /// It only opens the window; remote access is its own switch and never depends on it.

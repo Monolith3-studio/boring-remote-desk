@@ -38,6 +38,9 @@ fi
 # Tests shorten it; as root it is always 60.
 WAIT=60
 [ -n "$ROOT" ] && WAIT=${BORING_ROLLBACK_WAIT:-60}
+# Checks (0.5 s apart) that a restarted launchd job says "state = running". Tests set 0: one look, no waits.
+TRIES=10
+[ -n "$ROOT" ] && TRIES=${BORING_LAUNCHD_TRIES:-10}
 
 APP="$ROOT/Applications/$BUNDLE"
 OLD="$ROOT/Applications/$OLD_BUNDLE"
@@ -77,8 +80,12 @@ needs_move() {
 # The per-user agent (--server, the screen capturer) lives in the user's GUI domain, not root's.
 agent_out() {
   launchctl bootout "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
-  i=0  # bootout returns before the job is gone; bootstrap fails while it is still there
-  while [ $i -lt 20 ] && launchctl print "gui/$CONSOLE_UID/$AGENT_LABEL" >/dev/null 2>&1; do
+  job_gone "gui/$CONSOLE_UID/$AGENT_LABEL"
+}
+# bootout returns before the job is gone; bootstrap fails while it is still there.
+job_gone() {
+  i=0
+  while [ $i -lt $((TRIES * 2)) ] && launchctl print "$1" >/dev/null 2>&1; do
     sleep 0.5; i=$((i + 1))
   done
 }
@@ -86,6 +93,34 @@ agent_in() {
   launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT_PLIST" 2>/dev/null \
     || launchctl kickstart -k "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true
   launchctl kickstart "gui/$CONSOLE_UID/$AGENT_LABEL" 2>/dev/null || true  # loaded but not started
+}
+
+# launchctl's own line for the job (its endpoints say active), within TRIES checks.
+job_up() {
+  i=0
+  while :; do
+    launchctl print "$1" 2>/dev/null | grep -q '^	state = running$' && return 0
+    i=$((i + 1)); [ $i -lt "$TRIES" ] || return 1
+    sleep 0.5
+  done
+}
+
+# After a bundle swap launchd can hold a job at "spawn failed" (EX_CONFIG 78, "needs LWCR
+# update"): KeepAlive never respawns it and kickstart exits 0 without starting it. Only
+# bootout + bootstrap clears that, so the agent always gets one, and the daemon when its
+# kickstart did not bring it back.
+agent_restart() {
+  agent_out
+  agent_in
+  job_up "gui/$CONSOLE_UID/$AGENT_LABEL" || echo "install-update: --server did not come up" >&2
+}
+daemon_restart() {
+  launchctl kickstart -k "system/$SERVICE_LABEL" || true
+  job_up "system/$SERVICE_LABEL" && return 0
+  launchctl bootout "system/$SERVICE_LABEL" 2>/dev/null || true
+  job_gone "system/$SERVICE_LABEL"
+  launchctl bootstrap system "$DAEMON_PLIST" 2>/dev/null || launchctl load -w "$DAEMON_PLIST" || true
+  job_up "system/$SERVICE_LABEL" || echo "install-update: the service did not come up" >&2
 }
 
 # Keep the newer bundle (the new path wins a tie) at the new path, then point both jobs at it.
@@ -165,8 +200,9 @@ done
 printf 'from=%s\nto=%s\ntime=%s\n' "$FROM" "$VERSION" "$(date +%s)" > "$SUPPORT/update-pending"
 
 restart() {
-  launchctl kickstart -k "system/$SERVICE_LABEL" || true
-  pkill -x "$APP_NAME" || true
+  daemon_restart
+  pkill -x "$APP_NAME" || true  # the old window and its --server
+  user_session && agent_restart
   if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != root ]; then
     launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" open "$APP" || true
   fi

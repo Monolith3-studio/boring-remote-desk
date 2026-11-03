@@ -1102,6 +1102,27 @@ def bundle_checks(c):
     c.fact("Access: Settings and Home check what serves sessions; remote access is its own switch (t17)",
            not bad, "; ".join(bad))
 
+    # A replaced bundle can leave launchd holding the agent at "spawn failed" (EX_CONFIG 78, "needs
+    # LWCR update"); kickstart exits 0 and does nothing. Every restart checks and boots it out and in.
+    move, script = c.read("libs/base/src/bundle_move.rs"), c.read(INSTALL_SCRIPT)
+    kit_restart = access[access.find("Future<bool> restartAgent("):]
+    bad = [n for n, ok in [
+        ("kit restartAgent kickstarts, checks, then bootout + bootstrap",
+         all(n in kit_restart for n in ("['kickstart', '-k', job]", "if (await cameUp()) return true;",
+                                        "['bootout', job]", "['bootstrap', 'gui/$uid', kAgentPlist]",
+                                        "return cameUp();"))),
+        ("Access Fix uses restartAgent", "await restartAgent(Process.run, await uid())" in home
+         and "'kickstart'" not in home and "agentRunning('${r.stdout}')" in home),
+        ("bundle_move start_agent uses restart_agent", "restart_agent(&mut launchctl, &mut sleep, uid)" in move
+         and all(n in move for n in ('launchctl(&["bootout", &job]);',
+                                     'launchctl(&["bootstrap", &format!("gui/{uid}"), PLISTS[1]]);'))),
+        ("install-update.sh boots the agent out and in after the swap, checks both jobs",
+         "  user_session && agent_restart\n" in script and "  daemon_restart\n" in script
+         and "job_up \"gui/$CONSOLE_UID/$AGENT_LABEL\"" in script and "job_up \"system/$SERVICE_LABEL\"" in script),
+    ] if not ok]
+    c.fact("the agent restart checks --server came up; a job stuck at spawn failed is booted out and in again (t17)",
+           not bad, "; ".join(bad))
+
     mac, ipc, auth = c.read("src/platform/macos.rs"), c.read("src/ipc.rs"), c.read("src/ipc/auth.rs")
     move, script = c.read("libs/base/src/bundle_move.rs"), c.read(INSTALL_SCRIPT)
     stale = '.arg(&format!("/Applications/{}.app", crate::get_app_name()))'

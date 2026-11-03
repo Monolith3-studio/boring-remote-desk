@@ -97,21 +97,74 @@ fn run(support_dir: &Path, quit: fn()) {
 }
 
 /// The agent (`--server`) serves sessions. Start it when remote access is on and it isn't up
-/// (a plist written before t17 left it down after macOS's "Quit & Reopen").
+/// (a plist written before t17 left it down after macOS's "Quit & Reopen"; a replaced bundle can
+/// leave launchd holding it at "spawn failed").
 #[cfg(target_os = "macos")]
 fn start_agent() {
     if !Path::new(PLISTS[1]).exists() || hbb_common::config::Config::get_option("stop-service") == "Y" {
         return;
     }
-    let target = format!("gui/{}/{AGENT_LABEL}", unsafe { libc::getuid() });
-    let up = std::process::Command::new("launchctl")
-        .args(["print", &target])
-        .output()
-        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| l == "\tstate = running"));
-    if !up {
-        log::info!("starting {target}");
-        let _ = std::process::Command::new("launchctl").args(["kickstart", &target]).status();
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{AGENT_LABEL}");
+    let mut launchctl = |args: &[&str]| {
+        std::process::Command::new("launchctl")
+            .args(args)
+            .output()
+            .ok()
+            .map(|o| (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()))
+    };
+    if launchctl(&["print", &target]).is_some_and(|(ok, out)| ok && agent_running(&out)) {
+        return;
     }
+    log::info!("starting {target}");
+    let mut sleep = || std::thread::sleep(std::time::Duration::from_millis(500));
+    if !restart_agent(&mut launchctl, &mut sleep, uid) {
+        log::warn!("{target} is still not running");
+    }
+}
+
+/// launchctl's own line for the job, not its endpoints' (those say active).
+pub fn agent_running(launchctl_print: &str) -> bool {
+    launchctl_print.lines().any(|l| l == "\tstate = running")
+}
+
+/// Start the agent and check it came up. `kickstart -k` alone is not enough: after the app
+/// bundle is replaced, launchd can hold the job at "spawn failed" (EX_CONFIG 78, "needs LWCR
+/// update"), and kickstart exits 0 without starting it. Only bootout + bootstrap clears that.
+/// `launchctl` runs one launchctl command: Some((exited 0, stdout)). True once it is running.
+pub fn restart_agent(
+    launchctl: &mut dyn FnMut(&[&str]) -> Option<(bool, String)>,
+    sleep: &mut dyn FnMut(),
+    uid: u32,
+) -> bool {
+    const TRIES: usize = 10; // 0.5 s apart
+    let job = format!("gui/{uid}/{AGENT_LABEL}");
+    let came_up = |launchctl: &mut dyn FnMut(&[&str]) -> Option<(bool, String)>, sleep: &mut dyn FnMut()| {
+        for i in 0..TRIES {
+            if launchctl(&["print", &job]).is_some_and(|(ok, out)| ok && agent_running(&out)) {
+                return true;
+            }
+            if i + 1 < TRIES {
+                sleep();
+            }
+        }
+        false
+    };
+    launchctl(&["kickstart", "-k", &job]);
+    if came_up(launchctl, sleep) {
+        return true;
+    }
+    launchctl(&["bootout", &job]);
+    // bootout returns before the job is gone; bootstrap fails while it is still there
+    for _ in 0..TRIES {
+        if !launchctl(&["print", &job]).is_some_and(|(ok, _)| ok) {
+            break;
+        }
+        sleep();
+    }
+    launchctl(&["bootstrap", &format!("gui/{uid}"), PLISTS[1]]);
+    launchctl(&["kickstart", &job]); // loaded but not started
+    came_up(launchctl, sleep)
 }
 
 #[cfg(test)]
@@ -167,5 +220,66 @@ mod tests {
         assert_eq!(running_from_old(&exe("/Applications/Boring Remote.app/Contents/MacOS/BoringRemote")), Some(false));
         assert_eq!(running_from_old(&exe("/Volumes/Boring Remote/Boring Remote.app/Contents/MacOS/BoringRemote")), None);
         assert_eq!(running_from_old(&exe("/Applications/BoringRemote.app.previous/Contents/MacOS/BoringRemote")), None);
+    }
+
+    /// A fake launchctl holding the agent the way a real Mac (macOS 26) did after the bundle was
+    /// replaced: "spawn failed", EX_CONFIG 78, "needs LWCR update"; kickstart exits 0 and does nothing.
+    struct Launchd {
+        calls: Vec<String>,
+        loaded: bool,
+        running: bool,
+        kickstart_fixes: bool,
+        bootstrap_fixes: bool,
+    }
+    const STUCK: &str = "gui/501/x = {\n\tstate = spawn scheduled\n\tjob state = spawn failed\n\tlast exit code = 78: EX_CONFIG\n}\n";
+    const UP: &str = "gui/501/x = {\n\tstate = running\n\tpid = 4242\n}\n";
+    impl Launchd {
+        fn new(kickstart_fixes: bool, bootstrap_fixes: bool) -> Self {
+            Launchd { calls: vec![], loaded: true, running: false, kickstart_fixes, bootstrap_fixes }
+        }
+        fn run(&mut self, args: &[&str]) -> Option<(bool, String)> {
+            self.calls.push(args.join(" "));
+            match args[0] {
+                "print" => return Some((self.loaded, if self.running { UP } else { STUCK }.into())),
+                "kickstart" => self.running |= self.kickstart_fixes,
+                "bootout" => (self.loaded, self.running) = (false, false),
+                "bootstrap" => (self.loaded, self.running) = (true, self.bootstrap_fixes),
+                _ => {}
+            }
+            Some((true, String::new()))
+        }
+    }
+
+    fn restart(l: &mut Launchd) -> bool {
+        restart_agent(&mut |a: &[&str]| l.run(a), &mut || {}, 501)
+    }
+
+    #[test]
+    fn agent_counts_as_running_only_on_launchctls_own_state_line() {
+        assert!(agent_running(UP));
+        assert!(!agent_running(STUCK));
+        assert!(!agent_running("\t\tstate = active\n"));
+    }
+
+    #[test]
+    fn kickstart_that_brings_the_agent_up_is_enough() {
+        let mut l = Launchd::new(true, true);
+        assert!(restart(&mut l));
+        assert_eq!(l.calls[0], format!("kickstart -k gui/501/{AGENT_LABEL}"));
+        assert!(!l.calls.iter().any(|c| c.starts_with("bootout")));
+    }
+
+    #[test]
+    fn agent_stuck_at_spawn_failed_is_booted_out_and_in_again_then_checked() {
+        let mut l = Launchd::new(false, true);
+        assert!(restart(&mut l));
+        let at = |c: &str| l.calls.iter().position(|x| x == c).unwrap_or_else(|| panic!("no {c} in {:?}", l.calls));
+        assert!(at(&format!("bootout gui/501/{AGENT_LABEL}")) < at(&format!("bootstrap gui/501 {}", PLISTS[1])));
+        assert!(l.calls.last().unwrap().starts_with("print "));
+    }
+
+    #[test]
+    fn agent_still_down_after_bootstrap_says_so() {
+        assert!(!restart(&mut Launchd::new(false, false)));
     }
 }

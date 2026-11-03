@@ -40,6 +40,7 @@ MAC_BUNDLE = "Mac bundle is Boring Remote.app; its exe stays BoringRemote (t17)"
 MAC_PLISTS = "launchd plists run Boring Remote.app directly, no sh -c (t17)"
 MAC_MOVE = "a 1.6.x BoringRemote.app is moved once; both paths count as installed until then (t17)"
 ACCESS = "Access: Settings and Home check what serves sessions; remote access is its own switch (t17)"
+AGENT_RESTART = "the agent restart checks --server came up; a job stuck at spawn failed is booted out and in again (t17)"
 SETTINGS_GEAR = "Settings opens from a gear, not the three-line menu (t17)"
 WIN_NAMES = "Windows service, firewall rule and Apps list say Boring Remote; exe and install dir unchanged (t17)"
 REBRAND = HERE / "rebrand.py"
@@ -667,7 +668,7 @@ class RebrandSeam(unittest.TestCase):
     def test_bundle_name_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
-        for fact in (MAC_BUNDLE, MAC_PLISTS, MAC_MOVE, WIN_NAMES, SETTINGS_GEAR, ACCESS):
+        for fact in (MAC_BUNDLE, MAC_PLISTS, MAC_MOVE, WIN_NAMES, SETTINGS_GEAR, ACCESS, AGENT_RESTART):
             self.assertIn(f"PASS {fact}", r.stdout)
         xc = (self.root / "flutter/macos/Runner/Configs/AppInfo.xcconfig").read_text()
         self.assertIn("PRODUCT_NAME = Boring Remote\n", xc)
@@ -706,6 +707,27 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.SETTINGS, "          onOpenAtLogin: (on) {\n",
                   "          onOpenAtLogin: (on) {\n            mainSetBoolOption(kOptionStopService, !on);\n")
         self.assert_check_fails(ACCESS)
+
+    def test_access_fix_back_to_kickstart_only_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "    if (!await restartAgent(Process.run, await uid())) debugPrint('Access: --server still down');\n",
+                  "    await Process.run('launchctl', ['kickstart', '-k', 'gui/${await uid()}/$kAgentLabel']);\n")
+        self.assert_check_fails(AGENT_RESTART)
+
+    def test_kit_restart_without_bootout_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/access.dart", "  await run('launchctl', ['bootout', job]);\n", "")
+        self.assert_check_fails(AGENT_RESTART)
+
+    def test_bundle_move_back_to_kickstart_only_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/bundle_move.rs", "restart_agent(&mut launchctl, &mut sleep, uid)", "launchctl(&[\"kickstart\", &target])")
+        self.assert_check_fails(AGENT_RESTART)
+
+    def test_update_restart_leaving_the_agent_to_keepalive_fails_check(self):
+        self.rebrand()
+        self.edit(check.INSTALL_SCRIPT, "  user_session && agent_restart\n", "")
+        self.assert_check_fails(AGENT_RESTART)
 
     def test_three_line_settings_icon_back_fails_check(self):
         self.rebrand()

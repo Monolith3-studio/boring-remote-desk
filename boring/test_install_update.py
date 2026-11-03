@@ -92,7 +92,7 @@ class InstallUpdate(unittest.TestCase):
     def run_script(self, *args, root=True, wait=2):
         env = {"PATH": f"{self.stubs}:/usr/bin:/bin:/usr/sbin:/sbin", "STUB_LOG": str(self.log),
                "ARGS_LOG": str(self.args_log),
-               "TMPDIR": str(self.tmp), "BORING_ROLLBACK_WAIT": str(wait)}
+               "TMPDIR": str(self.tmp), "BORING_ROLLBACK_WAIT": str(wait), "BORING_LAUNCHD_TRIES": "0"}
         if root:
             env["BORING_TEST_ROOT"] = str(self.root)
         return subprocess.run(["/bin/sh", str(SCRIPT), *map(str, args)], env=env,
@@ -313,6 +313,40 @@ class InstallUpdate(unittest.TestCase):
         self.assertEqual(self.marker(self.app), "new")
         self.assertEqual(self.marker(pathlib.Path(str(self.app) + ".previous")), "old16")
         self.assert_new_plists()
+
+    # --- t17: after the swap launchd can hold a job at "spawn failed" (EX_CONFIG 78, "needs LWCR
+    # update"); KeepAlive never respawns it and kickstart exits 0 without starting it.
+    def test_update_boots_the_agent_out_and_in_again_after_the_swap(self):
+        if console_is_root():
+            self.skipTest("no console user: the agent has no GUI domain")
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        uid, args = console_uid(), self.args("launchctl")
+        out = f"launchctl [bootout] [gui/{uid}/{agent_label()}]"
+        boot = f"launchctl [bootstrap] [gui/{uid}] [{self.plists()[1]}]"
+        self.assertIn(out, args)
+        self.assertIn(boot, args)
+        self.assertLess(args.index(out), args.index(boot))
+        # and only after the old app (and its --server) was killed
+        log = self.log.read_text().splitlines()
+        self.assertLess(log.index("pkill -x BoringRemote"), log.index(f"launchctl bootout gui/{uid}/{agent_label()}"))
+        self.assertIn(f"launchctl [print] [gui/{uid}/{agent_label()}]", args)  # checked, not assumed
+
+    def test_update_reloads_a_daemon_that_did_not_come_back(self):
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=30)  # stub print: never running
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = self.args("launchctl")
+        kick = f"launchctl [kickstart] [-k] [system/{daemon_label()}]"
+        out = f"launchctl [bootout] [system/{daemon_label()}]"
+        boot = f"launchctl [bootstrap] [system] [{self.plists()[0]}]"
+        self.assertLess(args.index(kick), args.index(out))
+        self.assertLess(args.index(out), args.index(boot))
+
+    def test_update_leaves_a_daemon_that_came_back_alone(self):
+        self.stub("launchctl", '[ "$1" = print ] && printf "system/x = {\\n\\tstate = running\\n}\\n"\nexit 0\n')
+        r = self.run_script(self.package(), GOOD_SIG, "1.6.0", wait=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(f"launchctl [bootout] [system/{daemon_label()}]", self.args("launchctl"))
 
     def test_package_with_the_new_bundle_name_installs_too(self):
         r = self.run_script(self.package(name=BUNDLE), GOOD_SIG, "1.6.0")

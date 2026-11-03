@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/desktop/kit/access.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
@@ -73,6 +75,69 @@ void main() {
     expect(find.text(AccessWords.notReady('Row running')), findsOneWidget);
     await tester.tap(find.text(AccessWords.fix));
     expect(fixed, ['running']);
+  });
+
+  // A real Mac (macOS 26) after the bundle was replaced: launchd held the agent at
+  // "spawn failed" (EX_CONFIG 78, "needs LWCR update"); kickstart -k exited 0 and did nothing.
+  const stuck = 'gui/501/$kAgentLabel = {\n\tstate = spawn scheduled\n\tjob state = spawn failed\n'
+      '\tlast exit code = 78: EX_CONFIG\n\tproperties = needs LWCR update | managed LWCR | has LWCR\n}\n';
+  const up = 'gui/501/$kAgentLabel = {\n\tstate = running\n\tpid = 4242\n}\n';
+
+  /// A fake launchctl holding the stuck job: kickstart brings it up only when [kickstartFixes],
+  /// bootstrap (after bootout) only when [bootstrapFixes].
+  ({List<String> calls, RunProcess run}) launchd({bool kickstartFixes = false, bool bootstrapFixes = true}) {
+    final calls = <String>[];
+    var loaded = true, running = false;
+    Future<ProcessResult> run(String exe, List<String> args) async {
+      calls.add('$exe ${args.join(' ')}');
+      var out = '', code = 0;
+      switch (args.first) {
+        case 'print':
+          if (!loaded) code = 113;
+          out = running ? up : stuck;
+        case 'kickstart':
+          if (kickstartFixes) running = true;
+        case 'bootout':
+          loaded = false;
+          running = false;
+        case 'bootstrap':
+          loaded = true;
+          running = bootstrapFixes;
+      }
+      return ProcessResult(0, code, out, '');
+    }
+
+    return (calls: calls, run: run);
+  }
+
+  Future<void> noWait(Duration _) async {}
+
+  test('the agent counts as running only on launchctl\'s own "state = running" line', () {
+    expect(agentRunning(up), isTrue);
+    expect(agentRunning(stuck), isFalse);
+    expect(agentRunning('\t\tstate = active\n'), isFalse); // an endpoint, not the job
+  });
+
+  test('kickstart that brings the agent up is enough', () async {
+    final l = launchd(kickstartFixes: true);
+    expect(await restartAgent(l.run, '501', sleep: noWait), isTrue);
+    expect(l.calls.where((c) => c.contains('bootout')), isEmpty);
+    expect(l.calls.first, 'launchctl kickstart -k gui/501/$kAgentLabel');
+  });
+
+  test('a job stuck at spawn failed is booted out and bootstrapped again, then checked', () async {
+    final l = launchd();
+    expect(await restartAgent(l.run, '501', sleep: noWait), isTrue);
+    final out = l.calls.indexOf('launchctl bootout gui/501/$kAgentLabel');
+    final boot = l.calls.indexOf('launchctl bootstrap gui/501 $kAgentPlist');
+    expect(out, greaterThan(0));
+    expect(boot, greaterThan(out));
+    expect(l.calls.last, 'launchctl print gui/501/$kAgentLabel');
+  });
+
+  test('still down after bootstrap: says so', () async {
+    final l = launchd(bootstrapFixes: false);
+    expect(await restartAgent(l.run, '501', sleep: noWait), isFalse);
   });
 
   test('open at login: a LaunchAgent that opens the app by bundle id, credited to it', () {
