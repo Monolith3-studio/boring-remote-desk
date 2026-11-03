@@ -955,6 +955,36 @@ PATCHES += [
      CONTROLLER_NAME, "the approval prompt names the Controller computer"),
 ]
 
+# --- LAN Discovery both ways (v1.7 ticket 21) --------------------------------------
+# Upstream lists a computer only if this one's broadcast reached it and its reply came back in the
+# same cycle. Broadcast is what Wi-Fi drops, so Tori's Wi-Fi laptop lost the wired PC (M1-D2) for
+# good while the wired Studio kept it. Each cycle now also asks every computer seen before or heard
+# from directly (base::lan::send_pings), and the listener notes who pinged it (heard_ping), so if
+# either side's broadcast gets through both list each other. Loopback and Tailscale's /32 get no
+# ping: those sends only failed (errors 49 and 65 every 6 s in the Studio's log).
+T21_LISTENER_OLD = ("                            if p.id == id {\n"
+                    "                                continue;\n"
+                    "                            }\n")
+T21_HEARD = "                            base::lan::heard_ping(addr.ip()); // v1.7 t21: ask it directly next cycle\n"
+T21_SEND_OLD = ("    let maddr = SocketAddr::from(([255, 255, 255, 255], get_broadcast_port()));\n"
+                "    for socket in &sockets {\n"
+                "        allow_err!(socket.send_to(&out, maddr));\n"
+                "    }\n")
+T21_SEND = ("    // boring-remote (v1.7 t21): each interface's own broadcast, and a direct ask to every computer\n"
+            "    // seen before or heard from (base::lan). Nothing to loopback or Tailscale: those only fail.\n"
+            "    #[cfg(not(target_os = \"ios\"))]\n"
+            "    let locals: Vec<(Ipv4Addr, u8)> = default_net::get_interfaces()\n"
+            "        .into_iter()\n"
+            "        .flat_map(|i| i.ipv4.into_iter().map(|n| (n.addr, n.prefix_len)))\n"
+            "        .collect();\n"
+            "    #[cfg(target_os = \"ios\")]\n"
+            "    let locals: Vec<(Ipv4Addr, u8)> = Vec::new();\n"
+            "    base::lan::send_pings(&sockets, &out, get_broadcast_port(), &config::LanPeers::load().peers, &locals);\n")
+PATCHES += [
+    ("src/lan.rs", T21_LISTENER_OLD, T21_LISTENER_OLD + T21_HEARD, "the listener notes who pinged it (t21)"),
+    ("src/lan.rs", T21_SEND_OLD, T21_SEND, "discovery asks known computers directly, skips unusable interfaces (t21)"),
+]
+
 # --- Mac Home (v1.7 ticket 01) ----------------------------------------------------
 # The kit (desktop/kit/kit.dart) and Mac Home (desktop/kit/mac_home.dart) are ours and
 # bridge-free; these wire them to bind. Mac only: other platforms keep the old home for now.
@@ -1793,16 +1823,21 @@ T06_SETUP_PAGE = (
     "                .then((n) => n.isNotEmpty ? n : Platform.localHostname.replaceAll('.local', '')),\n"
     "        onName: (n) => bind.mainSetOption(key: nameKey, value: n),\n"
     "        canSeeScreen: () => bind.mainIsCanScreenRecording(prompt: false),\n"
+    "        canMonitorInput: () => bind.mainIsCanInputMonitoring(prompt: false), // v1.7 t21: the third switch\n"
     "        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n"
     "        openPane: (url) {\n"
     "          // Asking once puts Boring Remote in the pane's list; then open the pane itself.\n"
     "          if (url == kScreenRecordingPane) bind.mainIsCanScreenRecording(prompt: true);\n"
     "          if (url == kAccessibilityPane) bind.mainIsProcessTrusted(prompt: true);\n"
+    "          if (url == kInputMonitoringPane) bind.mainIsCanInputMonitoring(prompt: true);\n"
     "          launchUrl(Uri.parse(url));\n"
     "        },\n"
     "        passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
     "        setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
     "        startStep: setupStartStep(bind.mainGetLocalOption(key: kSetupStepOption), screens),\n"
+    "        // v1.7 t21: a welcome on first launch only; Ready is Settings' Access line, green when it is.\n"
+    "        welcome: setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption)),\n"
+    "        readyChecks: boringAccessChecks(),\n"
     "        onStep: (i) => bind.mainSetLocalOption(key: kSetupStepOption, value: '$i'),\n"
     "        onDone: () async {\n"
     "          await bind.mainSetLocalOption(key: kSetupStepOption, value: '');\n"

@@ -704,6 +704,11 @@ def setup_checks(c):
         (kit, "?Privacy_ScreenCapture'"),
         (kit, "?Privacy_Accessibility'"),
         (kit, "SimpleSettings.strongEnough("),
+        (kit, "?Privacy_ListenEvent'"),  # t21: the third switch
+        (home, "canMonitorInput: () => bind.mainIsCanInputMonitoring(prompt: false),"),
+        (home, "welcome: setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption)),"),
+        (home, "readyChecks: boringAccessChecks(),"),
+        (kit, "const kSetupDownloadUrl = "),
     ]
     missing = [n for text, n in hooks if n not in text]
     c.fact("Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)",
@@ -1021,6 +1026,19 @@ def support_checks(c):
         if needle not in sup:
             bad.append(why)
     c.fact("the support file removes every secret by name and hashes IDs (t20)", not bad, "; ".join(bad))
+
+def lan_both_ways_checks(c):
+    """v1.7 ticket 21: discovery asks known and heard-from computers directly, the listener notes
+    who pinged it, and nothing is sent to loopback or Tailscale's /32."""
+    lan, base = c.read("src/lan.rs"), c.read("libs/base/src/lan.rs")
+    missing = [n.strip().splitlines()[0] for n in (rebrand.T21_HEARD, rebrand.T21_SEND) if n not in lan]
+    if rebrand.T21_SEND_OLD in lan:
+        missing.append("src/lan.rs still broadcasts 255.255.255.255 from every socket")
+    for fn in ("pub fn send_pings(", "pub fn ping_targets(", "pub fn heard_ping(", "pub fn known_ips("):
+        if fn not in base:
+            missing.append(f"libs/base/src/lan.rs: {fn}")
+    c.fact("LAN Discovery both ways: asks known computers directly, skips loopback and Tailscale (t21)",
+           not missing, "; ".join(missing))
 
 
 def rust_hook_checks(c):
@@ -1550,6 +1568,7 @@ def run_checks(root):
     high_efficiency_checks(c)  # v1.7 t05
     rust_hook_checks(c)  # v1.7 t02-t05
     support_checks(c)  # v1.7 t20
+    lan_both_ways_checks(c)  # v1.7 t21
     home_checks(c)  # v1.7 review: Home, Settings, copy
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",

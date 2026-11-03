@@ -219,3 +219,26 @@ class _AccessSummaryState extends State<AccessSummary> with WidgetsBindingObserv
     return Padding(padding: const EdgeInsets.symmetric(vertical: Kit.s2), child: _summary(context, checks, r, fix));
   }
 }
+
+/// Setup's last screen (ticket 21): the summary line always, green "Ready" once everything is.
+class AccessStatus extends StatefulWidget {
+  final List<AccessCheck> checks;
+  final Duration pollEvery;
+  const AccessStatus({super.key, required this.checks, this.pollEvery = const Duration(seconds: 2)});
+
+  @override
+  State<AccessStatus> createState() => _AccessStatusState();
+}
+
+class _AccessStatusState extends State<AccessStatus> with WidgetsBindingObserver, _Polls<AccessStatus> {
+  @override
+  List<AccessCheck> get checks => widget.checks;
+  @override
+  Duration get pollEvery => widget.pollEvery;
+
+  @override
+  Widget build(BuildContext context) {
+    final r = ok;
+    return r == null ? const SizedBox(height: 40) : _summary(context, checks, r, fix);
+  }
+}

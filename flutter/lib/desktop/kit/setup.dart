@@ -1,7 +1,9 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import 'access.dart';
 import 'kit.dart';
 import 'simple_settings.dart';
 
@@ -55,6 +57,10 @@ List<String> windowsRuleAddArgs(String exe) {
     "Start-Process -FilePath netsh -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '${rule.replaceAll("'", "''")}'",
   ];
 }
+
+/// Where the other computer gets Boring Remote, copied from Setup's last screen (ticket 21).
+/// TODO(ticket 15): the download page's real address; Settings still says theboringremote.com/download.
+const kSetupDownloadUrl = 'https://boringlabs.online/remote';
 
 /// First launch only: Setup shows until it has been finished once.
 bool setupNeeded(String doneOption) => doneOption != 'Y';
@@ -127,6 +133,22 @@ const setupCopy = <String, String>{
   'password.skip.why@windows': 'If you skip, someone has to be at this computer to click Allow every time. '
       'You can set it later in Settings.',
   'done': 'Finish',
+  // Before step 1 (ticket 21)
+  'welcome.title': 'Welcome to Boring Remote',
+  'welcome.body': "Let's get this Mac ready so your other computers can reach it. It takes about a minute.",
+  'welcome.body@windows': "Let's get this computer ready so your other computers can reach it. It takes about a minute.",
+  'welcome.start': 'Get started',
+  // Screen 2 (Mac), third switch (ticket 21)
+  'allow.input': 'Let keyboard shortcuts reach this Mac',
+  'allow.input.button': 'Open Input Monitoring',
+  // After the last step (ticket 21)
+  'ready.title': 'Now your other computer',
+  'ready.ok': 'Ready.',
+  'ready.other': 'On your other computer, open Boring Remote. This one shows up as “{name}”.',
+  'ready.get': "Don't have Boring Remote there yet? Copy the download link and open it on that computer.",
+  'ready.copy': 'Copy download link',
+  'ready.copied': 'Copied',
+  'ready.done': 'Done',
 };
 
 /// Which machine Setup runs on. Screen 2 depends on it: Mac asks for screen and control
@@ -160,6 +182,8 @@ class SetupFlow extends StatefulWidget {
   /// Polled while screen 2 shows; a check turns green as soon as one reads true.
   final bool Function() canSeeScreen;
   final bool Function() canControl;
+  /// The third Mac switch (Input Monitoring); null leaves it off screen 2.
+  final bool Function()? canMonitorInput;
   final void Function(String url) openPane;
   final Duration pollEvery;
 
@@ -173,6 +197,15 @@ class SetupFlow extends StatefulWidget {
   final int startStep;
   final void Function(int step) onStep;
   final VoidCallback onDone;
+
+  /// A welcome screen before step 1 (first launch). Not a numbered step.
+  final bool welcome;
+
+  /// A last screen after the numbered steps: the green Ready line (from [readyChecks], the same
+  /// checks as Settings' Access), the name the other computer sees, and the download link.
+  final bool ready;
+  final List<AccessCheck> readyChecks;
+  final Future<void> Function(String text) copyText;
 
   const SetupFlow({
     super.key,
@@ -190,7 +223,14 @@ class SetupFlow extends StatefulWidget {
     this.startStep = 0,
     required this.onStep,
     required this.onDone,
+    this.canMonitorInput,
+    this.welcome = true,
+    this.ready = true,
+    this.readyChecks = const [],
+    this.copyText = _clipboard,
   });
+
+  static Future<void> _clipboard(String text) => Clipboard.setData(ClipboardData(text: text));
 
   @override
   State<SetupFlow> createState() => _SetupFlowState();
@@ -204,7 +244,9 @@ class _SetupFlowState extends State<SetupFlow> {
   String? _error;
   bool _confirmSkip = false;
   bool _saved = false;
-  bool _seeScreen = false, _control = false;
+  bool _seeScreen = false, _control = false, _input = false;
+  late bool _welcome = widget.welcome && _step == 0;
+  bool _ready = false, _copied = false;
   bool _reached = false, _reachFailed = false;
   Timer? _poll;
 
@@ -262,11 +304,16 @@ class _SetupFlowState extends State<SetupFlow> {
   void _read() {
     _seeScreen = widget.canSeeScreen();
     _control = widget.canControl();
+    _input = widget.canMonitorInput?.call() ?? true;
   }
 
   void _advance() {
     if (_step == _screens.length - 1) {
       _poll?.cancel();
+      if (widget.ready && !_ready) {
+        setState(() => _ready = true);
+        return;
+      }
       widget.onDone();
       return;
     }
@@ -309,21 +356,23 @@ class _SetupFlowState extends State<SetupFlow> {
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
+    if (_welcome) return _page(t, _copy('welcome.title'), _welcomeScreen(t));
+    if (_ready) return _page(t, _copy('ready.title'), _readyScreen(t));
     final (title, body) = switch (_screen) {
       _Screen.name => (_copy('name.title'), _nameScreen(t)),
       _Screen.allow => (_copy('allow.title'), _allowScreen(t)),
       _Screen.reach => (_copy('reach.title'), _reachScreen(t)),
       _Screen.password => (_copy('password.title'), _passwordScreen(t)),
     };
+    return _page(t, title, body,
+        step: _copy('step').replaceFirst('{n}', '${_step + 1}').replaceFirst('{total}', '${_screens.length}'));
+  }
+
+  Widget _page(TextTheme t, String title, Widget body, {String? step}) {
     return ListView(
       padding: const EdgeInsets.all(Kit.s7),
       children: [
-        Text(
-            _copy('step')
-                .replaceFirst('{n}', '${_step + 1}')
-                .replaceFirst('{total}', '${_screens.length}'),
-            style: t.bodySmall),
-        const SizedBox(height: Kit.s2),
+        if (step != null) ...[Text(step, style: t.bodySmall), const SizedBox(height: Kit.s2)],
         Text(title, style: t.headlineSmall),
         const SizedBox(height: Kit.s5),
         body,
@@ -364,6 +413,53 @@ class _SetupFlowState extends State<SetupFlow> {
       ]),
     ]);
   }
+
+  Widget _welcomeScreen(TextTheme t) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(_copy('welcome.body')),
+          const SizedBox(height: Kit.s5),
+          _primary(_copy('welcome.start'), () {
+            setState(() => _welcome = false);
+            _enter();
+          }),
+        ],
+      );
+
+  /// The name this computer was given on screen 1 (or already had, when Setup opened later).
+  String get _shownAs => _name.text.trim();
+
+  Widget _readyScreen(TextTheme t) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (widget.readyChecks.isEmpty)
+            Row(children: [
+              const Icon(Icons.check_circle, color: Kit.ok),
+              const SizedBox(width: Kit.s2),
+              Text(_copy('ready.ok')),
+            ])
+          else
+            AccessStatus(checks: widget.readyChecks),
+          const SizedBox(height: Kit.s4),
+          Text(_copy('ready.other').replaceFirst('{name}', _shownAs)),
+          const SizedBox(height: Kit.s4),
+          Text(_copy('ready.get'), style: t.bodySmall),
+          const SizedBox(height: Kit.s2),
+          Row(children: [
+            Flexible(child: SelectableText(kSetupDownloadUrl, style: t.bodyMedium)),
+            const SizedBox(width: Kit.s3),
+            OutlinedButton(
+              onPressed: () async {
+                await widget.copyText(kSetupDownloadUrl);
+                if (mounted) setState(() => _copied = true);
+              },
+              child: Text(_copy(_copied ? 'ready.copied' : 'ready.copy')),
+            ),
+          ]),
+          const SizedBox(height: Kit.s5),
+          _primary(_copy('ready.done'), widget.onDone),
+        ],
+      );
 
   Widget _nameScreen(TextTheme t) => Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -430,7 +526,7 @@ class _SetupFlowState extends State<SetupFlow> {
       );
 
   Widget _allowScreen(TextTheme t) {
-    final both = _seeScreen && _control;
+    final both = _seeScreen && _control && _input;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -447,6 +543,14 @@ class _SetupFlowState extends State<SetupFlow> {
             what: _copy('allow.control'),
             button: _copy('allow.control.button'),
             pane: kAccessibilityPane),
+        if (widget.canMonitorInput != null) ...[
+          const SizedBox(height: Kit.s2),
+          _allowRow(t,
+              on: _input,
+              what: _copy('allow.input'),
+              button: _copy('allow.input.button'),
+              pane: kInputMonitoringPane),
+        ],
         const SizedBox(height: Kit.s4),
         Text(_copy('allow.picture'), style: t.bodySmall),
         const SizedBox(height: Kit.s2),

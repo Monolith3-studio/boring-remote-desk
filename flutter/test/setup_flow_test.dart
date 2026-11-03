@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_hbb/desktop/kit/access.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
 import 'package:flutter_hbb/desktop/kit/setup.dart';
 
@@ -28,6 +29,11 @@ SetupFlow flow({
   int startStep = 0,
   void Function(int)? onStep,
   VoidCallback? onDone,
+  bool welcome = false,
+  bool ready = false,
+  bool Function()? canMonitorInput,
+  List<AccessCheck> readyChecks = const [],
+  Future<void> Function(String)? copyText,
 }) =>
     SetupFlow(
       platform: platform,
@@ -43,6 +49,11 @@ SetupFlow flow({
       startStep: startStep,
       onStep: onStep ?? (_) {},
       onDone: onDone ?? () {},
+      welcome: welcome,
+      ready: ready,
+      canMonitorInput: canMonitorInput,
+      readyChecks: readyChecks,
+      copyText: copyText ?? (_) async {},
     );
 
 void main() {
@@ -372,5 +383,88 @@ void main() {
     // "Accessibility" alone is allowed: it is the macOS label the buyer must click.
     final hits = setupCopy.values.where(banned.hasMatch).toList();
     expect(hits, isEmpty);
+  });
+
+  // v1.7 ticket 21: opened app to Ready, then the other computer.
+  group('first run: welcome, then Ready and the other computer', () {
+    testWidgets('a welcome comes first and is not a numbered step', (tester) async {
+      await tester.pumpWidget(host(flow(welcome: true)));
+      await tester.pump();
+      expect(find.text(setupCopy['welcome.title']!), findsOneWidget);
+      expect(find.textContaining('Step '), findsNothing);
+      await tapText(tester, setupCopy['welcome.start']!);
+      await tester.pump();
+      expect(find.text(setupCopy['name.title']!), findsOneWidget);
+      expect(find.text('Step 1 of 3'), findsOneWidget);
+    });
+
+    testWidgets('no welcome when Setup comes back to a later screen', (tester) async {
+      await tester.pumpWidget(host(flow(welcome: true, startStep: 2)));
+      expect(find.text(setupCopy['welcome.title']!), findsNothing);
+      expect(find.text(setupCopy['password.title']!), findsOneWidget);
+    });
+
+    testWidgets('the Mac step has all three switches when Input Monitoring is passed', (tester) async {
+      final opened = <String>[];
+      var input = false;
+      await tester.pumpWidget(host(flow(
+          startStep: 1, openPane: opened.add, canSeeScreen: () => true, canControl: () => true,
+          canMonitorInput: () => input)));
+      FilledButton next() => tester.widget<FilledButton>(find.widgetWithText(FilledButton, setupCopy['next']!));
+      expect(next().onPressed, isNull, reason: 'Continue waits for the third switch');
+      await tapText(tester, setupCopy['allow.input.button']!);
+      expect(opened, [kInputMonitoringPane]);
+      input = true;
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.byIcon(Icons.check_circle), findsNWidgets(3));
+      expect(next().onPressed, isNotNull);
+    });
+
+    testWidgets('after the last step: Ready, the name it shows up as, and the download link', (tester) async {
+      var done = 0;
+      final copied = <String>[];
+      await tester.pumpWidget(host(flow(
+          ready: true, passwordSet: true, onDone: () => done++, copyText: (t) async => copied.add(t),
+          canSeeScreen: () => true, canControl: () => true)));
+      await tester.pump();
+      await tester.enterText(find.byKey(SetupFlow.nameKey), 'Tori Laptop');
+      await tapText(tester, setupCopy['next']!);
+      await tester.pumpAndSettle();
+      await tapText(tester, setupCopy['next']!);
+      await tester.pump();
+      await tapText(tester, setupCopy['done']!);
+      await tester.pump();
+      expect(done, 0, reason: 'Finish on the password screen leads to Ready, not straight out');
+      expect(find.text(setupCopy['ready.title']!), findsOneWidget);
+      expect(find.text(setupCopy['ready.ok']!), findsOneWidget);
+      expect(find.text('On your other computer, open Boring Remote. This one shows up as “Tori Laptop”.'),
+          findsOneWidget);
+      await tapText(tester, setupCopy['ready.copy']!);
+      await tester.pump();
+      expect(copied, [kSetupDownloadUrl]);
+      expect(find.text(setupCopy['ready.copied']!), findsOneWidget);
+      await tapText(tester, setupCopy['ready.done']!);
+      expect(done, 1);
+    });
+
+    testWidgets('Ready is the same green line as Settings, or what is missing and its Fix', (tester) async {
+      var granted = false;
+      final checks = [
+        AccessCheck(label: 'Screen Recording', why: '', read: () async => granted, fix: () async => granted = true),
+      ];
+      await tester.pumpWidget(host(flow(ready: true, passwordSet: true, startStep: 2, readyChecks: checks)));
+      await tapText(tester, setupCopy['done']!);
+      await tester.pump();
+      await tester.pump();
+      expect(find.text(AccessWords.notReady('Screen Recording')), findsOneWidget);
+      await tester.tap(find.text(AccessWords.fix));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text(AccessWords.ready), findsOneWidget);
+    });
+
+    test('the download link is the one place the other computer gets the app', () {
+      expect(kSetupDownloadUrl, 'https://boringlabs.online/remote');
+    });
   });
 }

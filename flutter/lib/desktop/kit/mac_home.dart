@@ -17,6 +17,15 @@ class MacEntry {
 class MacHome extends StatefulWidget {
   static const addressKey = Key('mac-home-address');
 
+  /// What Home says while no other Boring Remote has answered on this network (ticket 21).
+  static List<String> emptyLines() => [
+        'No other ${KitWords.many} found on this network yet.',
+        '1. Open Boring Remote on the other ${KitWords.one} and finish its Setup.',
+        '2. Check both are on the same Wi-Fi or network.',
+        "It shows up here by itself within a few seconds.",
+      ];
+  static const emptyTypeIt = 'Or type its address above, like 192.168.1.20.';
+
   /// One LAN Discovery cycle listens ~3 s; asking again every 6 s keeps the list live.
   static const discoverEvery = Duration(seconds: 6);
 
@@ -133,13 +142,12 @@ class _MacHomeState extends State<MacHome> {
                       onTap: () => widget.onConnect(m.ip),
                     ),
                 ],
-                if (widget.macs.isEmpty && widget.lan.isEmpty) ...[
-                  Text(
-                      'No other ${KitWords.many} found yet. Open Boring Remote on the other ${KitWords.one}. '
-                      "You'll see it here once both are on the same network."),
+                if (widget.lan.isEmpty && q.isEmpty) ...[
+                  Text('On this network', style: Theme.of(context).textTheme.bodySmall),
                   const SizedBox(height: Kit.s2),
-                  Text('Or type its address above, like 192.168.1.20.',
-                      style: Theme.of(context).textTheme.bodySmall),
+                  for (final line in MacHome.emptyLines()) ...[Text(line), const SizedBox(height: Kit.s2)],
+                  Text(MacHome.emptyTypeIt, style: Theme.of(context).textTheme.bodySmall),
+                  const SizedBox(height: Kit.s4),
                 ],
                 if (shown.isNotEmpty) Text('Used before', style: Theme.of(context).textTheme.bodySmall),
                 for (final m in shown)
