@@ -56,9 +56,9 @@ pub const PLAINTEXT_REFUSED: &str =
 
 /// The Target's identity key differs from the one pinned for that address or ID.
 #[cfg(not(target_os = "windows"))]
-pub const IDENTITY_CHANGED: &str = "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
+pub const IDENTITY_CHANGED: &str = "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.";
 #[cfg(target_os = "windows")]
-pub const IDENTITY_CHANGED: &str = "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted Controllers, click Forget next to it, then try again.";
+pub const IDENTITY_CHANGED: &str = "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.";
 
 /// `PeerInfo.platform` of a Mac (src/common.rs PLATFORM_MACOS), as a session saves it to PeerConfig.
 const MAC_PLATFORM: &str = "Mac OS";

@@ -202,10 +202,10 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     await tester.pumpWidget(host(settings(advanced: [
       SettingsLink(label: 'All settings', onTap: () => opened.add('all')),
-      SettingsLink(label: 'Trusted Controllers', onTap: () => opened.add('trusted')),
+      SettingsLink(label: 'Trusted list', onTap: () => opened.add('trusted')),
     ])));
     expect(find.text('Advanced'), findsOneWidget);
-    await tester.tap(find.text('Trusted Controllers'));
+    await tester.tap(find.text('Trusted list'));
     await tester.tap(find.text('All settings'));
     expect(opened, ['trusted', 'all']);
   });

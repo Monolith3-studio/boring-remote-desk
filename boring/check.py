@@ -772,7 +772,7 @@ def trust_checks(c, cfg):
         ("src/server.rs", rebrand.T03_HANDSHAKE_CALL),
         ("src/server/connection.rs", rebrand.T04_TRUSTED_SKIP),
         ("src/server/connection.rs", rebrand.T04_GRANT),
-        (rebrand.SETTINGS, "label: 'Trusted Controllers',"),
+        (rebrand.SETTINGS, "label: kTrustedTitle,"),
         (rebrand.SETTINGS, "TrustedControllersPage("),
         (rebrand.CM_PAGE, "ApprovalPrompt("),
     ]
