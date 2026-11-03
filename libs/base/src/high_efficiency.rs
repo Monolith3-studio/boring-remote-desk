@@ -1,6 +1,7 @@
 //! High Efficiency (v1.7 ticket 05, ADR 0006).
 
 use crate::direct_link::Path;
+use std::convert::TryFrom;
 use crate::message_proto::supported_decoding::PreferCodec;
 use crate::message_proto::{ImageQuality, Message, Misc, OptionMessage, PeerInfo, SupportedDecoding};
 
@@ -24,12 +25,28 @@ pub fn is_boring_remote(platform_additions: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Best software codec both ends have (ADR 0006: hardware H.265/H.264 stay out): AV1, then VP9,
-/// then VP8. The Target always encodes VP9 (SupportedEncoding has no flag for it). Neither left
-/// means Auto: the Target picks as it would anyway.
+/// The size the Target encodes its current display at under High Efficiency: a Retina Mac
+/// (`scale` > 1) captures its points size while a software codec runs ([`captures_points`]).
+/// `None` when the PeerInfo names no current display.
+pub fn encode_size(peer: &PeerInfo) -> Option<(i32, i32)> {
+    let d = peer.displays.get(usize::try_from(peer.current_display).ok()?)?;
+    let scale = if d.scale > 1.0 { d.scale } else { 1.0 };
+    Some(((d.width as f64 / scale).round() as i32, (d.height as f64 / scale).round() as i32))
+}
+
+/// The biggest frame AV1 gets (ADR 0006 amendment). No Mac and no GPU this app drives encodes AV1
+/// in hardware: AV1 is always software libaom, already at its fastest realtime speed (10). Upstream
+/// passes AV1 only when it encodes a 1080p frame in under 30 ms (scrap `test_av1`); past that size
+/// it can't hold 30 fps (device check A3: 3024x1964 gave 23 fps, 503 ms), and VP9 is cheaper.
+pub const AV1_MAX_PIXELS: i64 = 1920 * 1080;
+
+/// Best software codec both ends have (ADR 0006: hardware H.265/H.264 stay out): AV1 up to
+/// [`AV1_MAX_PIXELS`], then VP9, then VP8. The Target always encodes VP9 (SupportedEncoding has
+/// no flag for it). Neither left means Auto: the Target picks as it would anyway.
 fn best_codec(peer: &PeerInfo, ours: &SupportedDecoding) -> PreferCodec {
     let theirs = peer.encoding.get_or_default();
-    if theirs.av1 && ours.ability_av1 > 0 {
+    let av1_keeps_up = encode_size(peer).is_some_and(|(w, h)| w as i64 * h as i64 <= AV1_MAX_PIXELS);
+    if theirs.av1 && ours.ability_av1 > 0 && av1_keeps_up {
         PreferCodec::AV1
     } else if ours.ability_vp9 > 0 {
         PreferCodec::VP9
@@ -141,17 +158,65 @@ pub fn ack_for(o: &OptionMessage) -> Option<Message> {
     Some(msg)
 }
 
+/// Target (macOS): whether High Efficiency captures a Retina display at its points size, a quarter
+/// of the pixels. Only on a software encoder (VP9/AV1/VP8); a hardware one keeps the full size.
+pub fn captures_points(hardware_encoder: bool) -> bool {
+    !hardware_encoder
+}
+
+/// Target (macOS): the connections on High Efficiency with a software encoder. Upstream drops to
+/// points when it streams two displays (server.rs `update_enable_retina`); this adds the second
+/// reason, held until the connection closes.
+#[derive(Default)]
+pub struct PointsCapture(std::sync::Mutex<Vec<i32>>);
+
+impl PointsCapture {
+    pub fn hold(&self, conn_id: i32) {
+        if let Ok(mut held) = self.0.lock() {
+            if !held.contains(&conn_id) {
+                held.push(conn_id);
+            }
+        }
+    }
+
+    /// Upstream's Retina rule plus ours. `open` are the server's connection ids: a held id that
+    /// is not open any more is let go.
+    pub fn retina(&self, video_services: usize, open: impl Iterator<Item = i32>) -> bool {
+        let open: Vec<i32> = open.collect();
+        let mut held = match self.0.lock() {
+            Ok(held) => held,
+            Err(e) => e.into_inner(),
+        };
+        held.retain(|id| open.contains(id));
+        video_services < 2 && held.is_empty()
+    }
+}
+
+/// The Target's one [`PointsCapture`].
+pub static POINTS_CAPTURE: PointsCapture = PointsCapture(std::sync::Mutex::new(Vec::new()));
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message_proto::SupportedEncoding;
+    use crate::message_proto::{DisplayInfo, SupportedEncoding};
 
-    fn boring_peer(av1: bool) -> PeerInfo {
+    fn display(width: i32, height: i32, scale: f64) -> DisplayInfo {
+        DisplayInfo { width, height, scale, ..Default::default() }
+    }
+
+    fn boring_peer_on(av1: bool, d: DisplayInfo) -> PeerInfo {
         PeerInfo {
             platform_additions: r#"{"boring_remote":"1.7.0","is_installed":true}"#.into(),
             encoding: protobuf::MessageField::some(SupportedEncoding { av1, vp8: true, ..Default::default() }),
+            displays: vec![display(1920, 1080, 1.0), d],
+            current_display: 1,
             ..Default::default()
         }
+    }
+
+    /// Tori Laptop (device check A3): a Retina M1 Pro, 3024x1964 pixels, 1512x982 points.
+    fn boring_peer(av1: bool) -> PeerInfo {
+        boring_peer_on(av1, display(3024, 1964, 2.0))
     }
 
     fn decodes(av1: bool) -> SupportedDecoding {
@@ -209,6 +274,47 @@ mod tests {
         assert_eq!(d.prefer.enum_value(), Ok(PreferCodec::AV1));
         assert_eq!((d.ability_vp9, d.ability_av1), (1, 1), "abilities stay what this Mac decodes");
         assert_eq!(STREAM_TYPE, "LocalHighEfficiency", "what Flutter's linkStateFor maps to the badge");
+    }
+
+    #[test]
+    fn a_retina_mac_is_encoded_at_its_points_size() {
+        assert_eq!(encode_size(&boring_peer(true)), Some((1512, 982)));
+        assert_eq!(encode_size(&boring_peer_on(true, display(3440, 1440, 1.0))), Some((3440, 1440)));
+        let mut lost = boring_peer(true);
+        lost.current_display = 7;
+        assert_eq!(encode_size(&lost), None, "no current display, no size");
+    }
+
+    #[test]
+    fn av1_only_where_its_software_encoder_keeps_up() {
+        // Device check A3: libaom at 3024x1964 gave 23 fps / 503 ms; at points size it is a
+        // quarter of the pixels, under the 1080p frame upstream's own AV1 speed test passes.
+        let mac = choose(Path::Local, &boring_peer(true), &decodes(true)).unwrap();
+        assert_eq!(mac.codec, PreferCodec::AV1);
+        let fhd = choose(Path::Local, &boring_peer_on(true, display(1920, 1080, 1.0)), &decodes(true));
+        assert_eq!(fhd.unwrap().codec, PreferCodec::AV1);
+        // The Windows PC and Mac Studio (3440x1440) and a 5K iMac (2560x1440 points): VP9.
+        for d in [display(3440, 1440, 1.0), display(5120, 2880, 2.0), display(3840, 2160, 1.0)] {
+            let s = choose(Path::Local, &boring_peer_on(true, d.clone()), &decodes(true)).unwrap();
+            assert_eq!(s.codec, PreferCodec::VP9, "{}x{} @{}", d.width, d.height, d.scale);
+            assert_eq!((s.fps, s.quality), (60, ImageQuality::Best));
+        }
+        let mut unknown = boring_peer(true);
+        unknown.displays.clear();
+        assert_eq!(choose(Path::Local, &unknown, &decodes(true)).unwrap().codec, PreferCodec::VP9);
+    }
+
+    #[test]
+    fn a_target_on_a_software_codec_captures_points_while_high_efficiency_is_on() {
+        assert!(captures_points(false), "software VP9/AV1/VP8 encode the points size");
+        assert!(!captures_points(true), "a hardware H.264/H.265 encoder keeps the Retina pixels");
+        let held = PointsCapture::default();
+        assert!(held.retina(1, vec![1, 2].into_iter()), "no High Efficiency session: Retina as upstream");
+        held.hold(2);
+        assert!(!held.retina(1, vec![1, 2].into_iter()), "connection 2 is on High Efficiency");
+        assert!(!held.retina(2, vec![1].into_iter()), "two displays: upstream's points rule stands");
+        assert!(held.retina(1, vec![1, 3].into_iter()), "connection 2 closed: back to Retina");
+        assert!(held.retina(1, vec![1, 2].into_iter()), "and it was let go, not just skipped");
     }
 
     fn option(m: &Message) -> OptionMessage {

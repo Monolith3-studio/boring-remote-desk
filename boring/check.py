@@ -923,10 +923,13 @@ def firewall_upgrade_checks(c):
 def high_efficiency_checks(c):
     """v1.7 ticket 05 (ADR 0006): a Local link between two Boring Remotes asks for 60 fps, best
     quality, best software codec. The Target marks itself, the Controller applies it after the
-    first PeerInfo, and the Link Badge reads the stream_type Rust re-reports. No hardware codec."""
+    first PeerInfo, and the Link Badge reads the stream_type Rust re-reports. No hardware codec.
+    ADR 0006 amendment (device check A3): AV1 only up to 1080p-sized frames, and a Retina Mac on a
+    software codec captures its points size while High Efficiency is on."""
     he = c.read("libs/base/src/high_efficiency.rs")
     st = re.search(r'pub const STREAM_TYPE: &str = "([^"]+)";', he)
     hooks = [("src/server/connection.rs", rebrand.T05_MARKER), ("src/server/connection.rs", rebrand.T05_ANSWER),
+             ("src/server.rs", rebrand.T05_RETINA),
              ("src/client/io_loop.rs", rebrand.T05_LINK_SET), ("src/client/io_loop.rs", rebrand.T05_ASK_FN),
              ("src/client/io_loop.rs", rebrand.T05_ASK_CALL), ("src/client/io_loop.rs", rebrand.T05_BADGE),
              ("flutter/lib/desktop/kit/session_toolbar.dart",
@@ -934,6 +937,8 @@ def high_efficiency_checks(c):
     missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
     if not st:
         missing.append("high_efficiency.rs: STREAM_TYPE")
+    if "AV1_MAX_PIXELS: i64 = 1920 * 1080" not in he or "&& av1_keeps_up" not in he:
+        missing.append("high_efficiency.rs: AV1 not capped at 1080p frames (ADR 0006 amendment)")
     if re.search(r"PreferCodec::H26[45]", he):
         missing.append("high_efficiency.rs prefers a hardware codec (ADR 0006)")
     c.fact("High Efficiency wired: Target marks itself and answers the ask, badge waits for the answer",

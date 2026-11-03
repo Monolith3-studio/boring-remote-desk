@@ -426,6 +426,16 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/client/io_loop.rs", rebrand.T05_BADGE, "")
         self.assert_check_fails(HE_WIRED)
 
+    def test_retina_rule_without_high_efficiency_fails_check(self):  # ADR 0006 amendment
+        self.rebrand()
+        self.edit("src/server.rs", rebrand.T05_RETINA, rebrand.T05_RETINA_OLD)
+        self.assert_check_fails(HE_WIRED)
+
+    def test_av1_uncapped_fails_check(self):  # ADR 0006 amendment, device check A3
+        self.rebrand()
+        self.edit("libs/base/src/high_efficiency.rs", " && av1_keeps_up", "")
+        self.assert_check_fails(HE_WIRED)
+
     # --- v1.7 t03: Direct Link, Tailscale fallback, encrypted off Tailscale ----
     def test_ip_branch_back_before_the_direct_link_fails_check(self):
         self.rebrand()
