@@ -831,6 +831,88 @@ def trust_checks(c, cfg):
     if rebrand.GUARD not in (fn_body(c.read("src/common.rs"), "pub fn read_custom_client(config: &str) {") or ""):
         why.append("read_custom_client (the preset-password path) is not stripped")
     c.fact("no default or blank password ships (ADR 0002)", not why, "; ".join(why[:10]))
+    approval_checks(c)
+    firewall_upgrade_checks(c)
+
+
+APPROVAL_RS = "src/boring_approval.rs"
+APPROVAL_DART = "flutter/lib/desktop/kit/approval.dart"
+
+
+def approval_checks(c):
+    """v1.7 t04 follow-up: the connection window's ask also fills the main window, which comes
+    to the front (opened if it is not running). Its Allow / Don't allow go back to the connection
+    window, which runs its own (so trust is granted as a click there is, ADR 0005). Settings lists
+    who is waiting and who was removed, each with Allow, over the server option as Remove."""
+    rs, kit, trust = c.read(APPROVAL_RS), c.read(APPROVAL_DART), c.read(TRUST_DART)
+    model, sm = c.read(rebrand.FFI_MODEL), c.read(rebrand.SERVER_MODEL)
+    hooks = [
+        ("src/lib.rs", rebrand.T04B_MOD), ("src/flutter_ffi.rs", rebrand.T04B_FFI),
+        ("src/flutter_ffi.rs", rebrand.T04B_LISTEN), ("src/ui_cm_interface.rs", rebrand.T04B_CM_IPC),
+        (rebrand.FFI_MODEL, rebrand.T04B_EVENT), (rebrand.SERVER_MODEL, rebrand.T04B_ASK),
+        (rebrand.SERVER_MODEL, rebrand.T04B_DONE_REMOVE), (rebrand.SERVER_MODEL, rebrand.T04B_DONE_LOGIN),
+        (rebrand.CM_PAGE, rebrand.T04B_CARD),
+    ]
+    bad = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
+    for rname, dname in (("ASK", "kApprovalAsk"), ("DONE", "kApprovalDone"), ("ANSWER", "kApprovalAnswer"),
+                         ("EVENT", "kApprovalEvent")):
+        r = re.search(rf'pub const {rname}: &str = "([^"]+)";', rs)
+        d = re.search(rf"const {dname} = '([^']+)';", kit)
+        if not r or not d or r.group(1) != d.group(1):
+            bad.append(f"{rname} vs {dname}")
+    send = fn_body(rs, "pub fn send(msg: String) {") or ""
+    if 'post("_cm", msg)' not in send or "crate::run_me(Vec::<&str>::new())" not in send:
+        bad.append("answers go to the connection window's _cm; an ask opens the main window if needed")
+    # The answer runs exactly the connection window's own buttons (T04_PROMPT): handleAccept is
+    # sendLoginResponse(client, true); handleDisconnect is cmCloseConnection.
+    if "sm!.sendLoginResponse(c, true);" not in rebrand.T04B_EVENT \
+            or "bind.cmCloseConnection(connId: c.id);" not in rebrand.T04B_EVENT \
+            or "onAllow: () => handleAccept(context)," not in c.read(rebrand.CM_PAGE):
+        bad.append("main window's answer is not the connection window's own Allow / Don't allow")
+    if "toFront: () => windowOnTop(null)," not in rebrand.T04B_EVENT:
+        bad.append("main window does not come to the front")
+    if "SingleChildScrollView(" not in (fn_body(kit, "  Widget build(BuildContext context) {") or "") \
+            or "return SingleChildScrollView(" not in trust.split("class ApprovalPrompt", 1)[-1]:
+        bad.append("an ask can clip: main window view or connection window prompt does not scroll")
+    c.fact("the ask also fills the main window, which comes to the front; its Allow is the connection window's (t04)",
+           not bad, "; ".join(bad))
+
+    settings, simple = c.read(rebrand.SETTINGS), c.read("flutter/lib/desktop/kit/simple_settings.dart")
+    reinstate = fn_body(trust, "String reinstateTrusted(String json, String key, {int? now}) {") or ""
+    grant = fn_body(c.read(TRUST_RS), "    fn reinstate(") or ""
+    bad = [n for n, ok in [
+        ("Trusted Controllers lists removed ones with Allow", "removed: parseRemoved(" in settings
+         and "onAllow: (c) async {" in settings and "child: const Text('Allow')," in trust),
+        ("Allow there writes the server option (ipc to the service), never a local one",
+         "await bind.mainSetOption(\n                            key: kTrustedControllersOption,\n"
+         "                            value: reinstateTrusted(" in settings
+         and "mainSetLocalOption(key: kTrustedControllersOption" not in settings),
+        ("reinstateTrusted does what trust.rs reinstate does", "f.key != 'removed'" in reinstate
+         and "'added': at" in reinstate and "t.removed = false;" in grant and "t.added = now();" in grant),
+        ("Allow there also lets in a live ask from it", "ApprovalDesk.main?.decide(w.id, true);" in settings),
+        ("whoever is waiting shows in Trusted Controllers and above Access",
+         settings.count("waiting: WaitingApprovals(") == 2 and "widget.waiting!," in simple),
+    ] if not ok]
+    c.fact("Settings: Allow next to removed and waiting Controllers, over the service like Remove (t04)",
+           not bad, "; ".join(bad))
+
+
+def firewall_upgrade_checks(c):
+    """Ticket 12: one reach rule each way. An MSI upgrade from before t17 left the old
+    "BoringRemote Service" pair beside the new one; install, upgrade and self-install drop it first."""
+    fw, win = c.read(rebrand.FW_CPP), c.read("src/platform/windows.rs")
+    add = fn_body(fw, "bool AddFirewallRule(bool add, LPWSTR exeName, LPWSTR exeFile)") or ""
+    clean = fn_body(fw, "static void BoringRemoveOldRules(INetFwPolicy2* pNetFwPolicy2, LPWSTR exeName)") or ""
+    i, j = win.find(rebrand.WIN_FW_CLEAN), win.find(f'firewall add rule name=\\"{rebrand.WINDOWS_RULE}\\"')
+    bad = [n for n, ok in [
+        ("MSI drops the old-name and today's rules before adding", rebrand.FW_CALL in add
+         and add.find(rebrand.FW_CALL) < add.find("    if (add) {")
+         and 'L"%ls%ls", exeName, L" Service"' in clean and f'L"{rebrand.WINDOWS_RULE}"' in clean),
+        ("MSI removes every rule with the name, not just one", "rules->Remove(b)" in fw and "rules->Item(b, &r)" in fw),
+        ("self-install drops them before its two adds", 0 <= i < j),
+    ] if not ok]
+    c.fact("Windows install and upgrade leave one firewall rule each way: pre-t17 rules go first (t12)",
+           not bad, "; ".join(bad))
 
 
 def high_efficiency_checks(c):

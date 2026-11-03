@@ -1310,6 +1310,11 @@ SIMPLE_SETTINGS_METHOD = (
     "            }\n"
     "          },\n"
     "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n"
+    "          // v1.7 t04: whoever is waiting right now, Allow / Don't allow (kit/approval.dart)\n"
+    "          waiting: WaitingApprovals(\n"
+    "            waiting: ApprovalDesk.waitingNow,\n"
+    "            onDecide: (id, allow) => ApprovalDesk.main?.decide(id, allow),\n"
+    "          ),\n"
     "          checkUpdates: mainGetLocalBoolOptionSync(kBoringUpdateCheckOption),\n"
     "          onCheckUpdates: (on) async {\n"
     "            await mainSetLocalBoolOption(kBoringUpdateCheckOption, on);\n"
@@ -1437,6 +1442,21 @@ T04_SETTINGS_LINK = (
     "                              key: o, value: forgetId(bind.mainGetLocalOption(key: o), id));\n"
     "                        }\n"
     "                      },\n"
+    "                      // Allow here = Allow on the prompt: Trusted again (the server option, over ipc to\n"
+    "                      // the service, as Remove), and a live ask from it is let in (kit/approval.dart).\n"
+    "                      removed: parseRemoved(bind.mainGetOptionSync(key: kTrustedControllersOption)),\n"
+    "                      onAllow: (c) async {\n"
+    "                        await bind.mainSetOption(\n"
+    "                            key: kTrustedControllersOption,\n"
+    "                            value: reinstateTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption), c.key));\n"
+    "                        for (final w in ApprovalDesk.waitingNow.value) {\n"
+    "                          if (w.name.trim() == c.name.trim()) ApprovalDesk.main?.decide(w.id, true);\n"
+    "                        }\n"
+    "                      },\n"
+    "                      waiting: WaitingApprovals(\n"
+    "                        waiting: ApprovalDesk.waitingNow,\n"
+    "                        onDecide: (id, allow) => ApprovalDesk.main?.decide(id, allow),\n"
+    "                      ),\n"
     "                    ),\n"
     "                  ),\n"
     "                ),\n"
@@ -1476,6 +1496,178 @@ PATCHES += [
     (CM_PAGE, "    final showAccept = model.approveMode != 'password';\n",
      "    final showAccept = model.approveMode != 'password';\n" + T04_PROMPT,
      "approval prompt in plain words"),
+]
+
+# --- Allow in the main window (v1.7 t04 follow-up) ---------------------------------
+# On a real Mac the ask in the small connection window was cut off. The connection window runs in
+# its own process (--cm), so src/boring_approval.rs (ours) carries ask / done to the main window
+# over ipc `_boring_approval` (opening the main window if it is not running) and the answer back
+# over `_cm`; desktop/kit/approval.dart (ours, bridge-free) shows the ask in the middle of the main
+# window. The connection window then runs its own Allow / Don't allow, so trust is granted exactly
+# as a click there does (T04_GRANT, ADR 0005). Settings lists who is waiting and who was removed,
+# each with Allow. The connection window stays as the fallback and scrolls instead of clipping.
+T04B_MOD = ("#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+            "mod boring_approval; // boring-remote: Allow in the main window (v1.7 t04)\n")
+T04B_FFI = (
+    "/// boring-remote (v1.7 t04): Allow / Don't allow between the connection window and the main\n"
+    "/// window (src/boring_approval.rs). Blocking ipc, so it runs on its own thread.\n"
+    "pub fn boring_approval_send(msg: String) {\n"
+    "    #[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+    "    std::thread::spawn(move || crate::boring_approval::send(msg));\n"
+    "}\n\n")
+T04B_LISTEN = (
+    "pub fn start_global_event_stream(s: StreamSink<String>, app_type: String) -> ResultType<()> {\n"
+    "    // boring-remote (v1.7 t04): the main window listens for the connection window's asks.\n"
+    "    #[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+    "    if app_type == crate::flutter::APP_TYPE_MAIN {\n"
+    "        crate::boring_approval::listen_once();\n"
+    "    }\n"
+    "    super::flutter::start_global_event_stream(s, app_type)\n"
+    "}\n")
+T04B_CM_IPC = (
+    "                                // boring-remote (v1.7 t04): the main window's Allow / Don't allow,\n"
+    "                                // handed to this window's page, which runs its own (boring_approval.rs).\n"
+    "                                #[cfg(feature = \"flutter\")]\n"
+    "                                Data::UrlLink(msg) if msg.starts_with(crate::boring_approval::ANSWER) => {\n"
+    "                                    crate::boring_approval::to_page(crate::flutter::APP_TYPE_CM, &msg);\n"
+    "                                }\n")
+T04B_EVENT = (
+    "      } else if (name == kApprovalEvent) {\n"
+    "        // boring-remote (v1.7 t04): Allow / Don't allow in the middle of the main window too.\n"
+    "        final m = parseApproval(evt['msg'].toString());\n"
+    "        final sm = parent.target?.serverModel;\n"
+    "        if (m != null && m.kind == ApprovalKind.answer) {\n"
+    "          // The connection window: its own Allow / Don't allow (server_page.dart, T04_PROMPT).\n"
+    "          for (final c in [...?sm?.clients]) {\n"
+    "            if (c.id == m.id && !c.authorized) {\n"
+    "              if (m.allow) {\n"
+    "                sm!.sendLoginResponse(c, true);\n"
+    "              } else {\n"
+    "                bind.cmCloseConnection(connId: c.id);\n"
+    "              }\n"
+    "              break;\n"
+    "            }\n"
+    "          }\n"
+    "        } else if (m != null) {\n"
+    "          (ApprovalDesk.main ??= ApprovalDesk(\n"
+    "            overlay: () => globalKey.currentState?.overlay,\n"
+    "            toFront: () => windowOnTop(null),\n"
+    "            answer: (id, allow) => bind.boringApprovalSend(msg: approvalAnswer(id, allow)),\n"
+    "          ))\n"
+    "              .take(m);\n"
+    "        }\n")
+T04B_GATE = "(isMacOS || isWindows) && desktopType == DesktopType.cm"
+T04B_ASK = (
+    "      // boring-remote (v1.7 t04): the ask also goes to the middle of the main window.\n"
+    f"      if ({T04B_GATE}) {{\n"
+    "        bind.boringApprovalSend(\n"
+    "            msg: !client.authorized && approveMode != 'password'\n"
+    "                ? approvalAsk(client.id, client.name)\n"
+    "                : approvalDone(client.id));\n"
+    "      }\n")
+T04B_DONE_REMOVE = (
+    "      // boring-remote (v1.7 t04): settled here, so the main window drops its ask.\n"
+    f"      if ({T04B_GATE}) bind.boringApprovalSend(msg: approvalDone(id));\n")
+T04B_DONE_LOGIN = (
+    "    // boring-remote (v1.7 t04): settled here, so the main window drops its ask.\n"
+    f"    if ({T04B_GATE}) bind.boringApprovalSend(msg: approvalDone(client.id));\n")
+T04B_CARD = ("                client.disconnected ||\n"
+             "                // boring-remote (v1.7 t04): the ask gets the whole card, nothing clipped.\n"
+             "                ((isMacOS || isWindows) && !client.authorized)\n"
+             "            ? Offstage()\n")
+SERVER_MODEL = "flutter/lib/models/server_model.dart"
+FFI_MODEL = "flutter/lib/models/model.dart"
+APPROVAL_IMPORT = "import 'package:flutter_hbb/desktop/kit/approval.dart';\n"
+PATCHES += [
+    ("src/lib.rs", "mod update_rollback;\n", "mod update_rollback;\n" + T04B_MOD, "approval module"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     T04B_FFI + "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n", "approval bridge call"),
+    ("src/flutter_ffi.rs",
+     "pub fn start_global_event_stream(s: StreamSink<String>, app_type: String) -> ResultType<()> {\n"
+     "    super::flutter::start_global_event_stream(s, app_type)\n}\n",
+     T04B_LISTEN, "main window listens for approvals"),
+    ("src/ui_cm_interface.rs",
+     "                                Data::Close => {\n"
+     "                                    log::info!(\"cm ipc connection closed from connection request\");\n",
+     T04B_CM_IPC +
+     "                                Data::Close => {\n"
+     "                                    log::info!(\"cm ipc connection closed from connection request\");\n",
+     "connection window takes the main window's answer"),
+    (FFI_MODEL, "import 'platform_model.dart';\n", "import 'platform_model.dart';\n" + APPROVAL_IMPORT,
+     "approval import (events)"),
+    (FFI_MODEL, "      } else if (name == 'on_url_scheme_received') {\n",
+     T04B_EVENT + "      } else if (name == 'on_url_scheme_received') {\n", "approval events, both windows"),
+    (SERVER_MODEL, "import '../common.dart';\n", "import '../common.dart';\n" + APPROVAL_IMPORT,
+     "approval import (connection window)"),
+    (SERVER_MODEL, "      final client = Client.fromJson(jsonDecode(evt[\"client\"]));\n",
+     "      final client = Client.fromJson(jsonDecode(evt[\"client\"]));\n" + T04B_ASK,
+     "connection window sends its ask to the main window"),
+    (SERVER_MODEL, "      final id = int.parse(evt['id'] as String);\n",
+     "      final id = int.parse(evt['id'] as String);\n" + T04B_DONE_REMOVE, "ask gone: tell the main window"),
+    (SERVER_MODEL, "  void sendLoginResponse(Client client, bool res) async {\n",
+     "  void sendLoginResponse(Client client, bool res) async {\n" + T04B_DONE_LOGIN,
+     "ask answered here: tell the main window"),
+    (SETTINGS, "import 'package:url_launcher/url_launcher.dart';\n",
+     "import 'package:url_launcher/url_launcher.dart';\n" + APPROVAL_IMPORT, "approval import (settings)"),
+    (CM_PAGE, "                client.disconnected\n            ? Offstage()\n", T04B_CARD,
+     "connection window: the ask gets the whole card"),
+]
+
+# --- One firewall rule each way after an upgrade (v1.7 t12/t17) --------------------
+# Before t17 the rules were named "<exe> Service" ("BoringRemote Service"); t17 names them
+# WINDOWS_RULE. An MSI upgrade over a pre-t17 install added the new pair and left the old pair.
+# Install, upgrade, uninstall and self-install now drop the old-name rules (and any already under
+# today's name) before adding, so one rule is left each way (ticket 12: no duplicates).
+FW_CPP = "res/msi/CustomActions/FirewallRules.cpp"
+FW_HELPERS = (
+    "// boring-remote (v1.7 t17): drop every rule called `name` (INetFwRules::Remove takes one at a time).\n"
+    "static void BoringRemoveRulesNamed(INetFwPolicy2* pNetFwPolicy2, LPCWSTR name)\n"
+    "{\n"
+    "    INetFwRules* rules = NULL;\n"
+    "    if (FAILED(pNetFwPolicy2->get_Rules(&rules)) || rules == NULL) {\n"
+    "        return;\n"
+    "    }\n"
+    "    BSTR b = SysAllocString(name);\n"
+    "    int n = 0;\n"
+    "    for (; b != NULL && n < 16; n++) {\n"
+    "        INetFwRule* r = NULL;\n"
+    "        if (FAILED(rules->Item(b, &r)) || r == NULL) {\n"
+    "            break;\n"
+    "        }\n"
+    "        r->Release();\n"
+    "        if (FAILED(rules->Remove(b))) {\n"
+    "            break;\n"
+    "        }\n"
+    "    }\n"
+    "    WcaLog(LOGMSG_STANDARD, \"Removed %d firewall rule(s) \\\"%ls\\\"\\n\", n, name);\n"
+    "    SysFreeString(b);\n"
+    "    rules->Release();\n"
+    "}\n"
+    "\n"
+    "// boring-remote (v1.7 t17): the rules before t17 (\"BoringRemote Service\", the exe's name) and\n"
+    "// any already under today's name go first, so install and upgrade leave one rule each way.\n"
+    "static void BoringRemoveOldRules(INetFwPolicy2* pNetFwPolicy2, LPWSTR exeName)\n"
+    "{\n"
+    "    WCHAR old[STRING_BUFFER_SIZE] = L\"\";\n"
+    "    if (SUCCEEDED(StringCchPrintfW(old, STRING_BUFFER_SIZE, L\"%ls%ls\", exeName, L\" Service\"))) {\n"
+    "        BoringRemoveRulesNamed(pNetFwPolicy2, old);\n"
+    "    }\n"
+    f"    BoringRemoveRulesNamed(pNetFwPolicy2, L\"{WINDOWS_RULE}\");\n"
+    "}\n"
+    "\n")
+FW_CALL = "    BoringRemoveOldRules(pNetFwPolicy2, exeName); // boring-remote (v1.7 t17)\n"
+WIN_FW_ADD = f'    netsh advfirewall firewall add rule name=\\"{WINDOWS_RULE}\\" dir=out'
+WIN_FW_CLEAN = (
+    '    rem boring-remote (v1.7 t17): the rules before t17, and any under today\'s name, go first\n'
+    '    netsh advfirewall firewall delete rule name=\\"{app_name} Service\\"\n'
+    f'    netsh advfirewall firewall delete rule name=\\"{WINDOWS_RULE}\\"\n')
+PATCHES += [
+    (FW_CPP, "bool AddFirewallRule(bool add, LPWSTR exeName, LPWSTR exeFile)\n",
+     FW_HELPERS + "bool AddFirewallRule(bool add, LPWSTR exeName, LPWSTR exeFile)\n",
+     "MSI: firewall helpers drop the pre-t17 rules"),
+    (FW_CPP, "    if (add) {\n", FW_CALL + "    if (add) {\n", "MSI: old-name rules go before the new ones are added"),
+    ("src/platform/windows.rs", WIN_FW_ADD, WIN_FW_CLEAN + WIN_FW_ADD,
+     "self-install: old-name rules go before the new ones are added"),
 ]
 
 # --- Three-screen Setup (v1.7 ticket 06) -------------------------------------------

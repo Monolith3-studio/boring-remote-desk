@@ -44,6 +44,9 @@ class SimpleSettings extends StatefulWidget {
   /// The Access rows (kit/access.dart); null hides them.
   final Widget? access;
 
+  /// Whoever is waiting to get in right now (kit/approval.dart), shown above Access.
+  final Widget? waiting;
+
   final bool checkUpdates;
   final void Function(bool on) onCheckUpdates;
 
@@ -67,6 +70,7 @@ class SimpleSettings extends StatefulWidget {
     this.openAtLogin,
     this.onOpenAtLogin,
     this.access,
+    this.waiting,
     required this.checkUpdates,
     required this.onCheckUpdates,
     this.advanced = const [],
@@ -273,6 +277,10 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             alignment: Alignment.centerLeft,
             child: OutlinedButton(onPressed: widget.onRunSetup, child: const Text('Run Setup again')),
           ),
+        ],
+        if (widget.waiting != null) ...[
+          const SizedBox(height: Kit.s6),
+          widget.waiting!,
         ],
         if (widget.access != null) ...[
           const SizedBox(height: Kit.s6),

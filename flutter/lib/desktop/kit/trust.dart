@@ -56,6 +56,45 @@ String removeTrusted(String json, String key) {
   }
 }
 
+/// The removed ones: Settings offers Allow next to each.
+List<TrustedController> parseRemoved(String json) {
+  try {
+    final list = jsonDecode(json);
+    if (list is! List) return [];
+    return [
+      for (final e in list)
+        if (e is Map && e['key'] is String && e['removed'] == true)
+          TrustedController(
+            key: e['key'] as String,
+            name: (e['name'] as String?) ?? '',
+            added: (e['added'] as num?)?.toInt() ?? 0,
+          ),
+    ];
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Allow in Settings for a removed Controller: its token is Trusted again, as Allow on the prompt
+/// does (trust.rs `Trusted::reinstate`: not removed, added now). The settings page writes it with
+/// the server option, over ipc to the service, as Remove does.
+String reinstateTrusted(String json, String key, {int? now}) {
+  try {
+    final list = jsonDecode(json);
+    if (list is! List) return '[]';
+    final at = now ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return jsonEncode([
+      for (final e in list)
+        if (e is Map && e['key'] == key)
+          {for (final f in e.entries) if (f.key != 'removed') f.key: f.value, 'added': at}
+        else
+          e
+    ]);
+  } catch (_) {
+    return '[]';
+  }
+}
+
 /// A Target this Mac pinned the key of on its first encrypted Direct Link.
 class KnownMac {
   final String id;
@@ -107,12 +146,22 @@ class TrustedControllersPage extends StatefulWidget {
   final Future<void> Function(String key) onRemove;
   final Future<void> Function(String id) onForget;
 
+  /// Removed ones, each with Allow ([onAllow] trusts it again, and lets in a live ask from it).
+  final List<TrustedController> removed;
+  final Future<void> Function(TrustedController c)? onAllow;
+
+  /// Whoever is waiting right now (kit/approval.dart WaitingApprovals); null shows nothing.
+  final Widget? waiting;
+
   const TrustedControllersPage({
     super.key,
     required this.trusted,
     required this.known,
     required this.onRemove,
     required this.onForget,
+    this.removed = const [],
+    this.onAllow,
+    this.waiting,
   });
 
   @override
@@ -122,6 +171,7 @@ class TrustedControllersPage extends StatefulWidget {
 class _TrustedControllersPageState extends State<TrustedControllersPage> {
   late final _trusted = [...widget.trusted];
   late final _known = [...widget.known];
+  late final _removed = [...widget.removed];
 
   @override
   Widget build(BuildContext context) {
@@ -131,6 +181,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
       children: [
         Text('Trusted Controllers', style: t.headlineSmall),
         const SizedBox(height: Kit.s2),
+        if (widget.waiting != null) widget.waiting!,
         Text('These ${KitWords.many} get into this one without asking. Remove one and it has to ask again.',
             style: t.bodySmall),
         const SizedBox(height: Kit.s4),
@@ -147,6 +198,39 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
               child: const Text('Remove'),
             ),
           ),
+        if (_removed.isNotEmpty && widget.onAllow != null) ...[
+          const SizedBox(height: Kit.s6),
+          Text('Removed', style: t.titleMedium),
+          const SizedBox(height: Kit.s2),
+          Text('These have to ask before they get in. Allow one and it gets in without asking again.',
+              style: t.bodySmall),
+          const SizedBox(height: Kit.s3),
+          for (final c in _removed)
+            Padding(
+              padding: const EdgeInsets.only(bottom: Kit.s3),
+              child: Row(children: [
+                Expanded(child: Text(c.name.isNotEmpty ? c.name : 'A ${KitWords.one} with no name')),
+                const SizedBox(width: Kit.s3),
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size(120, 48),
+                    backgroundColor: Kit.paper,
+                    foregroundColor: Kit.ink,
+                  ),
+                  onPressed: () async {
+                    await widget.onAllow!(c);
+                    if (mounted) {
+                      setState(() {
+                        _removed.remove(c);
+                        _trusted.add(c);
+                      });
+                    }
+                  },
+                  child: const Text('Allow'),
+                ),
+              ]),
+            ),
+        ],
         const SizedBox(height: Kit.s6),
         Text('${KitWords.cap(KitWords.many)} this one has connected to', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
@@ -173,7 +257,16 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
   }
 }
 
+/// The ask in plain words: who, and what it wants (the connection window and the main window).
+String approvalQuestion(String name) {
+  final who = name.trim().isNotEmpty ? name.trim() : 'A ${KitWords.one} on this network';
+  return '$who wants to control this ${KitWords.one}.';
+}
+
+const kApprovalWhy = "If you allow it, it can get in next time without asking. You can remove it in Settings.";
+
 /// What the Target shows when an unknown Mac asks to come in. Plain words, two choices.
+/// It scrolls rather than clips when the connection window is short.
 class ApprovalPrompt extends StatelessWidget {
   final String name;
   final VoidCallback onAllow;
@@ -184,17 +277,15 @@ class ApprovalPrompt extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
-    final who = name.trim().isNotEmpty ? name.trim() : 'A ${KitWords.one} on this network';
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(Kit.s4),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text('$who wants to control this ${KitWords.one}.', style: t.titleMedium),
+          Text(approvalQuestion(name), style: t.titleMedium),
           const SizedBox(height: Kit.s2),
-          Text("If you allow it, it can get in next time without asking. You can remove it in Settings.",
-              style: t.bodySmall),
+          Text(kApprovalWhy, style: t.bodySmall),
           const SizedBox(height: Kit.s4),
           Row(children: [
             Expanded(
