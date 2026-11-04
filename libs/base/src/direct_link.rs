@@ -92,11 +92,44 @@ impl Path {
     }
 }
 
-/// Where to dial: the Target's own address, then its Tailscale address if one is known.
+/// boring-remote (v1.7 t25): a session's path plus the link under it; the badge shows both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub path: Path,
+    pub link: crate::lan::LinkKind,
+}
+
+impl Route {
+    /// The session's `stream_type`; plain "Local" when either end's link is unknown (an old peer).
+    pub fn stream_type(self) -> &'static str {
+        use crate::lan::LinkKind::*;
+        match (self.path, self.link) {
+            (Path::ViaInternet, _) => Path::ViaInternet.stream_type(),
+            (Path::Local, Wired) => "LocalWired",
+            (Path::Local, WiFi) => "LocalWiFi",
+            (Path::Local, Other) => Path::Local.stream_type(),
+        }
+    }
+}
+
+/// Where to dial: the Target's own address, then (v1.7 t25) its other LAN addresses, fastest first,
+/// then its Tailscale address if one is known. `target` is set only when there is more than one
+/// way to reach one machine: who the plan means, so another computer at a stale address is passed
+/// over. `dialled` is the address a person asked for: whoever answers there is who they meant.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub direct: SocketAddr,
+    pub others: Vec<SocketAddr>,
     pub tailscale: Option<SocketAddr>,
+    pub target: Option<String>,
+    pub dialled: Option<SocketAddr>,
+}
+
+impl Plan {
+    /// One address and maybe Tailscale: what every plan was before t25 and what an old peer still gets.
+    pub fn single(direct: SocketAddr, tailscale: Option<SocketAddr>) -> Self {
+        Plan { direct, others: vec![], tailscale, target: None, dialled: None }
+    }
 }
 
 /// Why one dial didn't give a session.
@@ -107,9 +140,13 @@ pub enum Failure {
     /// Something answered and was refused (plaintext, a changed identity). Final: falling back
     /// would only route around the refusal.
     Refused(hbb_common::anyhow::Error),
+    /// boring-remote (v1.7 t25): one of several addresses for one Target answered wrong (another
+    /// computer has it now, or an old build). Try the rest: they are pinned to the same key, so
+    /// this routes around nothing. Reported only if nothing else connects.
+    Stale(hbb_common::anyhow::Error),
 }
 
-/// Dial `plan.direct`, then `plan.tailscale` if the first gave nothing. "Nothing" means TCP didn't
+/// Dial `plan.direct`, `plan.others` in order, then `plan.tailscale` if those gave nothing. "Nothing" means TCP didn't
 /// answer within `direct_ms` (a non-Tailscale address) or `slow_ms` (Tailscale: its first packets
 /// may go through a DERP relay), or the handshake found nothing it could talk to. A Target that
 /// answered gets the handshake's own timeouts, not the no-answer budget. A [`Failure::Refused`]
@@ -128,8 +165,9 @@ where
     HFut: Future<Output = Result<T, Failure>>,
 {
     let tailscale = plan.tailscale.filter(|t| *t != plan.direct);
-    let last = tailscale.unwrap_or(plan.direct);
-    for addr in std::iter::once(plan.direct).chain(tailscale) {
+    let last = tailscale.or(plan.others.last().copied()).unwrap_or(plan.direct);
+    let mut stale = None;
+    for addr in std::iter::once(plan.direct).chain(plan.others).chain(tailscale) {
         // The short budget only gets to the fallback sooner; the last address has nothing after it.
         let ms = if is_tailscale(addr.ip()) || addr == last { slow_ms } else { direct_ms };
         let Ok(Some(s)) = hbb_common::timeout(ms, connect(addr)).await else {
@@ -138,8 +176,12 @@ where
         match handshake(s, addr).await {
             Ok(t) => return Ok((t, addr)),
             Err(Failure::Refused(e)) => return Err(e),
+            Err(Failure::Stale(e)) => stale = stale.or(Some(e)),
             Err(Failure::Unreachable) => {}
         }
+    }
+    if let Some(e) = stale {
+        return Err(e);
     }
     bail!(NOT_ON_THIS_NETWORK)
 }
@@ -250,6 +292,19 @@ struct KnownTarget {
     lan: String,
     #[serde(default)]
     tailscale: String,
+    /// boring-remote (v1.7 t25): every LAN address it last listed. Hints for where to dial, never
+    /// pins: `lan` and `tailscale` are what [`Known::pin_ok`] holds an address to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_addrs")]
+    addrs: Vec<crate::lan::Address>,
+}
+
+/// A bad `addrs` must never cost the pins beside it, so it is read leniently.
+fn lenient_addrs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<crate::lan::Address>, D::Error> {
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Array(values) => crate::lan::lenient(values),
+        _ => vec![],
+    })
 }
 
 /// Targets this Controller has met over an encrypted Direct Link, by Target ID: the pinned
@@ -307,6 +362,54 @@ impl Known {
         }
     }
 
+    /// boring-remote (v1.7 t25): remember every LAN address `id` listed, public ones never. Only for
+    /// a Target already met: an entry without a pinned key must not exist. An address belongs to
+    /// whoever listed it last, so it leaves any other Target's list.
+    pub fn set_addresses(&mut self, id: &str, list: &[crate::lan::Address]) {
+        if !self.0.contains_key(id) {
+            return;
+        }
+        let list: Vec<_> = list.iter().filter(|a| crate::lan::is_lan(a.ip)).take(crate::lan::MAX_ADDRS).cloned().collect();
+        for (other, t) in self.0.iter_mut() {
+            if other != id {
+                t.addrs.retain(|a| !list.iter().any(|b| b.ip == a.ip));
+            }
+        }
+        if let Some(t) = self.0.get_mut(id) {
+            t.addrs = list;
+        }
+    }
+
+    /// Every LAN address stored for `id`: what it listed, and the one it last answered on.
+    pub fn addresses(&self, id: &str) -> Vec<crate::lan::Address> {
+        let Some(t) = self.0.get(id) else { return vec![] };
+        let mut out: Vec<_> = t.addrs.iter().filter(|a| crate::lan::is_lan(a.ip)).cloned().collect();
+        if let Ok(lan) = t.lan.parse::<SocketAddr>() {
+            if crate::lan::is_lan(lan.ip()) && !out.iter().any(|a| a.ip == lan.ip()) {
+                out.push(crate::lan::Address { ip: lan.ip(), link: Default::default(), mbps: 0 });
+            }
+        }
+        out
+    }
+
+    /// Which Target `ip` is stored for: any address it listed, last answered on, or its Tailscale.
+    pub fn owner_of(&self, ip: IpAddr) -> Option<String> {
+        let port_free = |s: &str| s.parse::<SocketAddr>().map_or(false, |a| a.ip() == ip);
+        self.0
+            .iter()
+            .find(|(_, t)| t.addrs.iter().any(|a| a.ip == ip) || port_free(&t.lan) || port_free(&t.tailscale))
+            .map(|(id, _)| id.clone())
+    }
+
+    fn tailscale_of(&self, id: &str) -> Option<SocketAddr> {
+        self.0.get(id).and_then(|t| t.tailscale.parse().ok())
+    }
+
+    /// The link under `ip` on the Target `id`, as it last said.
+    pub fn link_at(&self, id: &str, ip: IpAddr) -> crate::lan::LinkKind {
+        self.addresses(id).iter().find(|a| a.ip == ip).map_or(Default::default(), |a| a.link)
+    }
+
     /// The Tailscale address of whoever last answered at `direct`, if it told us one.
     pub fn tailscale_for(&self, direct: SocketAddr) -> Option<SocketAddr> {
         let lan = direct.to_string();
@@ -337,17 +440,69 @@ pub async fn plan_for(peer: &str, known: &Known, ms: u64) -> ResultType<Plan> {
         .tailscale_for(direct)
         .or_else(|| sorted.iter().copied().find(|a| is_tailscale(a.ip())))
         .filter(|t| *t != direct);
-    Ok(Plan { direct, tailscale })
+    let owner = crate::lan::advert_owner(direct.ip()).or_else(|| known.owner_of(direct.ip()));
+    Ok(widen(direct, tailscale, owner.as_deref(), known, Some(direct)))
+}
+
+/// Most LAN addresses tried per connect: each dead one costs up to [`DIRECT_TIMEOUT_MS`].
+const MAX_DIAL: usize = 4;
+
+/// boring-remote (v1.7 t25): `first` was going to be dialled for Target `owner`: this is every way to
+/// reach that machine, fastest first. What it listed in its latest pong leads; what is only stored
+/// follows, so a wire that just went away is tried last and a stored address is never the end of the
+/// road. Only private LAN addresses (ADR 0003), never this computer's own. A Target with one known
+/// address gets the same plan it always did, and a Tailscale address only goes via the LAN when the
+/// Target answered discovery here just now: elsewhere every stored LAN address would just time out.
+fn widen(first: SocketAddr, tailscale: Option<SocketAddr>, owner: Option<&str>, known: &Known, dialled: Option<SocketAddr>) -> Plan {
+    let single = Plan::single(first, tailscale.filter(|t| *t != first));
+    let Some(id) = owner else { return single };
+    let fresh = crate::lan::advert_of(id);
+    let via_tailscale = is_tailscale(first.ip());
+    if via_tailscale && fresh.is_empty() {
+        return single;
+    }
+    let here = crate::lan::local_nics();
+    let mut dial: Vec<SocketAddr> = vec![];
+    let stored = known.addresses(id);
+    let listed = crate::lan::ranked(&fresh, &here).into_iter().chain(crate::lan::ranked(&stored, &here));
+    let ips = listed.map(|a| a.ip).chain((!via_tailscale).then_some(first.ip()));
+    for ip in ips {
+        let addr = SocketAddr::new(ip, first.port());
+        let mine = here.iter().any(|n| IpAddr::V4(n.ip) == ip) && dialled != Some(addr);
+        if crate::lan::is_lan(ip) && !mine && !dial.contains(&addr) {
+            dial.push(addr);
+        }
+    }
+    if let Some(d) = dialled.filter(|d| dial.len() > MAX_DIAL && dial[MAX_DIAL..].contains(d)) {
+        dial[MAX_DIAL - 1] = d;
+    }
+    dial.truncate(MAX_DIAL);
+    let tailscale = if via_tailscale { Some(first) } else { tailscale.or_else(|| known.tailscale_of(id)) };
+    if dial.is_empty() || (dial == [first] && !via_tailscale) {
+        return Plan::single(first, tailscale.filter(|t| *t != first));
+    }
+    Plan {
+        direct: dial[0],
+        others: dial[1..].to_vec(),
+        tailscale: tailscale.filter(|t| !dial.contains(t)),
+        target: Some(id.to_owned()),
+        dialled,
+    }
 }
 
 /// A recent on Home (a stored peer) is kept by its Target ID, which nothing can dial: it goes to
-/// the address Known last met that ID on, else its name (`name`, then `name.local` for a bare
+/// every address it listed in discovery or Known holds for it, fastest first (v1.7 t25), else its name (`name`, then `name.local` for a bare
 /// host name), then its known Tailscale address. The pin still holds, keyed on the dialled
 /// address and the ID. No address to try is the plain [`NO_ADDRESS`].
 pub async fn plan_for_recent(id: &str, name: &str, known: &Known, ms: u64) -> ResultType<Plan> {
     let t = known.0.get(id);
     let mut tailscale = t.and_then(|t| t.tailscale.parse::<SocketAddr>().ok());
     let mut direct = t.and_then(|t| t.lan.parse::<SocketAddr>().ok());
+    if direct.is_none() {
+        // boring-remote (v1.7 t25): on the network right now, whatever Known holds.
+        let port = hbb_common::config::RELAY_PORT as u16 + 1;
+        direct = crate::lan::advert_of(id).first().map(|a| SocketAddr::new(a.ip, port));
+    }
     if direct.is_none() && !name.is_empty() {
         let bare = !name.contains('.') && !name.contains(':');
         let local = format!("{}.local", name);
@@ -360,8 +515,8 @@ pub async fn plan_for_recent(id: &str, name: &str, known: &Known, ms: u64) -> Re
         }
     }
     match (direct, tailscale) {
-        (Some(direct), ts) => Ok(Plan { direct, tailscale: ts.filter(|t| *t != direct) }),
-        (None, Some(ts)) => Ok(Plan { direct: ts, tailscale: None }),
+        (Some(direct), ts) => Ok(widen(direct, ts, Some(id), known, None)),
+        (None, Some(ts)) => Ok(Plan::single(ts, None)),
         (None, None) => bail!(NO_ADDRESS),
     }
 }
@@ -374,8 +529,8 @@ pub fn is_target_id(peer: &str) -> bool {
 /// The connect box (src/client.rs `_start`): Direct Link first, then Tailscale, else
 /// [`NOT_ON_THIS_NETWORK`]. A recent from Home (a Target ID) goes by [`plan_for_recent`].
 /// Every session comes back encrypted or not at all. Returns the
-/// stream, the path it took and the Target's identity key (the session fingerprint) when known.
-pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Option<Vec<u8>>)> {
+/// stream, the route it took and the Target's identity key (the session fingerprint) when known.
+pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Route, Option<Vec<u8>>)> {
     let known = Known::load();
     let plan = if is_target_id(peer) {
         let name = hbb_common::config::PeerConfig::load(peer).info.hostname;
@@ -386,21 +541,61 @@ pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Opti
     dial(plan?, slow_ms, known).await
 }
 
-async fn dial(plan: Plan, slow_ms: u64, mut known: Known) -> ResultType<(Stream, Path, Option<Vec<u8>>)> {
+async fn dial(plan: Plan, slow_ms: u64, mut known: Known) -> ResultType<(Stream, Route, Option<Vec<u8>>)> {
+    let here = crate::lan::local_nics();
+    let strict = plan.clone();
+    let here_ref = &here;
     let ((stream, who), addr) = race(
         plan,
         DIRECT_TIMEOUT_MS,
         slow_ms,
-        |addr| async move { hbb_common::socket_client::connect_tcp_local(addr, None, slow_ms).await.ok() },
-        |stream, addr| handshake(stream, addr, &known, HANDSHAKE_TIMEOUT_MS),
+        |addr| async move { connect_from(addr, crate::lan::source_for(addr.ip(), here_ref), slow_ms).await },
+        |stream, addr| {
+            let (known, strict) = (&known, &strict);
+            async move { judge(strict, addr, handshake(stream, addr, known, HANDSHAKE_TIMEOUT_MS).await) }
+        },
     )
     .await?;
+    let mut link = Default::default();
     let pk = who.map(|w| {
         known.record(&w, addr);
+        let fresh = crate::lan::advert_of(&w.id);
+        if !fresh.is_empty() {
+            known.set_addresses(&w.id, &fresh);
+        }
         known.save();
+        link = known.link_at(&w.id, addr.ip()).and(crate::lan::local_link(stream.local_addr().ip(), &here));
         w.sign_pk
     });
-    Ok((stream, Path::of(addr), pk))
+    Ok((stream, Route { path: Path::of(addr), link }, pk))
+}
+
+/// boring-remote (v1.7 t25): TCP to `addr`, leaving by `source` if this computer picked a way out. A
+/// source that went away (the wire was just pulled) is no reason to fail: the OS's own route is next.
+async fn connect_from(addr: SocketAddr, source: Option<IpAddr>, ms: u64) -> Option<Stream> {
+    if let Some(ip) = source {
+        let bound = SocketAddr::new(ip, 0);
+        if let Ok(s) = hbb_common::socket_client::connect_tcp_local(addr, Some(bound), ms).await {
+            return Some(s);
+        }
+    }
+    hbb_common::socket_client::connect_tcp_local(addr, None, ms).await.ok()
+}
+
+/// boring-remote (v1.7 t25): what one answer means when several addresses lead to one Target. A
+/// refusal, or another computer's identity, means this address is stale: on to the next. The address
+/// a person asked for is exempt from the who-check: if B has taken over .112 and Home lists B there,
+/// clicking that row opens B. With one address nothing changes: a refusal is final, as ever.
+fn judge<S>(plan: &Plan, addr: SocketAddr, got: Result<(S, Option<Verified>), Failure>) -> Result<(S, Option<Verified>), Failure> {
+    let Some(target) = plan.target.as_deref() else { return got };
+    match got {
+        Err(Failure::Refused(e)) => Err(Failure::Stale(e)),
+        Ok((_, Some(who))) if who.id != target && plan.dialled != Some(addr) => {
+            log::info!("{} answered as another computer, trying the next address", addr);
+            Err(Failure::Stale(anyhow!(NOT_ON_THIS_NETWORK)))
+        }
+        other => other,
+    }
 }
 
 /// A Target that picked up at `addr`: the encrypted, pinned handshake, then the trust token.
@@ -465,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn direct_timeout_falls_back_to_tailscale() {
         let seen = Arc::new(Mutex::new(vec![]));
-        let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
+        let plan = Plan::single(sa(LAN), Some(sa(TS)));
         let (got, addr) =
             race(plan, 50, 500, dialer(vec![(LAN, Some(5_000)), (TS, Some(1))], seen.clone()), handshake(0))
                 .await
@@ -478,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn direct_success_never_contacts_the_fallback() {
         let seen = Arc::new(Mutex::new(vec![]));
-        let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
+        let plan = Plan::single(sa(LAN), Some(sa(TS)));
         let (_, addr) =
             race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()), handshake(0))
                 .await
@@ -491,7 +686,7 @@ mod tests {
     async fn a_target_that_answers_in_time_but_handshakes_slowly_stays_local() {
         // The ~1 s is for "no answer". A Target that picked up gets the handshake's own budget.
         let seen = Arc::new(Mutex::new(vec![]));
-        let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
+        let plan = Plan::single(sa(LAN), Some(sa(TS)));
         let (_, addr) =
             race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()), handshake(200))
                 .await
@@ -503,12 +698,12 @@ mod tests {
     #[tokio::test]
     async fn nothing_answers_is_not_on_this_network() {
         let seen = Arc::new(Mutex::new(vec![]));
-        let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
+        let plan = Plan::single(sa(LAN), Some(sa(TS)));
         let err = race(plan, 50, 50, dialer(vec![(LAN, None), (TS, Some(5_000))], seen), handshake(0))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), NOT_ON_THIS_NETWORK);
-        let plan = Plan { direct: sa(LAN), tailscale: None };
+        let plan = Plan::single(sa(LAN), None);
         let err = race(plan, 50, 50, dialer(vec![], Default::default()), handshake(0)).await.unwrap_err();
         assert_eq!(err.to_string(), NOT_ON_THIS_NETWORK);
     }
@@ -516,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_direct_link_never_falls_back() {
         let seen = Arc::new(Mutex::new(vec![]));
-        let plan = Plan { direct: sa(LAN), tailscale: Some(sa(TS)) };
+        let plan = Plan::single(sa(LAN), Some(sa(TS)));
         let err = race(plan, 50, 500, dialer(vec![(LAN, Some(1)), (TS, Some(1))], seen.clone()), |_, _| async {
             Err::<(), _>(Failure::Refused(hbb_common::anyhow::anyhow!("plaintext")))
         })
@@ -528,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_typed_tailscale_address_gets_the_slow_timeout() {
-        let plan = Plan { direct: sa(TS), tailscale: None };
+        let plan = Plan::single(sa(TS), None);
         let (_, addr) = race(plan, 10, 500, dialer(vec![(TS, Some(100))], Default::default()), handshake(0))
             .await
             .unwrap();
@@ -556,7 +751,7 @@ mod tests {
         srv.send(&hash).await.unwrap();
         match super::handshake(ctl, sa(TS), &Known::default(), 2_000).await {
             Err(Failure::Refused(e)) => assert_eq!(e.to_string(), PLAINTEXT_REFUSED),
-            Err(Failure::Unreachable) => panic!("unreachable, not refused"),
+            Err(Failure::Unreachable | Failure::Stale(_)) => panic!("not refused"),
             Ok((s, who)) => panic!("not refused: secured {} {:?}", s.is_secured(), who.map(|w| w.id)),
         }
         for peer in ["100.101.102.103", "fd7a:115c:a1e0::1", "192.168.1.20"] {
@@ -722,7 +917,7 @@ mod tests {
         let mut known = Known::default();
         known.record(&Verified { id: "123456789".into(), sign_pk: vec![1; 32], tailscale: Some("100.101.102.103".parse().unwrap()) }, sa(LAN));
         let plan = plan_for_recent("123456789", "", &known, 1_000).await.unwrap();
-        assert_eq!(plan, Plan { direct: sa(LAN), tailscale: Some(sa(TS)) });
+        assert_eq!(plan, Plan::single(sa(LAN), Some(sa(TS))));
     }
 
     #[tokio::test]
@@ -734,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn a_recent_never_met_over_a_direct_link_tries_its_name() {
         let plan = plan_for_recent("123456789", "192.168.1.20", &Known::default(), 1_000).await.unwrap();
-        assert_eq!(plan, Plan { direct: sa(LAN), tailscale: None });
+        assert_eq!(plan, Plan::single(sa(LAN), None));
         let err = plan_for_recent("123456789", "8.8.8.8", &Known::default(), 1_000).await.unwrap_err();
         assert_eq!(err.to_string(), NO_ADDRESS, "a name that leads nowhere it may dial");
     }
@@ -751,7 +946,7 @@ mod tests {
     async fn a_recent_whose_lan_address_was_lost_goes_over_tailscale() {
         let known = Known::parse(r#"{"123456789":{"pk":"01","lan":"","tailscale":"100.101.102.103:21118"}}"#);
         let plan = plan_for_recent("123456789", "", &known, 1_000).await.unwrap();
-        assert_eq!(plan, Plan { direct: sa(TS), tailscale: None });
+        assert_eq!(plan, Plan::single(sa(TS), None));
     }
 
     #[tokio::test]
@@ -759,9 +954,9 @@ mod tests {
         let mut known = Known::default();
         known.record(&Verified { id: "1".into(), sign_pk: vec![1; 32], tailscale: Some("100.101.102.103".parse().unwrap()) }, sa(LAN));
         let plan = plan_for("192.168.1.20", &known, 1_000).await.unwrap();
-        assert_eq!(plan, Plan { direct: sa(LAN), tailscale: Some(sa(TS)) });
+        assert_eq!(plan, Plan::single(sa(LAN), Some(sa(TS))));
         let plan = plan_for("100.101.102.103", &known, 1_000).await.unwrap();
-        assert_eq!(plan, Plan { direct: sa(TS), tailscale: None });
+        assert_eq!(plan, Plan::single(sa(TS), None));
         for public in ["8.8.8.8", "1.1.1.1:21118", "123456789"] {
             assert_eq!(plan_for(public, &known, 1_000).await.unwrap_err().to_string(), NOT_FOUND, "{}", public);
         }
@@ -773,7 +968,7 @@ mod tests {
     async fn a_lan_address_with_no_fallback_gets_the_slow_timeout() {
         // The ~1 s is only there to reach the Tailscale address sooner. With none known, a LAN
         // Target slow to answer (waking up, ARP) failed at 1 s with nothing else to try.
-        let plan = Plan { direct: sa(LAN), tailscale: None };
+        let plan = Plan::single(sa(LAN), None);
         let (_, addr) = race(plan, 10, 500, dialer(vec![(LAN, Some(100))], Default::default()), handshake(0))
             .await
             .unwrap();
@@ -785,5 +980,258 @@ mod tests {
         for e in [NOT_ON_THIS_NETWORK, NOT_FOUND, NO_ADDRESS, PLAINTEXT_REFUSED, IDENTITY_CHANGED] {
             assert!(e.contains("computer") && !e.contains("Mac"), "{e}");
         }
+    }
+
+    // --- v1.7 t25: several addresses for one Target ------------------------------------------
+    const WIRED: &str = "192.168.1.112:21118";
+    const WIFI: &str = "192.168.1.79:21118";
+    use crate::lan::{Address, LinkKind};
+
+    fn tori_addrs() -> Vec<Address> {
+        vec![
+            Address { ip: sa(WIFI).ip(), link: LinkKind::WiFi, mbps: 0 },
+            Address { ip: sa(WIRED).ip(), link: LinkKind::Wired, mbps: 1000 },
+        ]
+    }
+
+    /// Tori met on Wi-Fi, as the Studio has her stored today, now with her addresses.
+    fn tori_known() -> Known {
+        let mut known = Known::default();
+        known.record(&Verified { id: "t25-tori".into(), sign_pk: vec![1; 32], tailscale: None }, sa(WIFI));
+        known.set_addresses("t25-tori", &tori_addrs());
+        known
+    }
+
+    fn lan_plan(addrs: &[&str]) -> Plan {
+        Plan {
+            direct: sa(addrs[0]),
+            others: addrs[1..].iter().map(|a| sa(a)).collect(),
+            tailscale: None,
+            target: Some("t25-tori".into()),
+            dialled: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn home_row_with_the_wifi_address_still_goes_wired_first() {
+        let plan = plan_for("192.168.1.79", &tori_known(), 1_000).await.unwrap();
+        assert_eq!((plan.direct, plan.others.clone()), (sa(WIRED), vec![sa(WIFI)]));
+        assert_eq!(plan.dialled, Some(sa(WIFI)));
+        assert_eq!(plan.target.as_deref(), Some("t25-tori"));
+    }
+
+    #[tokio::test]
+    async fn a_recent_dials_every_stored_address_fastest_first() {
+        let plan = plan_for_recent("t25-tori", "", &tori_known(), 1_000).await.unwrap();
+        assert_eq!((plan.direct, plan.others.clone()), (sa(WIRED), vec![sa(WIFI)]));
+        assert_eq!(plan.dialled, None);
+    }
+
+    #[tokio::test]
+    async fn a_dead_stored_address_falls_through_to_the_next_inside_the_short_budget() {
+        // Laptop unplugged: the wired address no longer answers, Wi-Fi does.
+        let seen = Arc::new(Mutex::new(vec![]));
+        let started = std::time::Instant::now();
+        let (_, addr) = race(lan_plan(&[WIRED, WIFI]), 50, 2_000, dialer(vec![(WIRED, Some(5_000)), (WIFI, Some(1))], seen.clone()), handshake(0))
+            .await
+            .unwrap();
+        assert_eq!(addr, sa(WIFI));
+        assert_eq!(*seen.lock().unwrap(), vec![sa(WIRED), sa(WIFI)], "wired first, then Wi-Fi");
+        assert!(started.elapsed() < Duration::from_millis(1_000), "the dead one got the short budget");
+    }
+
+    #[tokio::test]
+    async fn the_working_wire_is_kept_and_wifi_is_never_contacted() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let (_, addr) = race(lan_plan(&[WIRED, WIFI]), 50, 500, dialer(vec![(WIRED, Some(1)), (WIFI, Some(1))], seen.clone()), handshake(0))
+            .await
+            .unwrap();
+        assert_eq!(addr, sa(WIRED));
+        assert_eq!(*seen.lock().unwrap(), vec![sa(WIRED)]);
+    }
+
+    #[tokio::test]
+    async fn every_lan_address_dead_goes_on_to_tailscale_then_the_plain_error() {
+        let mut plan = lan_plan(&[WIRED, WIFI]);
+        plan.tailscale = Some(sa(TS));
+        let seen = Arc::new(Mutex::new(vec![]));
+        let (_, addr) = race(plan.clone(), 20, 500, dialer(vec![(TS, Some(1))], seen.clone()), handshake(0)).await.unwrap();
+        assert_eq!(addr, sa(TS));
+        assert_eq!(*seen.lock().unwrap(), vec![sa(WIRED), sa(WIFI), sa(TS)]);
+        let e = race(plan, 20, 50, dialer(vec![], seen), handshake(0)).await.unwrap_err();
+        assert_eq!(e.to_string(), NOT_ON_THIS_NETWORK);
+    }
+
+    /// `first` gives a stale-address answer, everyone else connects.
+    fn stale_at(first: &'static str) -> impl FnMut(SocketAddr, SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = Result<SocketAddr, Failure>>>> {
+        move |s, addr| {
+            Box::pin(async move {
+                if addr == sa(first) {
+                    Err(Failure::Stale(anyhow!(IDENTITY_CHANGED)))
+                } else {
+                    Ok(s)
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_address_now_held_by_another_computer_does_not_strand_the_target() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let (_, addr) = race(lan_plan(&[WIRED, WIFI]), 50, 500, dialer(vec![(WIRED, Some(1)), (WIFI, Some(1))], seen.clone()), stale_at(WIRED))
+            .await
+            .unwrap();
+        assert_eq!(addr, sa(WIFI));
+    }
+
+    #[tokio::test]
+    async fn nobody_else_answering_reports_what_the_stale_address_said() {
+        let seen = Arc::new(Mutex::new(vec![]));
+        let e = race(lan_plan(&[WIRED, WIFI]), 20, 50, dialer(vec![(WIRED, Some(1))], seen), stale_at(WIRED)).await.unwrap_err();
+        assert_eq!(e.to_string(), IDENTITY_CHANGED);
+    }
+
+    fn at(id: &str) -> Result<(u8, Option<Verified>), Failure> {
+        Ok((0, Some(Verified { id: id.into(), sign_pk: vec![1; 32], tailscale: None })))
+    }
+
+    #[test]
+    fn a_single_address_keeps_todays_rules() {
+        let plan = Plan::single(sa(WIRED), None);
+        assert!(judge(&plan, sa(WIRED), at("someone-else")).is_ok());
+        assert!(matches!(judge(&plan, sa(WIRED), Err::<(u8, Option<Verified>), _>(Failure::Refused(anyhow!("no")))), Err(Failure::Refused(_))));
+    }
+
+    #[test]
+    fn another_computer_at_a_sibling_address_is_passed_over() {
+        let plan = lan_plan(&[WIRED, WIFI]);
+        assert!(judge(&plan, sa(WIRED), at("t25-tori")).is_ok());
+        assert!(matches!(judge(&plan, sa(WIRED), at("other-machine")), Err(Failure::Stale(_))));
+        assert!(matches!(judge(&plan, sa(WIRED), Err::<(u8, Option<Verified>), _>(Failure::Refused(anyhow!(IDENTITY_CHANGED)))), Err(Failure::Stale(_))));
+        assert!(matches!(judge(&plan, sa(WIRED), Err::<(u8, Option<Verified>), _>(Failure::Unreachable)), Err(Failure::Unreachable)));
+    }
+
+    #[test]
+    fn the_address_a_person_asked_for_connects_to_whoever_is_there() {
+        // B took over .112 and Home lists it there: clicking B's row must open B, not Tori at .79.
+        let mut plan = lan_plan(&[WIRED, WIFI]);
+        plan.dialled = Some(sa(WIRED));
+        assert!(judge(&plan, sa(WIRED), at("machine-b")).is_ok());
+        assert!(matches!(judge(&plan, sa(WIFI), at("machine-b")), Err(Failure::Stale(_))));
+    }
+
+    #[tokio::test]
+    async fn a_public_or_tailscale_address_in_the_stored_list_is_never_a_lan_candidate() {
+        let mut known = Known::parse(
+            r#"{"t25-evil":{"pk":"01","lan":"192.168.1.112:21118","tailscale":"","addrs":[
+              {"ip":"8.8.8.8","link":"wired","mbps":100000},{"ip":"100.100.1.1","link":"wired","mbps":100000},
+              {"ip":"192.168.1.79","link":"wifi","mbps":0}]}}"#,
+        );
+        let plan = plan_for_recent("t25-evil", "", &known, 1_000).await.unwrap();
+        assert_eq!((plan.direct, plan.others.clone()), (sa(WIRED), vec![sa(WIFI)]));
+        known.set_addresses("t25-evil", &[Address { ip: "1.1.1.1".parse().unwrap(), link: LinkKind::Wired, mbps: 9 }]);
+        assert!(!known.to_json().contains("1.1.1.1"), "not stored either");
+    }
+
+    #[test]
+    fn known_keeps_every_address_and_old_entries_still_read() {
+        let known = tori_known();
+        let back = Known::parse(&known.to_json());
+        assert_eq!(back, known);
+        assert_eq!(back.addresses("t25-tori").len(), 2);
+        // An entry saved before t25.
+        let old = Known::parse(r#"{"7":{"pk":"ab","lan":"10.0.0.7:21118","tailscale":""}}"#);
+        assert_eq!(old.addresses("7"), vec![Address { ip: "10.0.0.7".parse().unwrap(), link: LinkKind::Other, mbps: 0 }]);
+        // And what an old build's reader needs is still where it looks.
+        let v: serde_json::Value = serde_json::from_str(&known.to_json()).unwrap();
+        assert_eq!(v["t25-tori"]["lan"], WIFI);
+    }
+
+    #[test]
+    fn an_address_belongs_to_whoever_advertised_it_last() {
+        let mut known = tori_known();
+        known.record(&Verified { id: "machine-b".into(), sign_pk: vec![2; 32], tailscale: None }, sa("192.168.1.200:21118"));
+        known.set_addresses("machine-b", &[Address { ip: sa(WIRED).ip(), link: LinkKind::Wired, mbps: 1000 }]);
+        assert_eq!(known.owner_of(sa(WIRED).ip()).as_deref(), Some("machine-b"));
+        assert_eq!(known.addresses("t25-tori").len(), 1);
+    }
+
+    #[test]
+    fn reconnecting_after_an_unplug_remembers_where_it_answered() {
+        let mut known = tori_known();
+        known.record(&Verified { id: "t25-tori".into(), sign_pk: vec![1; 32], tailscale: None }, sa(WIRED));
+        known.record(&Verified { id: "t25-tori".into(), sign_pk: vec![1; 32], tailscale: None }, sa(WIFI));
+        assert_eq!(known.addresses("t25-tori").len(), 2, "the wire comes back first when it is plugged in again");
+        assert!(known.pin_ok(sa(WIFI), "t25-tori", &[1; 32]));
+    }
+
+    #[test]
+    fn the_badge_type_names_the_slower_end() {
+        let on = |link| Route { path: Path::Local, link }.stream_type();
+        assert_eq!(on(LinkKind::Wired), "LocalWired");
+        assert_eq!(on(LinkKind::WiFi), "LocalWiFi");
+        assert_eq!(on(LinkKind::Other), "Local", "an old peer: same badge as today");
+        assert_eq!(Route { path: Path::ViaInternet, link: LinkKind::Wired }.stream_type(), "Tailscale");
+    }
+
+    /// A Target on a real socket: accepts one connection and runs the Direct Link.
+    async fn listening_target(id: &'static str, pk: sign::PublicKey, sk: sign::SecretKey) -> SocketAddr {
+        let l = hbb_common::tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let s = target(Stream::from(s, addr), sk, pk, id).await;
+            std::future::pending::<()>().await;
+            drop(s);
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn real_sockets_a_dead_wire_falls_through_and_the_session_is_encrypted_and_pinned() {
+        // Nothing listens at the first port (bound, then dropped: refused straight away).
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (pk, sk) = sign::gen_keypair();
+        let live = listening_target("t25-real", pk, sk).await;
+        let mut known = Known::default();
+        known.record(&Verified { id: "t25-real".into(), sign_pk: pk.0.to_vec(), tailscale: None }, dead);
+        let plan = Plan { direct: dead, others: vec![live], tailscale: None, target: Some("t25-real".into()), dialled: None };
+        let (mut stream, addr) = race(
+            plan,
+            500,
+            2_000,
+            |a| async move { connect_from(a, None, 500).await },
+            |mut s, a| {
+                let known = &known;
+                async move {
+                    let who = secure(&mut s, known, a, 2_000).await?;
+                    Ok::<_, Failure>((s, who))
+                }
+            },
+        )
+        .await
+        .map(|((s, who), a)| {
+            assert_eq!(who.id, "t25-real");
+            (s, a)
+        })
+        .map_err(|e| e.to_string())
+        .unwrap();
+        assert_eq!(addr, live);
+        assert!(stream.is_secured());
+        let mut hello = Message::new();
+        hello.set_signed_id(crate::message_proto::SignedId { id: b"hello".to_vec().into(), ..Default::default() });
+        stream.send(&hello).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_sockets_the_chosen_way_out_is_the_one_used_and_a_dead_one_is_not_fatal() {
+        let l = hbb_common::tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { loop { let _ = l.accept().await; } });
+        let s = connect_from(addr, Some("127.0.0.1".parse().unwrap()), 500).await.unwrap();
+        assert_eq!(s.local_addr().ip().to_string(), "127.0.0.1");
+        // A source address this computer no longer has (the wire was just pulled).
+        let s = connect_from(addr, Some("192.0.2.1".parse().unwrap()), 500).await.expect("falls back to the routed way");
+        assert_eq!(s.local_addr().ip().to_string(), "127.0.0.1");
     }
 }

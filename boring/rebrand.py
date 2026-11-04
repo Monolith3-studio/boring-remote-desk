@@ -981,6 +981,62 @@ PATCHES += [
     ("src/lan.rs", T21_SEND_OLD, T21_SEND, "discovery asks known computers directly, skips unusable interfaces (t21)"),
 ]
 
+# --- Every LAN address, fastest first (v1.7 ticket 25) -------------------------------
+# A computer with Ethernet and Wi-Fi on one network answered discovery from whichever its routing
+# picked, so Home listed Tori's Wi-Fi .79 and sessions crawled over it. The pong now lists every LAN
+# address with link type and speed in PeerDiscovery.misc (upstream never fills it, so the protocol
+# files stay upstream's; an old peer sends none, an old Controller ignores it). The logic and the
+# public-address filter live in base::lan; these wire the interface list in and out.
+T25_NICS = (
+    "/// boring-remote (v1.7 t25): this computer's IPv4 addresses with link type and speed, for base::lan.\n"
+    "fn boring_nics() -> Vec<base::lan::Nic> {\n"
+    "    #[cfg(target_os = \"ios\")]\n"
+    "    let nics = Vec::new();\n"
+    "    #[cfg(not(target_os = \"ios\"))]\n"
+    "    let nics = default_net::get_interfaces()\n"
+    "        .into_iter()\n"
+    "        .flat_map(|i| {\n"
+    "            use default_net::interface::InterfaceType as T;\n"
+    "            let link = match i.if_type {\n"
+    "                T::Wireless80211 => base::lan::LinkKind::WiFi,\n"
+    "                T::Ethernet | T::Ethernet3Megabit | T::FastEthernetT | T::FastEthernetFx | T::GigabitEthernet => {\n"
+    "                    base::lan::LinkKind::Wired\n"
+    "                }\n"
+    "                _ => base::lan::LinkKind::Other,\n"
+    "            };\n"
+    "            let label = format!(\"{} {}\", i.friendly_name.unwrap_or_default(), i.description.unwrap_or_default());\n"
+    "            let mbps = base::lan::mbps_from_bps(i.transmit_speed);\n"
+    "            let name = i.name;\n"
+    "            i.ipv4.into_iter().map(move |n| base::lan::Nic {\n"
+    "                name: name.clone(),\n"
+    "                label: label.clone(),\n"
+    "                ip: n.addr,\n"
+    "                prefix: n.prefix_len,\n"
+    "                link,\n"
+    "                mbps,\n"
+    "            })\n"
+    "        })\n"
+    "        .collect();\n"
+    "    base::lan::with_live_media(nics)\n"
+    "}\n\n")
+T25_PONG_OLD = "                                    platform: whoami::platform().to_string(),\n"
+T25_PONG = T25_PONG_OLD + "                                    misc: base::lan::advert(&boring_nics()), // v1.7 t25: every LAN address\n"
+T25_STORE_OLD = ("                                    ip_mac: HashMap::from([\n"
+                 "                                        (addr.ip().to_string(), p.mac.clone(),)\n"
+                 "                                    ]),\n")
+T25_STORE = ("                                    // boring-remote (v1.7 t25): where it answered from, and every address it listed.\n"
+             "                                    ip_mac: base::lan::pong_addresses(&p.id, addr.ip(), &p.mac, &p.misc),\n")
+T25_LOCAL_OLD = "    log::info!(\"discover ping sent\");\n"
+T25_LOCAL = "    base::lan::set_local_nics(boring_nics()); // v1.7 t25: Home ranks and connect dials from these\n" + T25_LOCAL_OLD
+PATCHES += [
+    ("src/lan.rs", "#[inline]\nfn get_broadcast_port() -> u16 {\n", T25_NICS + "#[inline]\nfn get_broadcast_port() -> u16 {\n",
+     "this computer's addresses with link type and speed (t25)"),
+    ("src/lan.rs", T25_PONG_OLD, T25_PONG, "the pong lists every LAN address (t25)"),
+    ("src/lan.rs", T25_STORE_OLD, T25_STORE, "discovery keeps every address a pong listed (t25)"),
+    ("src/lan.rs", T25_LOCAL_OLD, T25_LOCAL, "discovery notes this computer's own addresses (t25)"),
+    ("src/lan.rs", "    collections::{HashMap, HashSet},\n", "    collections::HashSet,\n", "the store line no longer builds a HashMap here (t25)"),
+]
+
 # --- Mac Home (v1.7 ticket 01) ----------------------------------------------------
 # The kit (desktop/kit/kit.dart) and Mac Home (desktop/kit/mac_home.dart) are ours and
 # bridge-free; these wire them to bind. Mac only: other platforms keep the old home for now.

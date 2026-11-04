@@ -1036,6 +1036,40 @@ def lan_both_ways_checks(c):
            not missing, "; ".join(missing))
 
 
+FASTEST_LAN = "every LAN address carried in the pong, public ones dropped, fastest dialled first, dead ones fall through (t25)"
+
+
+def fastest_lan_checks(c):
+    """v1.7 ticket 25: the pong lists every LAN address in `misc`, the Controller stores and ranks
+    them, a dead one falls through to the next. Never a public address (ADR 0003), and every dial
+    is still the encrypted, pinned handshake."""
+    lan, base, link = c.read("src/lan.rs"), c.read("libs/base/src/lan.rs"), c.read(DIRECT_LINK)
+    why = [n.strip().splitlines()[0] for n in (rebrand.T25_NICS, rebrand.T25_PONG, rebrand.T25_STORE, rebrand.T25_LOCAL)
+           if n not in lan]
+    is_lan = fn_body(base, "pub fn is_lan(ip: IpAddr) -> bool {") or ""
+    if "is_allowed(ip) && !crate::direct_link::is_tailscale(ip)" not in is_lan:
+        why.append("is_lan lets through more than private LAN (ADR 0003)")
+    if ".filter(|a| is_lan(a.ip))" not in (fn_body(base, "pub fn lenient(") or ""):
+        why.append("an address from a pong is not checked before it is kept")
+    if "crate::lan::is_lan(ip) && !mine && !dial.contains(&addr)" not in (fn_body(link, "fn widen(") or ""):
+        why.append("a candidate address is dialled without the private-LAN check")
+    if "crate::lan::is_lan(a.ip)" not in (fn_body(link, "pub fn set_addresses(") or ""):
+        why.append("Known stores an address without the private-LAN check")
+    dial = fn_body(link, "async fn dial(") or ""
+    if "judge(strict, addr, handshake(stream, addr, known, HANDSHAKE_TIMEOUT_MS).await)" not in dial:
+        why.append("a dial skips the encrypted, pinned handshake")
+    race_body = fn_body(link, "pub async fn race<") or ""
+    if "std::iter::once(plan.direct).chain(plan.others).chain(tailscale)" not in race_body:
+        why.append("race no longer tries every address before Tailscale")
+    if "(t.lan != at && t.tailscale != at)" not in (fn_body(link, "pub fn pin_ok(") or "") or "t.addrs" in (fn_body(link, "pub fn pin_ok(") or ""):
+        why.append("a listed address became a pin: a spoofed pong could lock a Target out")
+    badge = c.read("flutter/lib/desktop/kit/session_toolbar.dart")
+    for word in ("'Local · wired'", "'Local · Wi-Fi'", "'LocalWired' => LinkState.localWired,", "'LocalWiFi' => LinkState.localWiFi,"):
+        if word not in badge:
+            why.append(f"badge: {word}")
+    c.fact(FASTEST_LAN, not why, "; ".join(why))
+
+
 # A word for this machine (KitWords, or a literal Mac) right after a word that points at the other end.
 OTHER_END_MAC = re.compile(r"\b(?:that|other|another|both|from one|a|an|these)\s+"
                            r"(?:\$\{KitWords\.(?:one|many)\}|\$one|\$many|Macs?\b)", re.I)
@@ -1131,7 +1165,7 @@ def home_checks(c):
            "            // v1.7 review: a hand pick replaces High Efficiency, so the badge goes back to Local.\n" \
            "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));"
     why = [] if pick in bar else ["toolbar's quality pick does not drop High Efficiency"]
-    if not st or f"streamType == '{st.group(1)}' ? 'Local' : streamType;" not in c.read(T07_KIT):
+    if not st or f"'{st.group(1)}' => 'Local'," not in c.read(T07_KIT):
         why.append("session_toolbar.dart does not map Rust's High Efficiency stream type back to Local")
     c.fact("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)",
            not why, "; ".join(why))
@@ -1607,6 +1641,7 @@ def run_checks(root):
     rust_hook_checks(c)  # v1.7 t02-t05
     support_checks(c)  # v1.7 t20
     lan_both_ways_checks(c)  # v1.7 t21
+    fastest_lan_checks(c)  # v1.7 t25
     target_word_checks(c)  # v1.7 t26
     home_checks(c)  # v1.7 review: Home, Settings, copy
     ft = rebrand.FILE_MGR  # v1.7 t08
