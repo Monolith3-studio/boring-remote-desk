@@ -545,6 +545,49 @@ class RebrandSeam(unittest.TestCase):
         self.edit("libs/base/src/direct_link.rs", rebrand.NOT_ON_NETWORK, "failed to connect")
         self.assert_check_fails(CONNECT_TAILNET)
 
+    # v1.7 t25: every LAN address, fastest first
+    def test_fastest_lan_passes_on_a_clean_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {check.FASTEST_LAN}", run(CHECK, self.root).stdout)
+
+    def test_pong_without_the_address_list_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T25_PONG, rebrand.T25_PONG_OLD)
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_pong_addresses_not_kept_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T25_STORE, rebrand.T25_STORE_OLD)
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_public_address_from_a_pong_fails_check(self):  # ADR 0003
+        self.rebrand()
+        self.edit("libs/base/src/lan.rs", "        .filter(|a| is_lan(a.ip))\n", "")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_public_address_as_a_candidate_fails_check(self):  # ADR 0003
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "if crate::lan::is_lan(ip) && !mine && !dial.contains(&addr) {",
+                  "if !mine && !dial.contains(&addr) {")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_is_lan_widened_to_public_fails_check(self):  # ADR 0003
+        self.rebrand()
+        self.edit("libs/base/src/lan.rs", "is_allowed(ip) && !crate::direct_link::is_tailscale(ip)", "true")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_dial_skipping_the_handshake_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "judge(strict, addr, handshake(stream, addr, known, HANDSHAKE_TIMEOUT_MS).await)",
+                  "judge(strict, addr, Ok((stream, None)))")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_race_stopping_at_the_first_address_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "std::iter::once(plan.direct).chain(plan.others).chain(tailscale)",
+                  "std::iter::once(plan.direct).chain(tailscale)")
+        self.assert_check_fails(check.FASTEST_LAN)
+
     def test_fallback_past_a_refusal_fails_check(self):
         self.rebrand()
         self.edit("libs/base/src/direct_link.rs", "Err(Failure::Refused(e)) => return Err(e),",

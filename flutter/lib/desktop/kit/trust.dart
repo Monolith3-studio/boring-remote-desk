@@ -122,7 +122,7 @@ List<KnownMac> parseKnown(String json) {
 
 /// boring-remote (v1.7 t26): who a recent on Home is. A Known entry's pinned key (its Target ID
 /// when it has none) under the Target ID and each address it last answered on, no port. An address
-/// with no entry here is one nothing is pinned for now (Known keeps only the latest LAN address).
+/// with no entry here is one nothing is stored for now (Known keeps what it last listed).
 Map<String, String> identitiesFromKnown(String json) {
   final who = <String, String>{};
   try {
@@ -136,6 +136,14 @@ Map<String, String> identitiesFromKnown(String json) {
       for (final at in [t['lan'], t['tailscale']]) {
         final host = _host('${at ?? ''}');
         if (host.isNotEmpty) who[host] = key;
+      }
+      // boring-remote (v1.7 t25): every LAN address it listed is the same machine.
+      final addrs = t['addrs'];
+      if (addrs is List) {
+        for (final a in addrs) {
+          final ip = a is Map ? '${a['ip'] ?? ''}' : '';
+          if (ip.isNotEmpty) who[ip] = key;
+        }
       }
     }
   } catch (_) {}

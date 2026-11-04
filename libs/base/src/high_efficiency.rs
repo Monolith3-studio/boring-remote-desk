@@ -1,6 +1,7 @@
 //! High Efficiency (v1.7 ticket 05, ADR 0006).
 
 use crate::direct_link::Path;
+use crate::lan::LinkKind;
 use std::convert::TryFrom;
 use crate::message_proto::supported_decoding::PreferCodec;
 use crate::message_proto::{ImageQuality, Message, Misc, OptionMessage, PeerInfo, SupportedDecoding};
@@ -73,6 +74,9 @@ pub const FPS: i32 = 60;
 /// The `stream_type` the Controller re-reports once the Target answered the ask, so the Link Badge
 /// reads "Local · High Efficiency" only when it was actually applied (Flutter `linkStateFor`).
 pub const STREAM_TYPE: &str = "LocalHighEfficiency";
+/// boring-remote (v1.7 t25): the same, on a link whose type both ends know.
+pub const STREAM_TYPE_WIRED: &str = "LocalWiredHighEfficiency";
+pub const STREAM_TYPE_WIFI: &str = "LocalWiFiHighEfficiency";
 
 impl Settings {
     /// The one mid-session option message carrying these settings. Session only: nothing is
@@ -98,6 +102,7 @@ impl Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
     pub path: Path,
+    pub kind: LinkKind,
     pub secured: bool,
     pub direct: bool,
     asked: bool,
@@ -105,8 +110,23 @@ pub struct Link {
 
 impl Link {
     pub fn new(stream_type: &str, secured: bool, direct: bool) -> Self {
-        let path = if stream_type == Path::Local.stream_type() { Path::Local } else { Path::ViaInternet };
-        Link { path, secured, direct, asked: false }
+        // boring-remote (v1.7 t25): "Local", "LocalWired", "LocalWiFi" are all this network.
+        let path = if stream_type.starts_with(Path::Local.stream_type()) { Path::Local } else { Path::ViaInternet };
+        let kind = match stream_type {
+            "LocalWired" => LinkKind::Wired,
+            "LocalWiFi" => LinkKind::WiFi,
+            _ => LinkKind::Other,
+        };
+        Link { path, kind, secured, direct, asked: false }
+    }
+
+    /// What to re-report once the Target answered: High Efficiency, keeping the link type on the badge.
+    pub fn answered_stream_type(&self) -> &'static str {
+        match self.kind {
+            LinkKind::Wired => STREAM_TYPE_WIRED,
+            LinkKind::WiFi => STREAM_TYPE_WIFI,
+            LinkKind::Other => STREAM_TYPE,
+        }
     }
 
     /// The first PeerInfo of the round: the High Efficiency ask to send, once, if [`choose`] says
@@ -341,5 +361,20 @@ mod tests {
         let ask = choose(Path::Local, &boring_peer(true), &decodes(true)).unwrap().message(decodes(true));
         let answer = ack_for(&option(&ask)).unwrap();
         assert!(!link.answered(&option(&answer)));
+    }
+
+    // --- v1.7 t25: the link type stays on the badge ---
+    #[test]
+    fn a_wired_or_wifi_local_link_still_asks_and_keeps_its_link_type() {
+        for (stream_type, after) in [
+            ("Local", "LocalHighEfficiency"),
+            ("LocalWired", "LocalWiredHighEfficiency"),
+            ("LocalWiFi", "LocalWiFiHighEfficiency"),
+        ] {
+            let mut link = Link::new(stream_type, true, false);
+            assert!(link.ask(&boring_peer(true), decodes(true)).is_some(), "{}", stream_type);
+            assert_eq!(link.answered_stream_type(), after);
+        }
+        assert!(Link::new("Tailscale", true, false).ask(&boring_peer(true), decodes(true)).is_none());
     }
 }

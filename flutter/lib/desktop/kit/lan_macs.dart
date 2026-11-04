@@ -7,7 +7,10 @@ import 'kit.dart';
 class LanMac {
   final String name;
   final String ip;
-  const LanMac({required this.name, required this.ip});
+
+  /// boring-remote (v1.7 t25): its Target ID. The same computer stays one row when its best address changes.
+  final String id;
+  const LanMac({required this.name, required this.ip, this.id = ''});
 }
 
 /// Reads the `load_lan_peers` JSON (get_lan_peers in src/ui_interface.rs).
@@ -21,6 +24,7 @@ List<LanMac> lanMacsFromJson(String json) {
           LanMac(
             name: (p['hostname'] ?? '').toString().isNotEmpty ? p['hostname'].toString() : KitWords.unnamed,
             ip: p['ip'].toString(),
+            id: (p['id'] ?? '').toString(),
           ),
     ];
   } catch (_) {
@@ -28,7 +32,7 @@ List<LanMac> lanMacsFromJson(String json) {
   }
 }
 
-/// When a listed Mac last answered. Keyed by IP in [keepRecentLanMacs]'s memory.
+/// When a listed Mac last answered. Keyed by Target ID, else IP, in [keepRecentLanMacs]'s memory.
 typedef LanSeen = ({LanMac mac, DateTime at});
 
 /// One LAN Discovery round can miss a reply; without this the row blinks out under the cursor.
@@ -36,7 +40,7 @@ typedef LanSeen = ({LanMac mac, DateTime at});
 List<LanMac> keepRecentLanMacs(Map<String, LanSeen> memory, List<LanMac> fresh, DateTime now,
     {Duration grace = const Duration(seconds: 20)}) {
   for (final m in fresh) {
-    memory[m.ip] = (mac: m, at: now);
+    memory[m.id.isNotEmpty ? m.id : m.ip] = (mac: m, at: now);
   }
   memory.removeWhere((_, s) => now.difference(s.at) > grace);
   return [for (final s in memory.values) s.mac];
