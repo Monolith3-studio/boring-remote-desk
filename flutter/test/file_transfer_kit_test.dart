@@ -57,9 +57,9 @@ void main() {
 
     test('a delete job says what it deletes and where, in plain words', () {
       // The engine marks a delete on the other side with remoteToLocal (its isRemote).
-      expect(job('none', delete: true, remoteToLocal: true).status, 'Deleting from that Mac…');
+      expect(job('none', delete: true, remoteToLocal: true).status, 'Deleting from that computer…');
       expect(job('none', delete: true).status, 'Deleting from this Mac…');
-      expect(job('done', delete: true, remoteToLocal: true).status, 'Deleted from that Mac');
+      expect(job('done', delete: true, remoteToLocal: true).status, 'Deleted from that computer');
       expect(job('done', delete: true, remoteToLocal: true).phase, TransferPhase.done);
       expect(job('error', delete: true, err: 'Access denied').status, "Didn't delete: Access denied");
       expect(job('done', delete: true, err: 'cancel').status, 'Cancelled');
@@ -109,10 +109,10 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('panes are named This Mac and That Mac', (tester) async {
+    testWidgets('panes are named This Mac and That computer', (tester) async {
       await tester.pumpWidget(board(got: []));
       expect(find.text('This Mac'), findsOneWidget);
-      expect(find.text('That Mac'), findsOneWidget);
+      expect(find.text('That computer'), findsOneWidget);
     });
 
     testWidgets('this Mac to that Mac', (tester) async {
@@ -154,7 +154,7 @@ void main() {
 
     testWidgets('nothing yet: says how to send', (tester) async {
       await tester.pumpWidget(list(const []));
-      expect(find.text('Drag files from one Mac to the other.'), findsOneWidget);
+      expect(find.text('Drag files from one computer to the other.'), findsOneWidget);
     });
 
     testWidgets('sending shows a progress bar and Stop', (tester) async {
@@ -187,7 +187,7 @@ void main() {
       final got = <int>[];
       await tester.pumpWidget(list([job('none', delete: true, remoteToLocal: true)], onCancel: got.add));
       expect(find.text('cut.mov'), findsOneWidget);
-      expect(find.text('Deleting from that Mac…'), findsOneWidget);
+      expect(find.text('Deleting from that computer…'), findsOneWidget);
       expect(find.byIcon(Icons.delete_outline), findsOneWidget);
       expect(find.byType(LinearProgressIndicator), findsNothing);
       await tester.tap(find.byTooltip('Stop'));

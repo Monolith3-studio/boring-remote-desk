@@ -37,7 +37,7 @@ void main() {
   test('connection errors read as plain words with one next step', () {
     final timeout = kitMessageWords('error', 'Connection Error', 'Timeout')!;
     expect(timeout.title, "Couldn't connect");
-    expect(timeout.body, "That Mac didn't answer in time.");
+    expect(timeout.body, "That computer didn't answer in time.");
     expect(timeout.next, contains('then try again'));
 
     final unknown = kitMessageWords('error', 'Connection Error', 'os error 61')!;
@@ -46,7 +46,7 @@ void main() {
 
     final waiting = kitMessageWords('wait-remote-accept-nook', 'Prompt',
         'Please wait for the remote side to accept your session request...')!;
-    expect(waiting.body, 'Someone at that Mac needs to click Allow.');
+    expect(waiting.body, 'Someone at that computer needs to click Allow.');
     expect(kitMessageWaits('wait-remote-accept-nook', ''), isTrue);
 
     expect(kitMessageWords('info', 'Prompt', 'no_audio_input_device_tip'), isNull);
@@ -54,7 +54,7 @@ void main() {
 
   test("Direct Link's own errors keep their words and their one next step", () {
     const notReached =
-        "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again.";
+        "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again.";
     final w = kitMessageWords('error', 'Connection Error', notReached)!;
     expect(w.title, "Couldn't connect");
     expect(w.body, isNull, reason: 'the Rust text is shown as it is');
@@ -70,9 +70,9 @@ void main() {
 
   testWidgets('a message shows its title, body and next step, no icon', (tester) async {
     await tester.pumpWidget(host(const KitMessage(
-        title: "Couldn't connect", body: "That Mac didn't answer in time.", next: 'Try again.')));
+        title: "Couldn't connect", body: "That computer didn't answer in time.", next: 'Try again.')));
     expect(find.text("Couldn't connect"), findsOneWidget);
-    expect(find.text("That Mac didn't answer in time."), findsOneWidget);
+    expect(find.text("That computer didn't answer in time."), findsOneWidget);
     expect(find.text('Try again.'), findsOneWidget);
     expect(find.byType(Icon), findsNothing);
   });

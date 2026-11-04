@@ -10,7 +10,41 @@ import 'lan_macs.dart';
 class MacEntry {
   final String name;
   final String target;
-  const MacEntry({required this.name, required this.target});
+
+  /// The Target's pinned trust key when it has one (trust.dart [identitiesFromKnown]), else ''.
+  final String identity;
+  const MacEntry({required this.name, required this.target, this.identity = ''});
+}
+
+/// boring-remote (v1.7 t26): "Used before" shows each machine once. A session's PeerConfig is saved
+/// under the address dialled, so one machine has one entry per name, Wi-Fi IP, wired IP and
+/// Tailscale IP. [newestFirst] is in recents order, so the first entry seen is the newest address.
+/// Same trust key = same machine; an entry with no key joins the machine of that display name; a
+/// nameless one with no key stays apart, since nothing says it is the same machine. Different keys
+/// under one name are two machines. This only narrows what Home shows: nothing leaves disk, and any
+/// older address still connects when typed.
+List<MacEntry> oneEntryPerMachine(List<MacEntry> newestFirst) {
+  final kept = <MacEntry>[];
+  final keys = <String>[]; // the trust key each kept row stands for, '' while it has none
+  String named(MacEntry e) => e.name.trim().toLowerCase();
+  for (final e in newestFirst) {
+    final sameName = e.name == KitWords.unnamed
+        ? const <int>[]
+        : [for (var i = 0; i < kept.length; i++) if (named(kept[i]) == named(e)) i];
+    if (e.identity.isEmpty) {
+      if (sameName.isNotEmpty) continue;
+    } else {
+      if (keys.contains(e.identity)) continue;
+      final noKey = sameName.where((i) => keys[i].isEmpty);
+      if (noKey.isNotEmpty) {
+        keys[noKey.first] = e.identity; // the newer row of this name is this machine
+        continue;
+      }
+    }
+    kept.add(e);
+    keys.add(e.identity);
+  }
+  return kept;
 }
 
 /// Mac Home (v1.7): one Address box and the Macs list. Bridge-free; the home page passes data and callbacks.
@@ -19,8 +53,8 @@ class MacHome extends StatefulWidget {
 
   /// What Home says while no other Boring Remote has answered on this network (ticket 21).
   static List<String> emptyLines() => [
-        'No other ${KitWords.many} found on this network yet.',
-        '1. Open Boring Remote on the other ${KitWords.one} and finish its Setup.',
+        'No other computers found on this network yet.',
+        '1. Open Boring Remote on the other computer and finish its Setup.',
         '2. Check both are on the same Wi-Fi or network.',
         "It shows up here by itself within a few seconds.",
       ];
@@ -103,21 +137,21 @@ class _MacHomeState extends State<MacHome> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           ...widget.notices,
-          Text('Connect to a ${KitWords.one}', style: Theme.of(context).textTheme.headlineSmall),
+          Text('Connect to a computer', style: Theme.of(context).textTheme.headlineSmall),
           const SizedBox(height: Kit.s4),
           TextField(
             key: MacHome.addressKey,
             controller: _address,
             autofocus: true,
             decoration: InputDecoration(
-              hintText: "Type a ${KitWords.one}'s name",
+              hintText: "Type a computer's name",
               prefixIcon: const Icon(Icons.search, color: Kit.muted),
             ),
             onChanged: (_) => setState(() {}),
             onSubmitted: _submit,
           ),
           const SizedBox(height: Kit.s5),
-          Text(KitWords.cap(KitWords.many), style: Theme.of(context).textTheme.bodySmall),
+          Text('Computers', style: Theme.of(context).textTheme.bodySmall),
           const SizedBox(height: Kit.s2),
           Expanded(
             child: ListView(
@@ -196,7 +230,7 @@ class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
-    final one = KitWords.one, many = KitWords.many;
+    final one = KitWords.one; // this machine; the other end is a computer (t26)
     return SingleChildScrollView(
       padding: const EdgeInsets.all(Kit.s6),
       child: FutureBuilder<String?>(
@@ -212,7 +246,7 @@ class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
               if (snap.connectionState != ConnectionState.done)
                 Text('Checking…', style: t.bodySmall)
               else if (address != null) ...[
-                Text('From another network, type this on the other $one:'),
+                Text('From another network, type this on the other computer:'),
                 const SizedBox(height: Kit.s3),
                 Row(children: [
                   Flexible(child: SelectableText(address, style: t.headlineSmall)),
@@ -226,18 +260,18 @@ class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
                   ),
                 ]),
                 const SizedBox(height: Kit.s3),
-                Text('It works while Tailscale is open on both $many. '
+                Text('It works while Tailscale is open on both computers. '
                     'Tailscale is a free app that links your computers over the internet.',
                     style: t.bodySmall),
               ] else ...[
-                Text('To reach this $one from another network, both $many need Tailscale. '
+                Text('To reach this $one from another network, both computers need Tailscale. '
                     'Tailscale is a free app that links your computers over the internet.'),
                 const SizedBox(height: Kit.s3),
                 Text('1. Get Tailscale from tailscale.com. Install it on this $one and on the other one.'),
                 const SizedBox(height: Kit.s2),
                 Text('2. Open Tailscale on both and sign in with the same account.'),
                 const SizedBox(height: Kit.s2),
-                Text("3. Click Check again. You'll see what to type on the other $one."),
+                Text("3. Click Check again. You'll see what to type on the other computer."),
                 const SizedBox(height: Kit.s3),
                 OutlinedButton(
                   onPressed: () => setState(() {

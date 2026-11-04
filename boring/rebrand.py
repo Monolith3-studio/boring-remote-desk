@@ -40,27 +40,20 @@ PRIVATE_LAN = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7,fe80::/10"
 WHITELIST = f"{TAILNET},{PRIVATE_LAN}"
 
 # What the connect box says (v1.7 t03, ADRs 0004/0005), in plain words with one next step. The
-# text lives in libs/base/src/direct_link.rs, once per platform: the Mac build says "Mac", the
-# Windows build "computer" (as the kit's KitWords do). These are the translation keys
-# (src/lang/*.rs, English everywhere) and what check.py compares the Rust constants with.
-NOT_FOUND = "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again."
-NOT_ON_NETWORK = "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again."
-PLAINTEXT_REFUSED = "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again."
-IDENTITY_CHANGED = ("This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was "
+# text lives in libs/base/src/direct_link.rs. boring-remote (v1.7 t26): the Target can be a Mac or a
+# PC, so "computer" on both builds. These are the translation keys (src/lang/*.rs, English
+# everywhere) and what check.py compares the Rust constants with.
+NOT_FOUND = "Couldn't find a computer with that name. Pick it from the list, or check the spelling and try again."
+NOT_ON_NETWORK = "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again."
+PLAINTEXT_REFUSED = "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again."
+IDENTITY_CHANGED = ("This isn't the computer you connected to before, so Boring Remote stopped. If that computer was "
                     "reinstalled, open Settings, click Trusted list, click Forget next to it, "
                     "then try again.")
-NO_ADDRESS = ("Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, "
+NO_ADDRESS = ("Boring Remote doesn't know where that computer is yet. Type its name or address in the box, "
               "then try again.")
 CONNECT_ERRORS = {"NOT_FOUND": NOT_FOUND, "NOT_ON_THIS_NETWORK": NOT_ON_NETWORK, "NO_ADDRESS": NO_ADDRESS,
                   "PLAINTEXT_REFUSED": PLAINTEXT_REFUSED, "IDENTITY_CHANGED": IDENTITY_CHANGED}
-
-
-def on_windows(text):
-    """The Windows build's wording of a buyer-facing line: computer, not Mac (KitWords)."""
-    return text.replace("Macs", "computers").replace("Mac", "computer")
-
-
-CONNECT_ERROR_KEYS = [t for v in CONNECT_ERRORS.values() for t in (v, on_windows(v))]
+CONNECT_ERROR_KEYS = list(CONNECT_ERRORS.values())
 
 # Replaces _start's IP and domain:port branches in src/client.rs. check.py looks for
 # exactly this block and that nothing before it reaches the ID/rendezvous path.
@@ -999,7 +992,13 @@ MAC_HOME_METHOD = (
     "    final recents = gFFI.recentPeersModel;\n"
     "    String name(Peer p) => p.alias.isNotEmpty\n"
     "        ? p.alias\n"
-    "        : (p.hostname.isNotEmpty ? p.hostname : 'Unnamed Mac');\n"
+    "        : (p.hostname.isNotEmpty ? p.hostname : KitWords.unnamed);\n"
+    "    // boring-remote (v1.7 t26): each machine once, newest address. Home's view only: nothing leaves disk.\n"
+    "    List<MacEntry> usedBefore() {\n"
+    "      final who = identitiesFromKnown(bind.mainGetLocalOption(key: kDirectLinkKnownOption));\n"
+    "      return oneEntryPerMachine(\n"
+    "          [for (final p in recents.peers) MacEntry(name: name(p), target: p.id, identity: who[p.id] ?? '')]);\n"
+    "    }\n"
     "    return Theme(\n"
     "      data: Kit.theme(),\n"
     "      child: Material(\n"
@@ -1007,7 +1006,7 @@ MAC_HOME_METHOD = (
     "        child: ListenableBuilder(\n"
     "          listenable: Listenable.merge([recents, lanMacs]),\n"
     "          builder: (context, _) => MacHome(\n"
-    "            macs: [for (final p in recents.peers) MacEntry(name: name(p), target: p.id)],\n"
+    "            macs: usedBefore(),\n"
     "            tailscaleAddress: thisTailscaleAddress,\n"
     "            lan: lanMacs.macs,\n"
     "            discover: () => bind.mainDiscover(),\n"
@@ -1028,6 +1027,7 @@ PATCHES += [
      "import 'package:flutter_hbb/desktop/kit/lan_macs_model.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/tailscale.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/trust.dart';\n"
      "import 'package:flutter_hbb/models/peer_model.dart';\n",
      "Mac Home imports"),
     (HOME, "    super.build(context);\n",
@@ -1895,7 +1895,7 @@ PATCHES += [
 # a second rebrand still finds each block whole and stays a no-op. Setup's screen 2 on Windows is
 # "let other computers reach this one": the MSI's app rule (any port, every network type) covers
 # Direct Link 21118 and LAN Discovery 21119; Allow adds the same rule if it is missing. The kit
-# says "computer" for "Mac" on Windows (KitWords, set once in main()).
+# says "computer" for "this Mac" on Windows (KitWords, set once in main()).
 T12_GATES = [
     "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n",  # t01 Home
     "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",  # t01
@@ -1908,7 +1908,6 @@ T12_GATES = [
 ]
 T12_EDITS = [(g, g.replace("if (isMacOS)", "if (isMacOS || isWindows)", 1)
                .replace("if (isMacOS &&", "if ((isMacOS || isWindows) &&", 1)) for g in T12_GATES] + [
-    ("'Unnamed Mac'", "'Unnamed ${KitWords.one}'"),  # t01 Home
     ("  final screens = SetupFlow.screenCount(SetupPlatform.mac);\n",  # t06 Setup
      "  final platform = isWindows ? SetupPlatform.windows : SetupPlatform.mac; // v1.7 t12\n"
      "  final screens = SetupFlow.screenCount(platform);\n"),

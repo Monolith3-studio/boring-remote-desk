@@ -549,10 +549,8 @@ def connect_checks(c):
     v4, v6 = tailnet_exprs()
     why = []
     for name, text in rebrand.CONNECT_ERRORS.items():
-        texts = (text, rebrand.on_windows(text))
-        if link.count(f'pub const {name}: &str =') != 2 or any(f'"{t}"' not in link for t in texts) \
-                or f'#[cfg(target_os = "windows")]\npub const {name}: &str =' not in link:
-            why.append(f"{name} is not rebrand's text, Mac and Windows wording")
+        if link.count(f'pub const {name}: &str =') != 1 or f'"{text}"' not in link:
+            why.append(f"{name} is not rebrand's text")
     for need in ("lookup_host(host)", "_ => bail!(NOT_FOUND),",
                  "if addrs.is_empty() || !addrs.iter().all(|a| crate::lan::is_allowed(a.ip())) {\n        bail!(NOT_FOUND);"):
         if need not in plan:
@@ -567,9 +565,6 @@ def connect_checks(c):
         why.append("the ~1 s no-answer budget no longer covers the TCP connect only")
     if "let ms = if is_tailscale(addr.ip()) || addr == last { slow_ms } else { direct_ms };" not in race:
         why.append("a LAN address with no fallback after it gets the ~1 s budget, not the full one")
-    conn = fn_body(link, "pub async fn connect(") or ""
-    if conn.count("worded_for(") != 2:
-        why.append("connect errors say Mac without knowing the Target is one")
     c.fact("connect box dials only Tailscale or private-LAN addresses, else the plain error", not why, "; ".join(why))
 
     dial = strip_tests_and_comments(fn_body(link, "pub async fn handshake(") or "")
@@ -595,7 +590,7 @@ def connect_checks(c):
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [f"{p.name}: {text[:30]}" for p in langs for text in rebrand.CONNECT_ERROR_KEYS
                if p.read_text(encoding="utf-8").count(f'("{text}", ') != 1]
-    c.fact("every connect error, Mac and Windows wording, is in every translation file",
+    c.fact("every connect error is in every translation file",
            langs and not missing, ", ".join(missing[:10]))
     look = c.read("flutter/lib/desktop/kit/kit_look.dart")
     unmapped = [t[:40] for t in rebrand.CONNECT_ERROR_KEYS if f'  "{t}":\n      (_couldNot, null, null),' not in look]
@@ -1039,6 +1034,49 @@ def lan_both_ways_checks(c):
             missing.append(f"libs/base/src/lan.rs: {fn}")
     c.fact("LAN Discovery both ways: asks known computers directly, skips loopback and Tailscale (t21)",
            not missing, "; ".join(missing))
+
+
+# A word for this machine (KitWords, or a literal Mac) right after a word that points at the other end.
+OTHER_END_MAC = re.compile(r"\b(?:that|other|another|both|from one|a|an|these)\s+"
+                           r"(?:\$\{KitWords\.(?:one|many)\}|\$one|\$many|Macs?\b)", re.I)
+
+
+def target_word_checks(c):
+    """v1.7 t26: the machine at the other end can be a PC, so it is a computer on both builds; this
+    machine keeps its own word. "Used before" collapses addresses in Home's view only."""
+    kit_dir = c.root / "flutter/lib/desktop/kit"
+    hits = [f"{p.name}:{n}: {m.group(0)}" for p in sorted(kit_dir.glob("*.dart"))
+            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+            if not line.lstrip().startswith("//")
+            for m in [OTHER_END_MAC.search(line)] if m]
+    home_kit, home, link = c.read("flutter/lib/desktop/kit/mac_home.dart"), c.read(rebrand.HOME), c.read(DIRECT_LINK)
+    why = [f"Mac about the other end: {h}" for h in hits[:8]]
+    for need in ("'Connect to a computer'", '"Type a computer\'s name"', "Text('Computers',",
+                 "To reach this $one from another network", "pick this $one by name"):
+        if need not in home_kit:
+            why.append(f"Home lost {need}")
+    if "'Unnamed Mac'" in home or "KitWords.unnamed" not in home:
+        why.append("an unnamed recent says Mac")
+    if "{Mac" in c.read("flutter/lib/desktop/kit/kit_look.dart"):
+        why.append("the kit's messages still follow this machine's word")
+    if "worded_for" in link or re.search(r'pub const [A-Z_]+: &str =\s*"[^"]*\bMac\b', link):
+        why.append("a connect error says Mac")
+    c.fact("the Target is a computer on both builds: Home, connect errors, other-end lines (t26)",
+           not why, "; ".join(why))
+
+    method = fn_body(home, "  Widget buildBoringHome(BuildContext context) {") or ""
+    why = []
+    for need in ("macs: usedBefore(),", "return oneEntryPerMachine(",
+                 "identitiesFromKnown(bind.mainGetLocalOption(key: kDirectLinkKnownOption))",
+                 "identity: who[p.id] ?? ''"):
+        if need not in method:
+            why.append(f"Home lost {need}")
+    if re.search(r"mainRemovePeer|mainForgetPassword|removePeer", method):
+        why.append("Home removes a stored peer")
+    if "List<MacEntry> oneEntryPerMachine(List<MacEntry> newestFirst)" not in home_kit:
+        why.append("the kit lost oneEntryPerMachine")
+    c.fact("Used before lists each machine once, newest address, nothing deleted from disk (t26)",
+           not why, "; ".join(why))
 
 
 def rust_hook_checks(c):
@@ -1569,6 +1607,7 @@ def run_checks(root):
     rust_hook_checks(c)  # v1.7 t02-t05
     support_checks(c)  # v1.7 t20
     lan_both_ways_checks(c)  # v1.7 t21
+    target_word_checks(c)  # v1.7 t26
     home_checks(c)  # v1.7 review: Home, Settings, copy
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",

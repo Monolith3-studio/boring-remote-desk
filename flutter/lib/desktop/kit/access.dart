@@ -74,7 +74,7 @@ String openAtLoginPlist(String bundleId) => '''<?xml version="1.0" encoding="UTF
 class AccessWords {
   AccessWords._();
   static String get title => 'Access';
-  static String get ready => 'Ready. Your other ${KitWords.many} can connect.';
+  static String get ready => 'Ready. Your other computers can connect.';
   static String notReady(String row) => 'Not ready: $row';
   static const fix = 'Fix';
   static const screen = 'Screen Recording';
@@ -83,12 +83,12 @@ class AccessWords {
   static const controlWhy = 'So people who connect can use the mouse and keyboard.';
   static const input = 'Input Monitoring';
   static String get inputWhy => 'So keyboard shortcuts reach this ${KitWords.one}.';
-  static String get on => 'Let your other ${KitWords.many} in';
+  static String get on => 'Let your other computers in';
   static const onWhy = 'The switch above.';
   static const running = 'Boring Remote running in the background';
-  static String get runningWhy => 'So your other ${KitWords.many} can get in with this window closed.';
+  static String get runningWhy => 'So your other computers can get in with this window closed.';
   static const listening = 'Open for connections';
-  static String get listeningWhy => 'So your other ${KitWords.many} on this network can reach this one.';
+  static String get listeningWhy => 'So your other computers on this network can reach this one.';
   static String get reach => 'Let computers on this network reach Boring Remote';
   static const reachWhy = 'Windows asks once. Click “Yes”.';
 }

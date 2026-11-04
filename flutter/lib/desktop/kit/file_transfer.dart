@@ -94,7 +94,7 @@ class TransferJob {
   }
 
   String get _deleteStatus {
-    final where = toThisMac ? 'that ${KitWords.one}' : 'this ${KitWords.one}';
+    final where = toThisMac ? 'that computer' : 'this ${KitWords.one}';
     switch (phase) {
       case TransferPhase.done:
         return 'Deleted from $where';
@@ -148,7 +148,7 @@ class TransferPane extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.fromLTRB(Kit.s5, Kit.s4, Kit.s5, 0),
               child: Text(
-                side == TransferSide.thisMac ? 'This ${KitWords.one}' : 'That ${KitWords.one}',
+                side == TransferSide.thisMac ? 'This ${KitWords.one}' : 'That computer',
                 style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     color: Kit.paper, fontWeight: FontWeight.w700),
               ),
@@ -220,7 +220,7 @@ class TransferList extends StatelessWidget {
         ? Center(
             child: Padding(
               padding: const EdgeInsets.all(Kit.s5),
-              child: Text('Drag files from one ${KitWords.one} to the other.',
+              child: Text('Drag files from one computer to the other.',
                   textAlign: TextAlign.center,
                   style: const TextStyle(color: Kit.muted, fontSize: 15)),
             ),

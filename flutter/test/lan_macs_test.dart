@@ -9,7 +9,7 @@ void main() {
   test('discovered peers arrive with hostname and IP; ones without an IP are skipped', () {
     final macs = lanMacsFromJson('[{"id":"1","hostname":"edit-bay-2","ip":"192.168.1.20"},'
         '{"id":"2","hostname":"","ip":"10.0.4.7"},{"id":"3","hostname":"public","ip":""}]');
-    expect(macs.map((m) => '${m.name} ${m.ip}'), ['edit-bay-2 192.168.1.20', 'Unnamed Mac 10.0.4.7']);
+    expect(macs.map((m) => '${m.name} ${m.ip}'), ['edit-bay-2 192.168.1.20', 'Unnamed computer 10.0.4.7']);
     expect(lanMacsFromJson(''), isEmpty);
     expect(lanMacsFromJson('not json'), isEmpty);
   });

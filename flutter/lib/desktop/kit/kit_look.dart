@@ -243,50 +243,38 @@ class KitMessageWords {
   const KitMessageWords(this.title, [this.body, this.next]);
 }
 
-String _w(String s) => s.replaceAll('{Mac}', KitWords.one).replaceAll('{Macs}', KitWords.many);
-
 const _couldNot = "Couldn't connect";
-const _checkOn = "Make sure that {Mac} is awake and Boring Remote is open on it, then try again.";
+const _checkOn = "Make sure that computer is awake and Boring Remote is open on it, then try again.";
 
 /// Keyed by the text Rust sends (src/client.rs, src/client/io_loop.rs, src/server/connection.rs,
-/// libs/base/src/direct_link.rs). "{Mac}" is KitWords.one when shown.
+/// libs/base/src/direct_link.rs). The other end is a computer on both builds (t26).
 const _byText = <String, (String, String?, String?)>{
   'Connection in progress. Please wait.': ('Connecting…', 'This takes a few seconds.', null),
   'Connected, waiting for image...': ('Connected', 'Waiting for the first picture of the screen.', null),
   'Please wait for the remote side to accept your session request...':
-      ('Waiting for Allow', 'Someone at that {Mac} needs to click Allow.', null),
+      ('Waiting for Allow', 'Someone at that computer needs to click Allow.', null),
   'Do you want to enter again?':
-      ("That password didn't work", "Type it again. It's the Unattended Password set on that {Mac}.", null),
-  'Timeout': (_couldNot, "That {Mac} didn't answer in time.", _checkOn),
-  'Remote desktop is offline': (_couldNot, 'That {Mac} is offline.', _checkOn),
-  'Offline': (_couldNot, 'That {Mac} is offline.', _checkOn),
+      ("That password didn't work", "Type it again. It's the Unattended Password set on that computer.", null),
+  'Timeout': (_couldNot, "That computer didn't answer in time.", _checkOn),
+  'Remote desktop is offline': (_couldNot, 'That computer is offline.', _checkOn),
+  'Offline': (_couldNot, 'That computer is offline.', _checkOn),
   'Reset by the peer':
-      ('Disconnected', 'That {Mac} ended the connection.', 'Connect again. If it keeps happening, restart Boring Remote on that {Mac}.'),
+      ('Disconnected', 'That computer ended the connection.', 'Connect again. If it keeps happening, restart Boring Remote on that computer.'),
   'Connection not allowed':
-      (_couldNot, "That {Mac} didn't let this one in.", 'Ask someone there to click Allow, then connect again.'),
+      (_couldNot, "That computer didn't let this one in.", 'Ask someone there to click Allow, then connect again.'),
   'Too many wrong attempts':
-      ('Too many tries', 'That {Mac} stopped taking passwords for a minute.', 'Wait a minute, then try again.'),
+      ('Too many tries', 'That computer stopped taking passwords for a minute.', 'Wait a minute, then try again.'),
   'Please try 1 minute later':
-      ('Too many tries', 'That {Mac} stopped taking passwords for a minute.', 'Wait a minute, then try again.'),
-  // Direct Link's own errors (libs/base/src/direct_link.rs, Mac and Windows wording) already say
+      ('Too many tries', 'That computer stopped taking passwords for a minute.', 'Wait a minute, then try again.'),
+  // Direct Link's own errors (libs/base/src/direct_link.rs) already say
   // what to do next: shown as they are, under a plain title. check.py keeps this list in step.
-  "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again.":
-      (_couldNot, null, null),
   "Couldn't find a computer with that name. Pick it from the list, or check the spelling and try again.":
-      (_couldNot, null, null),
-  "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again.":
       (_couldNot, null, null),
   "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again.":
       (_couldNot, null, null),
-  "Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, then try again.":
-      (_couldNot, null, null),
   "Boring Remote doesn't know where that computer is yet. Type its name or address in the box, then try again.":
       (_couldNot, null, null),
-  "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again.":
-      (_couldNot, null, null),
   "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again.":
-      (_couldNot, null, null),
-  "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.":
       (_couldNot, null, null),
   "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.":
       (_couldNot, null, null),
@@ -296,15 +284,15 @@ const _byText = <String, (String, String?, String?)>{
 /// means "show the upstream text as it is". An unknown error still gets one next step.
 KitMessageWords? kitMessageWords(String type, String title, String text) {
   if (title == 'Restarting remote device') {
-    return KitMessageWords(_w('Restarting that {Mac}…'), "It connects again on its own when it's back.");
+    return const KitMessageWords('Restarting that computer…', "It connects again on its own when it's back.");
   }
   final known = _byText[text];
   if (known != null) {
-    return KitMessageWords(_w(known.$1), known.$2 == null ? null : _w(known.$2!), known.$3 == null ? null : _w(known.$3!));
+    return KitMessageWords(known.$1, known.$2, known.$3);
   }
-  if (title == 'Connection Error') return KitMessageWords(_couldNot, null, _w(_checkOn));
+  if (title == 'Connection Error') return const KitMessageWords(_couldNot, null, _checkOn);
   if (type.contains('error')) {
-    return KitMessageWords(title, null, _w('Try again. If it keeps happening, restart Boring Remote on both {Macs}.'));
+    return KitMessageWords(title, null, 'Try again. If it keeps happening, restart Boring Remote on both computers.');
   }
   return null;
 }
@@ -359,7 +347,7 @@ class KitMessage extends StatelessWidget {
 /// The Controller's password prompt in plain words (v1.7 review).
 class KitPasswordWords {
   KitPasswordWords._();
-  static String get title => 'Password for that ${KitWords.one}';
-  static String get body => 'Type the Unattended Password that was set on that ${KitWords.one}.';
+  static String get title => 'Password for that computer';
+  static String get body => 'Type the Unattended Password that was set on that computer.';
   static String get remember => 'Remember it on this ${KitWords.one}';
 }

@@ -31,7 +31,7 @@ void main() {
   testWidgets('before Allow it says it is asking, with no chat button', (tester) async {
     await tester.pumpWidget(host(const ConnectedHeader(
         name: '', kind: ConnectedKind.files, allowed: false, ended: false)));
-    expect(find.text('A Mac on this network'), findsOneWidget);
+    expect(find.text('A computer on this network'), findsOneWidget);
     expect(find.text('Asking to come in'), findsOneWidget);
     expect(find.byType(IconButton), findsNothing);
   });

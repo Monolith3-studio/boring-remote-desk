@@ -23,7 +23,7 @@ class ConnectedWords {
   static String status({required bool allowed, required bool ended}) =>
       !allowed ? 'Asking to come in' : (ended ? 'Disconnected' : 'Connected');
 
-  static String get unnamed => 'A ${KitWords.one} on this network';
+  static String get unnamed => 'A computer on this network';
   static const permissionsTitle = 'What they can do';
   static const messages = 'Messages';
   static const fileActivity = 'File activity';

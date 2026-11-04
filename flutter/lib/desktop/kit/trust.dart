@@ -120,6 +120,28 @@ List<KnownMac> parseKnown(String json) {
   }
 }
 
+/// boring-remote (v1.7 t26): who a recent on Home is. A Known entry's pinned key (its Target ID
+/// when it has none) under the Target ID and each address it last answered on, no port. An address
+/// with no entry here is one nothing is pinned for now (Known keeps only the latest LAN address).
+Map<String, String> identitiesFromKnown(String json) {
+  final who = <String, String>{};
+  try {
+    final map = jsonDecode(json);
+    if (map is! Map) return who;
+    for (final e in map.entries) {
+      final t = e.value is Map ? e.value as Map : const {};
+      final pk = '${t['pk'] ?? ''}';
+      final key = pk.isNotEmpty ? pk : '${e.key}';
+      who['${e.key}'] = key;
+      for (final at in [t['lan'], t['tailscale']]) {
+        final host = _host('${at ?? ''}');
+        if (host.isNotEmpty) who[host] = key;
+      }
+    }
+  } catch (_) {}
+  return who;
+}
+
 String _host(String addr) {
   final i = addr.lastIndexOf(':');
   final h = i > 0 ? addr.substring(0, i) : addr;
@@ -182,14 +204,14 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
         Text(kTrustedTitle, style: t.headlineSmall),
         const SizedBox(height: Kit.s2),
         if (widget.waiting != null) widget.waiting!,
-        Text('These ${KitWords.many} get into this one without asking. Remove one and it has to ask again.',
+        Text('These computers get into this one without asking. Remove one and it has to ask again.',
             style: t.bodySmall),
         const SizedBox(height: Kit.s4),
-        if (_trusted.isEmpty) Text('None yet. A ${KitWords.one} lands here once you allow it in.'),
+        if (_trusted.isEmpty) Text('None yet. A computer lands here once you allow it in.'),
         for (final c in _trusted)
           ListTile(
             contentPadding: EdgeInsets.zero,
-            title: Text(c.name.isNotEmpty ? c.name : 'A ${KitWords.one} with no name'),
+            title: Text(c.name.isNotEmpty ? c.name : 'A computer with no name'),
             trailing: TextButton(
               onPressed: () async {
                 await widget.onRemove(c.key);
@@ -209,7 +231,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
             Padding(
               padding: const EdgeInsets.only(bottom: Kit.s3),
               child: Row(children: [
-                Expanded(child: Text(c.name.isNotEmpty ? c.name : 'A ${KitWords.one} with no name')),
+                Expanded(child: Text(c.name.isNotEmpty ? c.name : 'A computer with no name')),
                 const SizedBox(width: Kit.s3),
                 FilledButton(
                   style: FilledButton.styleFrom(
@@ -232,7 +254,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
             ),
         ],
         const SizedBox(height: Kit.s6),
-        Text('${KitWords.cap(KitWords.many)} this one has connected to', style: t.bodySmall),
+        Text('Computers this one has connected to', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(
             "If one of these was reinstalled, it won't connect. Click Forget next to it, "
@@ -243,7 +265,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
         for (final m in _known)
           ListTile(
             contentPadding: EdgeInsets.zero,
-            title: Text(m.address.isNotEmpty ? m.address : 'A ${KitWords.one} you connected to'),
+            title: Text(m.address.isNotEmpty ? m.address : 'A computer you connected to'),
             trailing: TextButton(
               onPressed: () async {
                 await widget.onForget(m.id);
@@ -262,7 +284,7 @@ const kTrustedTitle = 'Trusted list';
 
 /// The ask in plain words: who, and what it wants (the connection window and the main window).
 String approvalQuestion(String name) {
-  final who = name.trim().isNotEmpty ? name.trim() : 'A ${KitWords.one} on this network';
+  final who = name.trim().isNotEmpty ? name.trim() : 'A computer on this network';
   return '$who wants to control this ${KitWords.one}.';
 }
 

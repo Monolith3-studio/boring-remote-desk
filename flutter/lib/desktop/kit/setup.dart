@@ -83,13 +83,11 @@ const setupCopy = <String, String>{
   'skip.back': 'Go back',
   // Screen 1
   'name.title': 'Name this Mac',
-  'name.body': 'Your other Macs will list it by this name.',
+  'name.body': 'Your other computers will list it by this name.',
   'name.hint': 'For example: Edit Bay 2',
-  'name.seen': "You'll see this name in the list on your other Macs.",
+  'name.seen': "You'll see this name in the list on your other computers.",
   'name.blank': 'Type a name first.',
   'name.title@windows': 'Name this computer',
-  'name.body@windows': 'Your other computers will list it by this name.',
-  'name.seen@windows': "You'll see this name in the list on your other computers.",
   // Screen 2 (Mac)
   'allow.title': 'Let Boring Remote see and control this Mac',
   'allow.body': 'Click each button. System Settings opens. Turn on the switch next to “Boring Remote”.',
@@ -119,7 +117,7 @@ const setupCopy = <String, String>{
       'You can finish this later in Settings.',
   // Screen 3
   'password.title': 'Set a password for when no one is here',
-  'password.body': 'Your other Macs can get in with this password when no one is at this one.',
+  'password.body': 'Your other computers can get in with this password when no one is at this one.',
   'password.hint': 'Type a password',
   'password.rule': 'At least 8 characters, with a capital, a small letter and a number.',
   'password.failed': "Couldn't save that password. Try again.",
@@ -129,7 +127,6 @@ const setupCopy = <String, String>{
   'password.already': 'A password is already set. Type a new one to change it, or click Finish.',
   'password.skip.why': 'If you skip, someone has to be at this Mac to click Allow every time. '
       'You can set it later in Settings.',
-  'password.body@windows': 'Your other computers can get in with this password when no one is at this one.',
   'password.skip.why@windows': 'If you skip, someone has to be at this computer to click Allow every time. '
       'You can set it later in Settings.',
   'done': 'Finish',

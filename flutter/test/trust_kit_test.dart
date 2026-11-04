@@ -23,6 +23,19 @@ void main() {
     expect(parseTrusted('not json'), isEmpty);
   });
 
+  // v1.7 t26: Home keys a recent by the key pinned for its Target ID or last address.
+  test('identities: a pinned key under the Target ID, the LAN address and the Tailscale address', () {
+    final who = identitiesFromKnown('{"303012600":{"pk":"AB01","lan":"192.168.1.124:21118",'
+        '"tailscale":"[fd7a:115c:a1e0::5]:21118"},"5":{"pk":"cd","lan":"","tailscale":"100.70.1.2:21118"}}');
+    expect(who['303012600'], 'AB01');
+    expect(who['192.168.1.124'], 'AB01');
+    expect(who['fd7a:115c:a1e0::5'], 'AB01');
+    expect(who['100.70.1.2'], 'cd');
+    expect(who[''], isNull);
+    expect(identitiesFromKnown('not json'), isEmpty);
+    expect(identitiesFromKnown('{"7":{"lan":"10.0.0.7:21118"}}')['10.0.0.7'], '7', reason: 'no key: the Target ID');
+  });
+
   test("forgets a Mac's pinned key by Target ID", () {
     final known = parseKnown(knownJson);
     expect(known.map((m) => m.address), ['192.168.1.20', '100.64.0.2']); // no LAN address: its Tailscale one
@@ -56,7 +69,7 @@ void main() {
       onRemove: (_) async {},
       onForget: (id) async => forgot.add(id),
     )));
-    expect(find.text('None yet. A Mac lands here once you allow it in.'), findsOneWidget);
+    expect(find.text('None yet. A computer lands here once you allow it in.'), findsOneWidget);
     expect(find.text('192.168.1.20'), findsOneWidget);
     expect(find.text('100.64.0.2'), findsOneWidget);
     expect(find.textContaining('987654321'), findsNothing); // never the ID
@@ -75,7 +88,7 @@ void main() {
       onRemove: (_) async {},
       onForget: (_) async {},
     )));
-    expect(find.text('A Mac you connected to'), findsOneWidget);
+    expect(find.text('A computer you connected to'), findsOneWidget);
     expect(find.textContaining('555666777'), findsNothing);
   });
 
@@ -105,6 +118,6 @@ void main() {
 
   testWidgets('a nameless Mac is still described in plain words', (tester) async {
     await tester.pumpWidget(host(ApprovalPrompt(name: '  ', onAllow: () {}, onDeny: () {})));
-    expect(find.text('A Mac on this network wants to control this Mac.'), findsOneWidget);
+    expect(find.text('A computer on this network wants to control this Mac.'), findsOneWidget);
   });
 }

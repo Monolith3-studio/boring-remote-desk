@@ -27,7 +27,7 @@ WIN_UPDATE = "Windows reads its own signed feed entry and installs the checked M
 CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
 CONNECT_TAILNET = "connect box dials only Tailscale or private-LAN addresses, else the plain error"
 CONNECT_ENCRYPTED = check.CONNECT_ENCRYPTED
-NOT_FOUND_TRANSLATED = "every connect error, Mac and Windows wording, is in every translation file"
+NOT_FOUND_TRANSLATED = "every connect error is in every translation file"
 CONNECT_PIN = "Direct Link pins the Target on the address dialled and on its ID (identity changed otherwise)"
 ONE_TIME_CODE = "a one-time code lets a Controller in for that session only (ADR 0005)"
 REMOVED_ASKS = "a removed Trusted Controller is asked again; its password does not undo Remove (A2 step 5)"
@@ -286,6 +286,58 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("src/lan.rs", rebrand.T21_HEARD, "")
         self.assert_check_fails(self.LAN_BOTH_WAYS)
+
+    # --- v1.7 t26: Home says computer about the Target, and lists each machine once -
+    TARGET_WORDS = "the Target is a computer on both builds: Home, connect errors, other-end lines (t26)"
+    USED_BEFORE = "Used before lists each machine once, newest address, nothing deleted from disk (t26)"
+
+    def test_t26_passes_after_rebrand(self):
+        self.rebrand()
+        out = run(CHECK, self.root).stdout
+        self.assertIn(f"PASS {self.TARGET_WORDS}", out)
+        self.assertIn(f"PASS {self.USED_BEFORE}", out)
+
+    def test_home_title_saying_mac_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/mac_home.dart", "'Connect to a computer'", "'Connect to a ${KitWords.one}'")
+        self.assert_check_fails(self.TARGET_WORDS)
+
+    def test_other_end_line_following_this_machines_word_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/kit_look.dart", "Password for that computer", "Password for that ${KitWords.one}")
+        self.assert_check_fails(self.TARGET_WORDS)
+
+    def test_connect_error_saying_mac_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "Couldn't reach that computer.", "Couldn't reach that Mac.")
+        self.assert_check_fails(self.TARGET_WORDS)
+
+    def test_unnamed_recent_saying_mac_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "KitWords.unnamed", "'Unnamed Mac'")
+        self.assert_check_fails(self.TARGET_WORDS)
+
+    def test_this_machine_losing_its_word_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/mac_home.dart", "To reach this $one", "To reach this computer")
+        self.assert_check_fails(self.TARGET_WORDS)
+
+    def test_home_listing_every_address_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "oneEntryPerMachine(", "List.of(")
+        self.assert_check_fails(self.USED_BEFORE)
+
+    def test_home_without_the_pinned_keys_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "identitiesFromKnown(bind.mainGetLocalOption(key: kDirectLinkKnownOption))",
+                  "const <String, String>{}")
+        self.assert_check_fails(self.USED_BEFORE)
+
+    def test_home_deleting_a_collapsed_entry_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "    List<MacEntry> usedBefore() {\n",
+                  "    List<MacEntry> usedBefore() {\n      bind.mainRemovePeer(id: '');\n")
+        self.assert_check_fails(self.USED_BEFORE)
 
     def test_setup_without_ready_line_fails_check(self):
         self.rebrand()

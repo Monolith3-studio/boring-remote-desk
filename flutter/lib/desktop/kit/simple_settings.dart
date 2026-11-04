@@ -138,7 +138,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         Text('Password for when no one is here', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(isSet
-            ? 'Set. Your other ${KitWords.many} can get in with it when no one is here.'
+            ? 'Set. Your other computers can get in with it when no one is here.'
             : 'Not set. Someone has to be at this ${KitWords.one} to click Allow each time.'),
         const SizedBox(height: Kit.s2),
         if (!_editingPassword)
@@ -179,17 +179,16 @@ class _SimpleSettingsState extends State<SimpleSettings> {
 
   /// Ticket 15: get Boring Remote onto the next computer in a couple of minutes.
   Widget _anotherSection(TextTheme t) {
-    final one = KitWords.one;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Set up another $one', style: t.bodySmall),
+        Text('Set up another computer', style: t.bodySmall),
         const SizedBox(height: Kit.s2),
-        Text('1. On the other $one, open theboringremote.com/download and download Boring Remote.'),
+        Text('1. On the other computer, open theboringremote.com/download and download Boring Remote.'),
         const SizedBox(height: Kit.s1),
         const Text('2. Open it and follow the three setup steps.'),
         const SizedBox(height: Kit.s1),
-        Text("3. You'll see it by name on this $one's Home screen when both are on the same network."),
+        Text("3. You'll see it by name on this ${KitWords.one}'s Home screen when both are on the same network."),
         const SizedBox(height: Kit.s3),
         Wrap(spacing: Kit.s2, runSpacing: Kit.s2, crossAxisAlignment: WrapCrossAlignment.center, children: [
           if (widget.openUrl != null)
@@ -225,14 +224,14 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         TextField(
           key: SimpleSettings.nameKey,
           controller: _name,
-          decoration: InputDecoration(hintText: 'The name other ${KitWords.many} see'),
+          decoration: InputDecoration(hintText: 'The name other computers see'),
           onSubmitted: _rename,
         ),
         const SizedBox(height: Kit.s6),
         _passwordSection(t),
         const SizedBox(height: Kit.s5),
         SwitchListTile(
-          title: Text('Let your other ${KitWords.many} in'),
+          title: Text('Let your other computers in'),
           subtitle: Text('Keeps this ${KitWords.one} open to them, even after a restart.', style: t.bodySmall),
           value: widget.remoteAccess && !_confirmStop,
           onChanged: (on) => on ? widget.onRemoteAccess(true) : setState(() => _confirmStop = true),
@@ -240,7 +239,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         ),
         if (_confirmStop) ...[
           // Off stops the service now, so the buyer reads exactly that before it happens.
-          Text("Turn this off and your other ${KitWords.many} can't get into this one, starting now. "
+          Text("Turn this off and your other computers can't get into this one, starting now. "
               'Turn it back on to let them in. Your ${KitWords.one} may ask you to confirm, and Boring Remote '
               'may restart.'),
           const SizedBox(height: Kit.s2),
@@ -260,7 +259,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
         if (widget.openAtLogin != null)
           SwitchListTile(
             title: const Text('Open Boring Remote at login'),
-            subtitle: Text('Opens this window when you log in. Your other ${KitWords.many} can get in either way.',
+            subtitle: Text('Opens this window when you log in. Your other computers can get in either way.',
                 style: t.bodySmall),
             value: _openAtLogin ?? widget.openAtLogin!,
             onChanged: (on) {

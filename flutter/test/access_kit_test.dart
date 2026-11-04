@@ -33,7 +33,7 @@ void main() {
     expect(AccessWords.runningWhy, 'So your other computers can get in with this window closed.');
     expect(AccessWords.listeningWhy, 'So your other computers on this network can reach this one.');
     KitWords.mac();
-    expect(AccessWords.runningWhy, 'So your other Macs can get in with this window closed.');
+    expect(AccessWords.runningWhy, 'So your other computers can get in with this window closed.');
   });
 
   test('the first missing row is the one the summary names', () {

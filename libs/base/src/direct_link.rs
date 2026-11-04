@@ -21,60 +21,27 @@ use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, future::Future, net::IpAddr, net::SocketAddr};
 
 // What the connect box says, in plain words with one next step (boring/rebrand.py keeps the same
-// text as translation keys). The Mac build says "Mac"; the Windows build says "computer".
-// [`connect`] rewords them with [`worded_for`]: "Mac" only when the Target is known to be one.
+// text as translation keys). boring-remote (v1.7 t26): the Target can be a Mac or a PC, so "computer"
+// on both builds.
 
 /// Neither the Direct Link nor the Tailscale address answered.
-#[cfg(not(target_os = "windows"))]
-pub const NOT_ON_THIS_NETWORK: &str =
-    "Couldn't reach that Mac. Make sure it's awake and on the same network as this one, then try again.";
-#[cfg(target_os = "windows")]
 pub const NOT_ON_THIS_NETWORK: &str =
     "Couldn't reach that computer. Make sure it's awake and on the same network as this one, then try again.";
 
 /// A name that resolves to nothing a Target would accept.
-#[cfg(not(target_os = "windows"))]
-pub const NOT_FOUND: &str = "Couldn't find a Mac with that name. Pick it from the list, or check the spelling and try again.";
-#[cfg(target_os = "windows")]
 pub const NOT_FOUND: &str =
     "Couldn't find a computer with that name. Pick it from the list, or check the spelling and try again.";
 
 /// A recent on Home that Boring Remote has no address for (never met over a Direct Link).
-#[cfg(not(target_os = "windows"))]
-pub const NO_ADDRESS: &str =
-    "Boring Remote doesn't know where that Mac is yet. Type its name or address in the box, then try again.";
-#[cfg(target_os = "windows")]
 pub const NO_ADDRESS: &str =
     "Boring Remote doesn't know where that computer is yet. Type its name or address in the box, then try again.";
 
 /// A non-Tailscale Target that answers without the encrypted Direct Link handshake (ADR 0005).
-#[cfg(not(target_os = "windows"))]
-pub const PLAINTEXT_REFUSED: &str = "That Mac needs the latest Boring Remote. Update Boring Remote on that Mac, then try again.";
-#[cfg(target_os = "windows")]
 pub const PLAINTEXT_REFUSED: &str =
     "That computer needs the latest Boring Remote. Update Boring Remote on that computer, then try again.";
 
 /// The Target's identity key differs from the one pinned for that address or ID.
-#[cfg(not(target_os = "windows"))]
-pub const IDENTITY_CHANGED: &str = "This isn't the Mac you connected to before, so Boring Remote stopped. If that Mac was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.";
-#[cfg(target_os = "windows")]
 pub const IDENTITY_CHANGED: &str = "This isn't the computer you connected to before, so Boring Remote stopped. If that computer was reinstalled, open Settings, click Trusted list, click Forget next to it, then try again.";
-
-/// `PeerInfo.platform` of a Mac (src/common.rs PLATFORM_MACOS), as a session saves it to PeerConfig.
-const MAC_PLATFORM: &str = "Mac OS";
-
-const CONNECT_ERRORS: [&str; 5] = [NOT_ON_THIS_NETWORK, NOT_FOUND, NO_ADDRESS, PLAINTEXT_REFUSED, IDENTITY_CHANGED];
-
-/// One of the errors above in "Mac" wording when `mac`, else "computer"; anything else as it is.
-/// Both wordings are translation keys (rebrand.py CONNECT_ERROR_KEYS).
-pub fn worded_for(msg: &str, mac: bool) -> String {
-    let computer = |e: &str| e.replace("Mac", "computer");
-    match CONNECT_ERRORS.iter().find(|e| **e == msg || computer(e) == msg) {
-        Some(e) if mac => e.replace("computer", "Mac"),
-        Some(e) => computer(e),
-        None => msg.to_owned(),
-    }
-}
 
 /// Controller-side memory of Targets met over an encrypted Direct Link (LocalConfig option).
 pub const KNOWN_OPTION: &str = "boring-direct-link-known";
@@ -340,12 +307,6 @@ impl Known {
         }
     }
 
-    /// The Target ID that last answered at `addr`.
-    pub fn id_at(&self, addr: SocketAddr) -> Option<&str> {
-        let lan = addr.to_string();
-        self.0.iter().find(|(_, t)| t.lan == lan).map(|(id, _)| id.as_str())
-    }
-
     /// The Tailscale address of whoever last answered at `direct`, if it told us one.
     pub fn tailscale_for(&self, direct: SocketAddr) -> Option<SocketAddr> {
         let lan = direct.to_string();
@@ -422,16 +383,7 @@ pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Path, Opti
     } else {
         plan_for(peer, &known, slow_ms).await
     };
-    // "Mac" only for a Target that told us it is one, under what was typed or the ID met there.
-    let is_mac = |keys: &[&str]| {
-        keys.iter().any(|k| hbb_common::config::PeerConfig::load(k).info.platform == MAC_PLATFORM)
-    };
-    let plan = plan.map_err(|e| anyhow!(worded_for(&e.to_string(), is_mac(&[peer]))))?;
-    let met_there = known.id_at(plan.direct).map(str::to_owned);
-    dial(plan, slow_ms, known).await.map_err(|e| {
-        let keys: Vec<&str> = std::iter::once(peer).chain(met_there.as_deref()).collect();
-        anyhow!(worded_for(&e.to_string(), is_mac(&keys)))
-    })
+    dial(plan?, slow_ms, known).await
 }
 
 async fn dial(plan: Plan, slow_ms: u64, mut known: Known) -> ResultType<(Stream, Path, Option<Vec<u8>>)> {
@@ -628,7 +580,6 @@ mod tests {
         known.record(&Verified { tailscale: None, ..who.clone() }, sa(LAN));
         known.record(&who, sa(TS));
         assert_eq!(known.tailscale_for(sa(LAN)), Some(sa(TS)));
-        assert_eq!(known.id_at(sa(LAN)), Some("123456789"), "a Tailscale connect keeps the LAN address");
         let (other, _) = sign::gen_keypair();
         assert!(known.pin_ok(sa(TS), "123456789", &pk.0));
         assert!(!known.pin_ok(sa(TS), "555000111", &other.0), "someone else at a known Tailscale address");
@@ -830,21 +781,9 @@ mod tests {
     }
 
     #[test]
-    fn connect_errors_say_computer_unless_the_target_is_known_to_be_a_mac() {
+    fn connect_errors_say_computer_on_every_build() {
         for e in [NOT_ON_THIS_NETWORK, NOT_FOUND, NO_ADDRESS, PLAINTEXT_REFUSED, IDENTITY_CHANGED] {
-            let computer = worded_for(e, false);
-            assert!(computer.contains("computer") && !computer.contains("Mac"), "{computer}");
-            let mac = worded_for(e, true);
-            assert!(mac.contains("Mac") && !mac.contains("computer"), "{mac}");
-            assert_eq!(worded_for(&computer, true), mac);
+            assert!(e.contains("computer") && !e.contains("Mac"), "{e}");
         }
-        assert_eq!(worded_for("Failed to connect to a Mac", false), "Failed to connect to a Mac", "not ours");
-    }
-
-    #[test]
-    fn known_names_who_last_answered_at_an_address() {
-        let known = Known::parse(r#"{"303012600":{"pk":"01","lan":"192.168.1.124:21118","tailscale":""}}"#);
-        assert_eq!(known.id_at(sa("192.168.1.124:21118")), Some("303012600"));
-        assert_eq!(known.id_at(sa(LAN)), None);
     }
 }

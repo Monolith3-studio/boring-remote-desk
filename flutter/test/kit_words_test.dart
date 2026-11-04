@@ -41,6 +41,16 @@ void main() {
     expect(find.textContaining('pick this computer by name'), findsOneWidget);
   });
 
+  // v1.7 t26: the Target says computer on both builds; only this machine's word differs.
+  testWidgets('Mac and Windows Home read the same about the Target', (tester) async {
+    for (final set in [KitWords.mac, KitWords.windows]) {
+      set();
+      await tester.pumpWidget(host(MacHome(macs: const [], tailscaleAddress: () async => null, onConnect: (_) {})));
+      expect(find.text('Connect to a computer'), findsOneWidget);
+      expect(find.text('Computers'), findsOneWidget);
+    }
+  });
+
   test('a Windows computer on the network with no name is an Unnamed computer', () {
     KitWords.windows();
     expect(lanMacsFromJson('[{"hostname":"","ip":"10.0.4.7"}]').single.name, 'Unnamed computer');

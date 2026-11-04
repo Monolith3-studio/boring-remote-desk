@@ -63,7 +63,7 @@ void main() {
     expect(find.text('Not set. Someone has to be at this Mac to click Allow each time.'), findsOneWidget);
     expect(find.text('Set password'), findsOneWidget);
     await tester.pumpWidget(host(settings(passwordSet: true)));
-    expect(find.text('Set. Your other Macs can get in with it when no one is here.'), findsOneWidget);
+    expect(find.text('Set. Your other computers can get in with it when no one is here.'), findsOneWidget);
     expect(find.text('Change password'), findsOneWidget);
     await tester.tap(find.text('Change password'));
     await tester.pump();
@@ -122,7 +122,7 @@ void main() {
     await tester.pumpWidget(host(settings(
         remoteAccess: false, onRemoteAccess: access.add, openAtLogin: false, onOpenAtLogin: login.add,
         checkUpdates: true, onCheckUpdates: updates.add)));
-    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other Macs in'));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other computers in'));
     await tester.tap(find.widgetWithText(SwitchListTile, 'Open Boring Remote at login'));
     await tester.tap(find.widgetWithText(SwitchListTile, 'Check for updates'));
     expect(access, [true]);
@@ -150,10 +150,10 @@ void main() {
   testWidgets('turning remote access off says what it stops first, and only then turns it off',
       (tester) async {
     final login = <bool>[];
-    const why = "Turn this off and your other Macs can't get into this one, starting now. "
+    const why = "Turn this off and your other computers can't get into this one, starting now. "
         'Turn it back on to let them in. Your Mac may ask you to confirm, and Boring Remote may restart.';
     await tester.pumpWidget(host(settings(remoteAccess: true, onRemoteAccess: login.add)));
-    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other Macs in'));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other computers in'));
     await tester.pump();
     expect(find.text(why), findsOneWidget);
     expect(login, isEmpty);
@@ -161,7 +161,7 @@ void main() {
     await tester.pump();
     expect(find.text(why), findsNothing);
     expect(login, isEmpty);
-    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other Macs in'));
+    await tester.tap(find.widgetWithText(SwitchListTile, 'Let your other computers in'));
     await tester.pump();
     await tester.tap(find.text('Turn off'));
     await tester.pump();
@@ -169,7 +169,7 @@ void main() {
     expect(find.text(why), findsNothing);
   });
 
-  testWidgets('set up another Mac: download link, copy the link, three plain steps', (tester) async {
+  testWidgets('set up another computer: download link, copy the link, three plain steps', (tester) async {
     tester.view.physicalSize = const Size(1200, 2400);
     addTearDown(tester.view.resetPhysicalSize);
     final opened = <String>[], copied = <String>[];
@@ -179,8 +179,8 @@ void main() {
     });
     addTearDown(() => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
     await tester.pumpWidget(host(settings(openUrl: opened.add)));
-    expect(find.text('Set up another Mac'), findsOneWidget);
-    expect(find.text('1. On the other Mac, open theboringremote.com/download and download Boring Remote.'),
+    expect(find.text('Set up another computer'), findsOneWidget);
+    expect(find.text('1. On the other computer, open theboringremote.com/download and download Boring Remote.'),
         findsOneWidget);
     expect(find.text('2. Open it and follow the three setup steps.'), findsOneWidget);
     expect(find.text("3. You'll see it by name on this Mac's Home screen when both are on the same network."), findsOneWidget);

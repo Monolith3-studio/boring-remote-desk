@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 
-/// What the buyer calls a computer (v1.7 ticket 12): "Mac" on the Mac build, "computer" on
+/// What the buyer calls THIS machine (v1.7 ticket 12): "Mac" on the Mac build, "computer" on
 /// Windows. Set once at startup (main.dart, before any window is built); Mac is the default.
+/// boring-remote (v1.7 t26): the machine at the other end can be a PC, so a line about it says
+/// "computer" in plain text on both builds. Use these words only for "this Mac" lines.
 class KitWords {
   KitWords._();
+  /// A machine on Home with no name yet. It can be a PC too (t26).
+  static const unnamed = 'Unnamed computer';
   static String one = 'Mac';
   static String many = 'Macs';
   static void mac() {

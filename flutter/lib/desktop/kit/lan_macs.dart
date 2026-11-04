@@ -19,7 +19,7 @@ List<LanMac> lanMacsFromJson(String json) {
       for (final p in list.cast<Map<String, dynamic>>())
         if ((p['ip'] ?? '').toString().isNotEmpty)
           LanMac(
-            name: (p['hostname'] ?? '').toString().isNotEmpty ? p['hostname'].toString() : 'Unnamed ${KitWords.one}',
+            name: (p['hostname'] ?? '').toString().isNotEmpty ? p['hostname'].toString() : KitWords.unnamed,
             ip: p['ip'].toString(),
           ),
     ];
