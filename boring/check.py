@@ -1614,6 +1614,11 @@ def run_checks(root):
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")
     ft_missing = [n for n in ft_needles if n not in c.read(ft)]
     c.fact("v1.7 File Transfer kit wired into the file manager", not ft_missing, "; ".join(ft_missing))
+    c.fact("File Transfer theme carries the extensions upstream's location bar reads (v1.7 t28)",
+           "data: boringKitTheme," in c.read(ft) and "Kit.theme()" not in c.read(ft))
+    c.fact("UI errors reach the app log (v1.7 t28)",
+           "logUiErrors((text) => bind.mainLogUiError(text: text));" in c.read("flutter/lib/main.dart")
+           and "pub fn main_log_ui_error(text: String)" in c.read("src/flutter_ffi.rs"))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):

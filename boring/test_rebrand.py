@@ -759,6 +759,16 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.FILE_MGR, "            if (j.type != JobType.none)\n", "            if (j.type == JobType.transfer)\n")
         self.assert_check_fails("File Transfer lists delete jobs too (v1.7 t08 follow-up)")
 
+    def test_transfer_theme_without_extensions_fails_check(self):  # v1.7 t28
+        self.rebrand()
+        self.edit(rebrand.FILE_MGR, "            data: boringKitTheme,\n", "            data: Kit.theme(),\n")
+        self.assert_check_fails("File Transfer theme carries the extensions upstream's location bar reads (v1.7 t28)")
+
+    def test_ui_errors_not_logged_fails_check(self):  # v1.7 t28
+        self.rebrand()
+        self.edit("flutter/lib/main.dart", "  logUiErrors((text) => bind.mainLogUiError(text: text));\n", "")
+        self.assert_check_fails("UI errors reach the app log (v1.7 t28)")
+
     def test_windows_setup_falling_back_to_scutil_fails_check(self):  # v1.7 t12 follow-up
         self.rebrand()
         self.edit(rebrand.HOME, "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n"

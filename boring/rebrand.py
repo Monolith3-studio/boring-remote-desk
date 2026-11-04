@@ -1100,7 +1100,9 @@ PATCHES += [
      "          ),\n",
      "          backgroundColor: Kit.ink,\n"
      "          body: Theme(\n"
-     "            data: Kit.theme().copyWith(cardColor: Kit.panel),\n"
+     "            // boring-remote (v1.7 t28): upstream's location bar reads MyTheme.tabbar. A theme without\n"
+     "            // those extensions throws there and the release build draws grey blocks.\n"
+     "            data: boringKitTheme,\n"
      "            child: Row(\n"
      "              children: [\n"
      "                if (!isWeb)\n"
@@ -1153,6 +1155,35 @@ PATCHES += [
      "                  color: selectedItems.items.contains(entry)\n"
      "                      ? Kit.line\n",
      "File Transfer: selected row in kit grey"),
+]
+
+# --- File Transfer page test + UI error log (v1.7 t28) ------------------------------
+# flutter/test/file_transfer_page_test.dart pumps the real page, which reaches the bridge through
+# PlatformFFI's private field, so the test needs a setter. kit/ui_error_log.dart is ours and
+# bridge-free; these send what it catches to the app log, since a release build logs nothing else.
+PATCHES += [
+    ("flutter/lib/models/native_model.dart", "  RustdeskImpl get ffiBind => _ffiBind;\n",
+     "  RustdeskImpl get ffiBind => _ffiBind;\n"
+     "  // boring-remote (v1.7 t28): lets a widget test pump a page against a fake bridge.\n"
+     "  @visibleForTesting\n"
+     "  set ffiBindForTest(RustdeskImpl b) => _ffiBind = b;\n",
+     "File Transfer page test: fake bridge setter"),
+    ("flutter/lib/main.dart", "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
+     "import 'package:flutter_hbb/desktop/kit/ui_error_log.dart';\n"
+     "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
+     "UI error log import"),
+    ("flutter/lib/main.dart", "  kBootArgs = List.from(args);\n",
+     "  // boring-remote (v1.7 t28): a grey block in a release build leaves a line in the app log.\n"
+     "  logUiErrors((text) => bind.mainLogUiError(text: text));\n"
+     "  kBootArgs = List.from(args);\n",
+     "UI errors reach the app log"),
+    ("src/flutter_ffi.rs", "pub fn main_is_login_wayland() -> SyncReturn<bool> {\n",
+     "/// boring-remote (v1.7 t28): a widget failed to build or lay out. Release Flutter logs nothing itself.\n"
+     "pub fn main_log_ui_error(text: String) {\n"
+     "    log::error!(\"UI error: {}\", text);\n"
+     "}\n\n"
+     "pub fn main_is_login_wayland() -> SyncReturn<bool> {\n",
+     "UI error log bridge call"),
 ]
 
 # --- Session Toolbar (v1.7 ticket 07) --------------------------------------------
