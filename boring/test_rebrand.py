@@ -759,6 +759,60 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.FILE_MGR, "            if (j.type != JobType.none)\n", "            if (j.type == JobType.transfer)\n")
         self.assert_check_fails("File Transfer lists delete jobs too (v1.7 t08 follow-up)")
 
+    # --- v1.7 t27: file transfer at full speed ----------------------------------------
+    def test_full_speed_hooks_land_and_the_tick_ceiling_is_gone(self):
+        self.rebrand()
+        conn = (self.root / rebrand.CONN).read_text()
+        self.assertIn("base::file_speed::pump_read_jobs(&mut conn.read_jobs", conn)
+        self.assertNotIn("match fs::handle_read_jobs(", conn)
+        io_loop = (self.root / rebrand.IO_LOOP).read_text()
+        self.assertIn("base::file_speed::pump_read_jobs(&mut self.read_jobs, &mut peer)", io_loop)
+        # An old Target still gets upstream's pace.
+        self.assertIn("fs::handle_read_jobs(&mut self.read_jobs, &mut peer)", io_loop)
+        self.assertIn("boring_full_speed: false,", io_loop)
+        self.assertIn("pub mod file_speed;", (self.root / rebrand.BASE_LIB).read_text())
+        self.assertIn("&& self.boring_compress.should_try(file_num, name)", (self.root / rebrand.FS_RS).read_text())
+
+    def test_full_speed_leaves_the_protocol_alone(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        self.assertIn(f"PASS {check.TRANSFER_HOOKS}", r.stdout)
+        self.assertIn("PASS protocol files are upstream's", r.stdout)
+
+    def test_a_second_rebrand_changes_nothing_after_t27(self):
+        self.rebrand()
+        files = (rebrand.CONN, rebrand.IO_LOOP, rebrand.UI_CM, rebrand.IPC, rebrand.FS_RS, rebrand.FILE_MGR)
+        first = {rel: (self.root / rel).read_bytes() for rel in files}
+        self.rebrand()
+        for rel in files:
+            self.assertEqual(first[rel], (self.root / rel).read_bytes(), rel)
+
+    def test_one_block_per_tick_on_the_target_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CONN, "match base::file_speed::pump_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {",
+                  "match fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {")
+        self.assert_check_fails(check.TRANSFER_HOOKS)
+
+    def test_target_reading_past_its_cm_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CONN, "res = conn.stream.next(), if conn.boring_cm_window.has_room() => {", "res = conn.stream.next() => {")
+        self.assert_check_fails(check.TRANSFER_HOOKS)
+
+    def test_cm_that_never_acks_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.UI_CM, "allow_err!(self.tx.send(Data::FileWriteAck(n)));", "let _ = n;")
+        self.assert_check_fails(check.TRANSFER_HOOKS)
+
+    def test_transfer_list_without_speed_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.FILE_MGR, "                  speed: j.speed, // boring-remote (v1.7 t27)\n", "")
+        self.assert_check_fails(check.TRANSFER_HOOKS)
+
+    def test_panes_without_the_drive_list_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.FILE_MGR, "          TransferDrives(load: _boringLoadDrives, onOpen: controller.openDirectory), // boring-remote (v1.7 t27)\n", "")
+        self.assert_check_fails(check.TRANSFER_HOOKS)
+
     def test_windows_setup_falling_back_to_scutil_fails_check(self):  # v1.7 t12 follow-up
         self.rebrand()
         self.edit(rebrand.HOME, "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n"

@@ -4,7 +4,13 @@ import 'package:flutter_hbb/desktop/kit/kit.dart';
 import 'package:flutter_hbb/desktop/kit/file_transfer.dart';
 
 TransferJob job(String state,
-        {int finished = 0, int total = 1000, String err = '', bool remoteToLocal = false, bool delete = false}) =>
+        {int finished = 0,
+        int total = 1000,
+        String err = '',
+        bool remoteToLocal = false,
+        bool delete = false,
+        double speed = 0,
+        double? averageSpeed}) =>
     TransferJob.fromEngine(
         id: 7,
         path: '/Users/j/Movies/cut.mov',
@@ -13,9 +19,147 @@ TransferJob job(String state,
         finished: finished,
         total: total,
         err: err,
-        delete: delete);
+        delete: delete,
+        speed: speed,
+        averageSpeed: averageSpeed);
 
 void main() {
+  group('speed', () {
+    test('says it the way a person reads it', () {
+      expect(kitSpeed(108e6), '108 MB/s');
+      expect(kitSpeed(107.6e6), '108 MB/s');
+      expect(kitSpeed(1.24e9), '1.2 GB/s');
+      expect(kitSpeed(820e3), '820 KB/s');
+    });
+
+    test('a sending job shows its share and live speed', () {
+      expect(job('inProgress', finished: 250, speed: 108e6).status, '25% · 108 MB/s');
+    });
+
+    test('no speed yet: only the share', () {
+      expect(job('inProgress', finished: 250).status, '25%');
+    });
+
+    test('a done job shows the average, or only Done without one', () {
+      expect(job('done', averageSpeed: 97e6).status, 'Done · 97 MB/s average');
+      expect(job('done', averageSpeed: 0).status, 'Done');
+      expect(job('done').status, 'Done');
+    });
+
+    test('live speed stays out of the other phases', () {
+      expect(job('paused', speed: 108e6).status, 'Paused');
+      expect(job('none', speed: 108e6).status, 'Waiting');
+      expect(job('none', delete: true, speed: 108e6).status, 'Deleting from this Mac…');
+    });
+  });
+
+  group('TransferClock averages one run', () {
+    final t0 = DateTime(2026, 11, 4, 12);
+    DateTime at(int seconds) => t0.add(Duration(seconds: seconds));
+    const gb = 1000000000;
+
+    test('from the first bytes to Done, not from the moment it was queued', () {
+      final c = TransferClock();
+      expect(c.observe(1, 'inProgress', 0, 2 * gb, at(0)), isNull); // an overwrite question
+      expect(c.observe(1, 'inProgress', 100000000, 2 * gb, at(60)), isNull);
+      expect(c.observe(1, 'done', 2 * gb, 2 * gb, at(79)), 100000000);
+    });
+
+    test('keeps its answer when the list looks again later', () {
+      final c = TransferClock();
+      c.observe(1, 'inProgress', 100000000, 2 * gb, at(0));
+      final first = c.observe(1, 'done', 2 * gb, 2 * gb, at(19));
+      expect(c.observe(1, 'done', 2 * gb, 2 * gb, at(500)), first);
+    });
+
+    test('Resume times the new run only', () {
+      final c = TransferClock();
+      c.observe(1, 'inProgress', 100000000, 2 * gb, at(0));
+      c.observe(1, 'paused', 500000000, 2 * gb, at(5));
+      c.observe(1, 'inProgress', 1000000000, 2 * gb, at(100));
+      expect(c.observe(1, 'done', 2 * gb, 2 * gb, at(110)), 100000000);
+    });
+
+    test('a job too quick to have a sample has no average', () {
+      final c = TransferClock();
+      expect(c.observe(1, 'done', 1000, 1000, at(0)), isNull);
+      c.observe(2, 'inProgress', 1000, 1000, at(0));
+      expect(c.observe(2, 'done', 1000, 1000, at(1)), isNull); // nothing after the first sample
+    });
+
+    test('jobs are timed separately', () {
+      final c = TransferClock();
+      c.observe(1, 'inProgress', 100, 1100, at(0));
+      c.observe(2, 'inProgress', 100, 2100, at(0));
+      expect(c.observe(1, 'done', 1100, 1100, at(1)), 1000);
+      expect(c.observe(2, 'done', 2100, 2100, at(1)), 2000);
+    });
+  });
+
+  group('drives', () {
+    ({String name, bool directory, bool link}) e(String name, {bool directory = true, bool link = false}) =>
+        (name: name, directory: directory, link: link);
+
+    test('each computer has its own place to look', () {
+      expect(transferDriveRoot('Mac OS'), '/Volumes');
+      expect(transferDriveRoot('Windows'), '/');
+      expect(transferDriveRoot('Linux'), isNull);
+      expect(transferDriveRoot(''), isNull);
+    });
+
+    test('Mac: the startup disk is the link to /, the rest live in /Volumes', () {
+      final d = transferDrivesFrom('Mac OS', [e('Macintosh HD', link: true), e('T9_1_2TB')]);
+      expect(d.map((x) => x.label), ['Macintosh HD', 'T9_1_2TB']);
+      expect(d.map((x) => x.path), ['/', '/Volumes/T9_1_2TB']);
+    });
+
+    test('Mac: leaves out hidden folders and loose files', () {
+      final d = transferDrivesFrom('Mac OS', [e('.timemachine'), e('note.txt', directory: false), e('')]);
+      expect(d, isEmpty);
+    });
+
+    test('Windows: drive letters open at their root', () {
+      final d = transferDrivesFrom('Windows', [e('C:'), e('E:')]);
+      expect(d.map((x) => x.label), ['C:', 'E:']);
+      expect(d.map((x) => x.path), ['C:\\', 'E:\\']);
+    });
+
+    Widget host(Widget w) => MaterialApp(theme: Kit.theme(), home: Scaffold(body: w));
+
+    testWidgets('one click opens a drive, and each side has its own list', (tester) async {
+      final opened = <String>[];
+      await tester.pumpWidget(host(Column(children: [
+        TransferDrives(load: () async => const [TransferDrive('Macintosh HD', '/')], onOpen: (p) => opened.add('this $p')),
+        TransferDrives(
+            load: () async => const [TransferDrive('C:', 'C:\\')], onOpen: (p) => opened.add('that $p')),
+      ])));
+      await tester.pump();
+      await tester.tap(find.text('Macintosh HD'));
+      await tester.tap(find.text('C:'));
+      expect(opened, ['this /', 'that C:\\']);
+    });
+
+    testWidgets('the button looks again and finds what was plugged in', (tester) async {
+      var plugged = false;
+      await tester.pumpWidget(host(TransferDrives(
+          load: () async => [const TransferDrive('Macintosh HD', '/'), if (plugged) const TransferDrive('T9', '/Volumes/T9')],
+          onOpen: (_) {})));
+      await tester.pump();
+      expect(find.text('T9'), findsNothing);
+      plugged = true;
+      await tester.tap(find.byTooltip('Look for drives again'));
+      await tester.pump();
+      expect(find.text('T9'), findsOneWidget);
+    });
+
+    testWidgets('a side that can\'t list drives shows only the button', (tester) async {
+      await tester.pumpWidget(host(TransferDrives(load: () async => throw 'no such folder', onOpen: (_) {})));
+      await tester.pump();
+      expect(find.byType(TextButton), findsNothing);
+      expect(find.byTooltip('Look for drives again'), findsOneWidget);
+    });
+  });
+
   group('TransferJob reads the engine job', () {
     test('in progress: sending, with the share done', () {
       final j = job('inProgress', finished: 250, total: 1000);
@@ -166,6 +310,15 @@ void main() {
       expect(bar.value, 0.5);
       await tester.tap(find.byTooltip('Stop'));
       expect(got, [7]);
+    });
+
+    testWidgets('sending shows the live speed, done the average', (tester) async {
+      await tester.pumpWidget(list([
+        job('inProgress', finished: 500, speed: 108e6),
+      ]));
+      expect(find.text('50% · 108 MB/s'), findsOneWidget);
+      await tester.pumpWidget(list([job('done', averageSpeed: 97e6)]));
+      expect(find.text('Done · 97 MB/s average'), findsOneWidget);
     });
 
     testWidgets('done shows Done and no bar', (tester) async {

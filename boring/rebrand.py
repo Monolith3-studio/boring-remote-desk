@@ -1055,6 +1055,7 @@ FILE_MGR_METHODS = (
     "    from.sendFiles(from.selectedItems, from.getOtherSideDirectoryData());\n"
     "    from.selectedItems.clear();\n"
     "  }\n\n"
+    "  final _boringClock = TransferClock(); // boring-remote (v1.7 t27)\n\n"
     "  Widget boringTransferList() => Obx(() => TransferList(\n"
     "        jobs: [\n"
     "          for (final j in jobController.jobTable)\n"
@@ -1067,7 +1068,10 @@ FILE_MGR_METHODS = (
     "                  finished: j.finishedSize,\n"
     "                  total: j.totalSize,\n"
     "                  err: j.err,\n"
-    "                  delete: j.type != JobType.transfer), // deletes are listed too (v1.7 review)\n"
+    "                  delete: j.type != JobType.transfer, // deletes are listed too (v1.7 review)\n"
+    "                  speed: j.speed, // boring-remote (v1.7 t27)\n"
+    "                  averageSpeed: _boringClock.observe(\n"
+    "                      j.id, j.state.name, j.finishedSize, j.totalSize, DateTime.now())),\n"
     "        ],\n"
     "        onCancel: (id) {\n"
     "          jobController.jobTable.removeWhere((j) => j.id == id);\n"
@@ -2492,6 +2496,431 @@ def _fold_t20(r, old, new, why):
 
 
 PATCHES[:] = [_fold_t20(*p) for p in PATCHES]
+
+# --- File transfer at whatever the slowest link is (v1.7 ticket 27) -----------------------
+# libs/base/src/file_speed.rs and desktop/kit/file_transfer.dart are ours; these wire them in.
+# Sending: the 1 ms tick arm sends for up to a 2 ms slice instead of one block, so the socket sets
+# the pace and the other arms still run between slices. Target writing: the connection stops
+# reading the peer while 32 MiB is queued for its CM, and the CM acks what it wrote; upstream's queue
+# is unbounded. Windows Target reading (through the CM): the same window the other way, on a 1 ms tick
+# instead of 5 ms. A Controller keeps upstream's pace for a Target that doesn't say it can take more.
+# secretbox is about 450 MiB/s per core and the wire format is fixed, so TCP streams seal a run of
+# blocks, and open big frames already in the buffer, on several cores with the same nonces in the
+# same order. Small frames (input, most video, every old peer's handshake) take upstream's path.
+HBB_TCP = "libs/hbb_common/src/tcp.rs"
+HBB_STREAM = "libs/hbb_common/src/stream.rs"
+BASE_BUILD = "libs/base/build.rs"
+FS_RS = "libs/base/src/fs.rs"
+UI_CM = "src/ui_cm_interface.rs"
+IPC = "src/ipc.rs"
+T27_BUILD = (
+    "    // boring-remote (v1.7 t27): this tree's hbb_common has Stream::send_run. A raw checkout's doesn't.\n"
+    "    println!(\"cargo:rustc-check-cfg=cfg(boring_stream_run)\");\n"
+    "    println!(\"cargo:rustc-cfg=boring_stream_run\");\n")
+T27_READY = (
+    "/// boring-remote (v1.7 t27): frames opened ahead, which `next` hands out in order.\n"
+    "#[derive(Default)]\n"
+    "struct BoringReady(std::collections::VecDeque<Result<BytesMut, Error>>);\n\n"
+    "impl Clone for BoringReady {\n"
+    "    fn clone(&self) -> Self {\n"
+    "        Self::default()\n"
+    "    }\n"
+    "}\n\n"
+    "/// boring-remote (v1.7 t27): how many big frames open together, what counts as big, and on how\n"
+    "/// many cores. secretbox is about 450 MiB/s per core and the wire format isn't ours to change.\n"
+    "const BORING_RUN: usize = 8;\n"
+    "const BORING_RUN_FROM: usize = 64 * 1024;\n"
+    "const BORING_CORES: usize = 4;\n\n"
+    "fn boring_each<T: Send>(items: &mut [T], f: impl Fn(usize, &mut T) + Sync) {\n"
+    "    if items.len() < 2 {\n"
+    "        items.iter_mut().enumerate().for_each(|(i, item)| f(i, item));\n"
+    "        return;\n"
+    "    }\n"
+    "    let per = (items.len() + BORING_CORES - 1) / BORING_CORES;\n"
+    "    let f = &f;\n"
+    "    std::thread::scope(|s| {\n"
+    "        for (c, chunk) in items.chunks_mut(per).enumerate() {\n"
+    "            s.spawn(move || {\n"
+    "                for (i, item) in chunk.iter_mut().enumerate() {\n"
+    "                    f(c * per + i, item);\n"
+    "                }\n"
+    "            });\n"
+    "        }\n"
+    "    });\n"
+    "}\n\n")
+T27_ENC_RUN = (
+    "    /// boring-remote (v1.7 t27): the nonces `enc` would use one at a time, on several cores.\n"
+    "    fn enc_run(&mut self, mut msgs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {\n"
+    "        let (first, key) = (self.1, &self.0);\n"
+    "        boring_each(&mut msgs, |i, m| {\n"
+    "            *m = secretbox::seal(m, &FramedStream::get_nonce(first + 1 + i as u64), key);\n"
+    "        });\n"
+    "        self.1 += msgs.len() as u64;\n"
+    "        msgs\n"
+    "    }\n\n"
+    "    /// boring-remote (v1.7 t27): what `dec` does to each frame, on several cores, into the ready queue.\n"
+    "    fn open_run(&mut self, frames: Vec<BytesMut>) {\n"
+    "        let mut run: Vec<_> = frames\n"
+    "            .into_iter()\n"
+    "            .map(|frame| {\n"
+    "                let nonce = (frame.len() > 1).then(|| {\n"
+    "                    self.2 += 1;\n"
+    "                    FramedStream::get_nonce(self.2)\n"
+    "                });\n"
+    "                (nonce, Ok(frame))\n"
+    "            })\n"
+    "            .collect();\n"
+    "        let key = self.3.as_ref().unwrap_or(&self.0);\n"
+    "        boring_each(&mut run, |_, (nonce, res): &mut (Option<Nonce>, Result<BytesMut, Error>)| {\n"
+    "            if let (Some(nonce), Ok(frame)) = (nonce.as_ref(), res.as_ref()) {\n"
+    "                *res = secretbox::open(frame, nonce, key)\n"
+    "                    .map(|opened| BytesMut::from(&opened[..]))\n"
+    "                    .map_err(|()| Error::new(ErrorKind::Other, \"decryption error\"));\n"
+    "            }\n"
+    "        });\n"
+    "        self.4 .0.extend(run.into_iter().map(|(_, res)| res));\n"
+    "    }\n\n")
+T27_SEND_RUN = (
+    "    /// boring-remote (v1.7 t27): messages in order, sealed together. The same bytes on the wire.\n"
+    "    pub async fn send_run(&mut self, msgs: Vec<Vec<u8>>) -> ResultType<()> {\n"
+    "        let msgs = match self.2.as_mut() {\n"
+    "            Some(key) => key.enc_run(msgs),\n"
+    "            None => msgs,\n"
+    "        };\n"
+    "        for msg in msgs {\n"
+    "            self.send_bytes(Bytes::from(msg)).await?;\n"
+    "        }\n"
+    "        Ok(())\n"
+    "    }\n\n")
+T27_NEXT = (
+    "    pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {\n"
+    "        // boring-remote (v1.7 t27): big frames already here open together, on several cores.\n"
+    "        if let Some(ready) = self.2.as_mut().and_then(|key| key.4 .0.pop_front()) {\n"
+    "            return Some(ready);\n"
+    "        }\n"
+    "        let mut res = self.0.next().await;\n"
+    "        if self.2.is_some() && matches!(&res, Some(Ok(frame)) if frame.len() >= BORING_RUN_FROM) {\n"
+    "            let mut frames: Vec<BytesMut> = res.and_then(Result::ok).into_iter().collect();\n"
+    "            let mut failed = None;\n"
+    "            while frames.len() < BORING_RUN {\n"
+    "                // Nothing is awaited from here on, so a select dropping this future loses nothing.\n"
+    "                match futures::FutureExt::now_or_never(self.0.next()) {\n"
+    "                    Some(Some(Ok(frame))) => frames.push(frame),\n"
+    "                    Some(Some(Err(err))) => {\n"
+    "                        failed = Some(err);\n"
+    "                        break;\n"
+    "                    }\n"
+    "                    _ => break, // the end of the stream comes round again on the next call\n"
+    "                }\n"
+    "            }\n"
+    "            let key = self.2.as_mut()?;\n"
+    "            key.open_run(frames);\n"
+    "            key.4 .0.extend(failed.map(Err));\n"
+    "            return key.4 .0.pop_front();\n"
+    "        }\n")
+T27_STREAM_RUN = (
+    "    /// boring-remote (v1.7 t27): messages in order. TCP seals them together.\n"
+    "    pub async fn send_run(&mut self, msgs: Vec<Vec<u8>>) -> ResultType<()> {\n"
+    "        if let Stream::Tcp(s) = self {\n"
+    "            return s.send_run(msgs).await;\n"
+    "        }\n"
+    "        for msg in msgs {\n"
+    "            self.send_raw(msg).await?;\n"
+    "        }\n"
+    "        Ok(())\n"
+    "    }\n\n")
+T27_MOD = "pub mod file_speed; // boring-remote (v1.7 t27): full-speed file transfer\n"
+T27_COMPRESS = (
+    "            // boring-remote (v1.7 t27): not media, and not a file that has stopped shrinking.\n"
+    "            if matches!(self.data_source, DataSource::FilePath(_))\n"
+    "                && !is_compressed_file(name)\n"
+    "                && self.boring_compress.should_try(file_num, name)\n"
+    "            {\n"
+    "                let tmp = compress(&buf);\n"
+    "                self.boring_compress.saw(buf.len(), tmp.len());\n")
+T27_CONN_ARM = (
+    "                        // boring-remote (v1.7 t27): send for a slice, not one block per tick. The log\n"
+    "                        // to the CM was per tick, and now keeps a person's pace.\n"
+    "                        if conn.boring_file_log.ready(base::file_speed::LOG_EVERY) {\n"
+    "                            conn.send_to_cm(ipc::Data::FileTransferLog((\"transfer\".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));\n"
+    "                        }\n"
+    "                        match base::file_speed::pump_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {\n")
+T27_CONN_GUARD = (
+    "                // boring-remote (v1.7 t27): while the CM is 32 MiB behind, leave blocks in the socket so\n"
+    "                // the sender feels the disk. Other arms keep running; each ack wakes this loop.\n"
+    "                res = conn.stream.next(), if conn.boring_cm_window.has_room() => {\n")
+T27_CONN_ACK = (
+    "                        ipc::Data::FileWriteAck(bytes) => {\n"
+    "                            // boring-remote (v1.7 t27): the guard on conn.stream.next() stops\n"
+    "                            // last_recv_time moving, and a disk writing isn't an idle peer.\n"
+    "                            conn.boring_cm_window.refund(bytes);\n"
+    "                            last_recv_time = Instant::now();\n"
+    "                        }\n")
+T27_CONN_SPEND = (
+    "                        // boring-remote (v1.7 t27): acked by the CM's IPC task, on desktop only.\n"
+    "                        #[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+    "                        self.boring_cm_window.spend(block.data.len());\n")
+T27_MARKER = (
+    "        // boring-remote (v1.7 t27): this Target pushes back on a sender (base::file_speed::CmWindow).\n"
+    "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+    "        platform_additions.insert(base::file_speed::FULL_SPEED_KEY.into(), json!(true));\n")
+T27_READ_ACK = (
+    "        // boring-remote (v1.7 t27): every block, stale ones too, or the CM's window stays spent. The\n"
+    "        // send below finishes before this loop takes the next block.\n"
+    "        self.send_to_cm(ipc::Data::FileReadAck(data.len()));\n")
+T27_IPC = (
+    "    /// boring-remote (v1.7 t27): CM to connection, bytes it has written or taken off the queue.\n"
+    "    FileWriteAck(usize),\n"
+    "    /// boring-remote (v1.7 t27): connection to CM, bytes it has sent on from a CM read job.\n"
+    "    FileReadAck(usize),\n")
+T27_CM_STATE = (
+    "        // boring-remote (v1.7 t27): the two windows between this CM and its connection, and a\n"
+    "        // person's pace for the progress log.\n"
+    "        let mut boring_acks = base::file_speed::AckBatch::default();\n"
+    "        let mut boring_read_window = base::file_speed::CmWindow::default();\n"
+    "        let mut boring_write_log = base::file_speed::Every::default();\n"
+    "        let mut boring_read_log = base::file_speed::Every::default();\n")
+T27_CM_TICK = (
+    "                        let conn_id = self.conn_id;\n"
+    "                        // boring-remote (v1.7 t27): read for a slice while the connection keeps up.\n"
+    "                        // self.tx is unbounded, so the window is what stops a whole file landing in\n"
+    "                        // memory.\n"
+    "                        let boring_started = Instant::now();\n"
+    "                        while boring_read_window.has_room() {\n"
+    "                            let before = base::file_speed::progress(&self.read_jobs);\n"
+    "                            if let Err(e) = handle_read_jobs_tick(&mut self.read_jobs, &self.tx, conn_id).await {\n"
+    "                                log::error!(\"Error processing read jobs: {}\", e);\n"
+    "                            }\n"
+    "                            let after = base::file_speed::progress(&self.read_jobs);\n"
+    "                            boring_read_window.spend(after.1.saturating_sub(before.1) as usize);\n"
+    "                            if after == before || boring_started.elapsed() >= base::file_speed::SLICE {\n"
+    "                                break;\n"
+    "                            }\n"
+    "                        }\n"
+    "                        if boring_read_log.ready(base::file_speed::LOG_EVERY) || self.read_jobs.is_empty() {\n"
+    "                            let log = fs::serialize_transfer_jobs(&self.read_jobs);\n"
+    "                            self.cm.ui_handler.file_transfer_log(\"transfer\", &log);\n"
+    "                        }\n")
+T27_IO_ARM = (
+    "                                // boring-remote (v1.7 t27): send for a slice, not one block per tick,\n"
+    "                                // unless this Target would only queue them in memory.\n"
+    "                                let boring_sent = if self.boring_full_speed {\n"
+    "                                    base::file_speed::pump_read_jobs(&mut self.read_jobs, &mut peer).await\n"
+    "                                } else {\n"
+    "                                    fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await\n"
+    "                                };\n"
+    "                                if let Err(err) = boring_sent {\n")
+T27_IO_PEER = "                        self.boring_full_speed = base::file_speed::target_takes_full_speed(&pi.platform_additions); // boring-remote (v1.7 t27)\n"
+T27_IO_SPEED = (
+    "        // boring-remote (v1.7 t27): file bytes, so a job's speed agrees with its percentage on\n"
+    "        // compressed blocks too, and nothing until the second look, since a resumed job starts high.\n"
+    "        let transferred = job.finished_size();\n"
+    "        let last_transferred = last_update_jobs_status.1.get(&job.id()).copied();\n"
+    "        last_update_jobs_status.1.insert(job.id(), transferred);\n"
+    "        let speed = last_transferred.map_or(0., |last| {\n"
+    "            transferred.saturating_sub(last) as f64 / (elapsed as f64 / 1000.)\n"
+    "        });\n")
+T27_DRIVES = (
+    "  // boring-remote (v1.7 t27): one click to any drive on this side; the location bar still takes a path.\n"
+    "  Future<List<TransferDrive>> _boringLoadDrives() async {\n"
+    "    var platform = isLocal\n"
+    "        ? (isWindows ? kPeerPlatformWindows : (isMacOS ? kPeerPlatformMacOS : ''))\n"
+    "        : _ffi.ffiModel.pi.platform;\n"
+    "    // The other computer's platform arrives with its PeerInfo, just after this view builds.\n"
+    "    for (var i = 0; platform.isEmpty && !isLocal && i < 100; i++) {\n"
+    "      await Future.delayed(const Duration(milliseconds: 200));\n"
+    "      platform = _ffi.ffiModel.pi.platform;\n"
+    "    }\n"
+    "    final root = transferDriveRoot(platform);\n"
+    "    if (root == null) return const [];\n"
+    "    final fd = await controller.fileFetcher.fetchDirectory(root, isLocal, false);\n"
+    "    return transferDrivesFrom(platform, [\n"
+    "      for (final e in fd.entries)\n"
+    "        (name: e.name, directory: e.isDirectory || e.isDrive, link: e.entryType == 2)\n"
+    "    ]);\n"
+    "  }\n\n")
+T27_BLOCK_OLD = (
+    "                    Some(file_response::Union::Block(block)) => {\n"
+    "                        self.send_fs(ipc::FS::WriteBlock {\n")
+PATCHES += [
+    (BASE_LIB, T20_MOD, T20_MOD + T27_MOD, "base: file_speed module (t27)"),
+    (BASE_BUILD, "fn main() {\n", "fn main() {\n" + T27_BUILD, "base knows its hbb_common has send_run (t27)"),
+    (HBB_TCP, "pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>);\n",
+     "pub struct Encrypt(pub Key, pub u64, pub u64, Option<Key>, BoringReady);\n\n" + T27_READY,
+     "Encrypt holds frames opened ahead (t27)"),
+    (HBB_TCP, "        let Encrypt(send, _, _, recv) = Encrypt::new_split(key.clone(), true, &t).unwrap();\n",
+     "        let Encrypt(send, _, _, recv, _) = Encrypt::new_split(key.clone(), true, &t).unwrap();\n",
+     "upstream's Encrypt test, one more field (t27)"),
+    (HBB_TCP, "        let Encrypt(send, _, _, recv) = Encrypt::new_split(key, true, &t).unwrap();\n",
+     "        let Encrypt(send, _, _, recv, _) = Encrypt::new_split(key, true, &t).unwrap();\n",
+     "upstream's other Encrypt test, one more field (t27)"),
+    (HBB_TCP, "        Self(key, 0, 0, None)\n", "        Self(key, 0, 0, None, Default::default())\n", "Encrypt::new (t27)"),
+    (HBB_TCP, "            Self(initiator, 0, 0, Some(responder))\n",
+     "            Self(initiator, 0, 0, Some(responder), Default::default())\n", "Encrypt::new_split, initiator (t27)"),
+    (HBB_TCP, "            Self(responder, 0, 0, Some(initiator))\n",
+     "            Self(responder, 0, 0, Some(initiator), Default::default())\n", "Encrypt::new_split, responder (t27)"),
+    (HBB_TCP, "    pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {\n",
+     T27_ENC_RUN + "    pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {\n", "seal and open a run (t27)"),
+    (HBB_TCP, "    #[inline]\n    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {\n",
+     T27_SEND_RUN + "    #[inline]\n    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {\n",
+     "FramedStream::send_run (t27)"),
+    (HBB_TCP, "    pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {\n        let mut res = self.0.next().await;\n",
+     T27_NEXT, "FramedStream::next opens big frames together (t27)"),
+    (HBB_STREAM, "    #[inline]\n    pub async fn send_raw(&mut self, bytes: Vec<u8>) -> ResultType<()> {\n",
+     T27_STREAM_RUN + "    #[inline]\n    pub async fn send_raw(&mut self, bytes: Vec<u8>) -> ResultType<()> {\n",
+     "Stream::send_run (t27)"),
+    (FS_RS, "    #[serde(skip_serializing)]\n    digest: FileDigest,\n}\n",
+     "    #[serde(skip_serializing)]\n    digest: FileDigest,\n"
+     "    // boring-remote (v1.7 t27)\n    #[serde(skip_serializing)]\n"
+     "    boring_compress: crate::file_speed::CompressGate,\n"
+     "    #[serde(skip_serializing)]\n"
+     "    boring_ahead: crate::file_speed::ReadAhead,\n}\n",
+     "a job remembers whether its file still shrinks, and reads ahead (t27)"),
+    (FS_RS, "    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {\n",
+     "    // boring-remote (v1.7 t27): a run of blocks per thread hop instead of one.\n"
+     "    async fn read_ahead(\n"
+     "        &mut self,\n"
+     "        ahead: &mut crate::file_speed::ReadAhead,\n"
+     "        out: &mut [u8],\n"
+     "    ) -> std::io::Result<usize> {\n"
+     "        if ahead.is_empty() {\n"
+     "            let n = self.read(ahead.space()).await?;\n"
+     "            ahead.filled(n);\n"
+     "        }\n"
+     "        Ok(ahead.take(out))\n"
+     "    }\n\n"
+     "    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {\n",
+     "read-ahead on the data stream (t27)"),
+    (FS_RS,
+     "                .ok_or(anyhow!(\"data stream is None\"))?\n"
+     "                .read(&mut buf[offset..])\n"
+     "                .await\n",
+     "                .ok_or(anyhow!(\"data stream is None\"))?\n"
+     "                .read_ahead(&mut self.boring_ahead, &mut buf[offset..])\n"
+     "                .await\n",
+     "the job's reads go through the read-ahead (t27)"),
+    (FS_RS, "        log::debug!(\"skip file {} in job {}\", self.file_num, self.id);\n        self.data_stream.take();\n",
+     "        log::debug!(\"skip file {} in job {}\", self.file_num, self.id);\n"
+     "        self.boring_ahead.clear(); // boring-remote (v1.7 t27)\n"
+     "        self.data_stream.take();\n",
+     "a skip drops what was read ahead (t27)"),
+    (FS_RS, "            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {\n",
+     "            self.boring_ahead.clear(); // boring-remote (v1.7 t27)\n"
+     "            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {\n",
+     "a seek on resume drops what was read ahead (t27)"),
+    (FS_RS,
+     "            if matches!(self.data_source, DataSource::FilePath(_)) && !is_compressed_file(name) {\n"
+     "                let tmp = compress(&buf);\n",
+     T27_COMPRESS, "no zstd on media, or on a file that stopped shrinking (t27)"),
+    (CONN, "    read_jobs: Vec<fs::TransferJob>,\n",
+     "    read_jobs: Vec<fs::TransferJob>,\n"
+     "    boring_file_log: base::file_speed::Every, // boring-remote (v1.7 t27)\n"
+     "    boring_cm_window: base::file_speed::CmWindow, // boring-remote (v1.7 t27)\n", "transfer fields (t27)"),
+    (CONN, "            read_jobs: Vec::new(),\n",
+     "            read_jobs: Vec::new(),\n"
+     "            boring_file_log: Default::default(),\n"
+     "            boring_cm_window: Default::default(),\n", "transfer field defaults (t27)"),
+    (CONN,
+     "                        conn.send_to_cm(ipc::Data::FileTransferLog((\"transfer\".to_string(), fs::serialize_transfer_jobs(&conn.read_jobs))));\n"
+     "                        match fs::handle_read_jobs(&mut conn.read_jobs, &mut conn.stream).await {\n",
+     T27_CONN_ARM, "Target sends until the socket pushes back (t27)"),
+    (CONN, "                res = conn.stream.next() => {\n", T27_CONN_GUARD, "Target stops reading while its CM is behind (t27)"),
+    (CONN, "                        ipc::Data::FileBlockFromCM { id, file_num, data, compressed, conn_id } => {\n",
+     T27_CONN_ACK + "                        ipc::Data::FileBlockFromCM { id, file_num, data, compressed, conn_id } => {\n",
+     "the CM's acks open the window (t27)"),
+    (CONN, T27_BLOCK_OLD,
+     "                    Some(file_response::Union::Block(block)) => {\n" + T27_CONN_SPEND
+     + "                        self.send_fs(ipc::FS::WriteBlock {\n", "blocks to the CM spend the window (t27)"),
+    (CONN, T05_MARKER, T27_MARKER + T05_MARKER, "Target says it takes full speed (t27)"),
+    (CONN, "        // Check if the job is still valid (not cancelled)\n"
+           "        if !self.cm_read_job_ids.contains(&id) {\n"
+           "            log::debug!(\n"
+           "                \"Dropping file block for cancelled/unknown job id={}, file_num={}\",\n",
+     T27_READ_ACK
+     + "        // Check if the job is still valid (not cancelled)\n"
+       "        if !self.cm_read_job_ids.contains(&id) {\n"
+       "            log::debug!(\n"
+       "                \"Dropping file block for cancelled/unknown job id={}, file_num={}\",\n",
+     "blocks from a CM read job open its window (t27)"),
+    (IPC, "    /// Response to ReadAllFiles: recursive directory listing\n",
+     T27_IPC + "    /// Response to ReadAllFiles: recursive directory listing\n", "IPC: window acks (t27)"),
+    (UI_CM, "        const MILLI5: Duration = Duration::from_millis(5);\n",
+     "        const BORING_FILE_TICK: Duration = Duration::from_millis(1); // boring-remote (v1.7 t27): was 5 ms\n",
+     "CM read job tick (t27)"),
+    (UI_CM, "                                        file_timer = crate::rustdesk_interval(time::interval(MILLI5));\n",
+     "                                        file_timer = crate::rustdesk_interval(time::interval(BORING_FILE_TICK));\n",
+     "CM read job tick in use (t27)"),
+    (UI_CM, "        // for tmp use, without real conn id\n        let mut write_jobs: Vec<fs::TransferJob> = Vec::new();\n",
+     T27_CM_STATE + "        // for tmp use, without real conn id\n        let mut write_jobs: Vec<fs::TransferJob> = Vec::new();\n",
+     "CM transfer state (t27)"),
+    (UI_CM,
+     "                                Data::FS(mut fs) => {\n"
+     "                                    if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {\n"
+     "                                        if let Ok(bytes) = self.stream.next_raw().await {\n"
+     "                                            fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};\n"
+     "                                            handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;\n"
+     "                                        }\n",
+     "                                Data::FileReadAck(bytes) => boring_read_window.refund(bytes), // boring-remote (v1.7 t27)\n"
+     "                                Data::FS(mut fs) => {\n"
+     "                                    let boring_block = matches!(fs, ipc::FS::WriteBlock { .. }); // boring-remote (v1.7 t27)\n"
+     "                                    if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {\n"
+     "                                        if let Ok(bytes) = self.stream.next_raw().await {\n"
+     "                                            let boring_bytes = bytes.len();\n"
+     "                                            fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};\n"
+     "                                            handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;\n"
+     "                                            // boring-remote (v1.7 t27): written, so the connection may\n"
+     "                                            // read the peer again. Every block, even for a gone job.\n"
+     "                                            if let Some(n) = boring_acks.add(boring_bytes) {\n"
+     "                                                allow_err!(self.tx.send(Data::FileWriteAck(n)));\n"
+     "                                            }\n"
+     "                                        }\n",
+     "CM acks what it wrote (t27)"),
+    (UI_CM,
+     "                                    let log = fs::serialize_transfer_jobs(&write_jobs);\n"
+     "                                    self.cm.ui_handler.file_transfer_log(\"transfer\", &log);\n"
+     "                                }\n"
+     "                                Data::FileTransferLog((action, log)) => {\n",
+     "                                    // boring-remote (v1.7 t27): this was every block.\n"
+     "                                    if !boring_block || boring_write_log.ready(base::file_speed::LOG_EVERY) {\n"
+     "                                        let log = fs::serialize_transfer_jobs(&write_jobs);\n"
+     "                                        self.cm.ui_handler.file_transfer_log(\"transfer\", &log);\n"
+     "                                    }\n"
+     "                                }\n"
+     "                                Data::FileTransferLog((action, log)) => {\n",
+     "CM logs writes at a person's pace (t27)"),
+    (UI_CM,
+     "                        let conn_id = self.conn_id;\n"
+     "                        if let Err(e) = handle_read_jobs_tick(&mut self.read_jobs, &self.tx, conn_id).await {\n"
+     "                            log::error!(\"Error processing read jobs: {}\", e);\n"
+     "                        }\n"
+     "                        let log = fs::serialize_transfer_jobs(&self.read_jobs);\n"
+     "                        self.cm.ui_handler.file_transfer_log(\"transfer\", &log);\n",
+     T27_CM_TICK, "CM read jobs: a slice per tick, inside the window (t27)"),
+    (IO_LOOP, "    read_jobs: Vec<fs::TransferJob>,\n",
+     "    read_jobs: Vec<fs::TransferJob>,\n    boring_full_speed: bool, // boring-remote (v1.7 t27)\n", "Controller's pace field (t27)"),
+    (IO_LOOP, "            read_jobs: Vec::new(),\n",
+     "            read_jobs: Vec::new(),\n            boring_full_speed: false,\n", "Controller's pace starts at upstream's (t27)"),
+    (IO_LOOP, "                                if let Err(err) = fs::handle_read_jobs(&mut self.read_jobs, &mut peer).await {\n",
+     T27_IO_ARM, "Controller sends until the socket pushes back (t27)"),
+    (IO_LOOP, T05_ASK_CALL, T27_IO_PEER + T05_ASK_CALL, "Controller reads what the Target can take (t27)"),
+    (IO_LOOP,
+     "        let transferred = job.transferred();\n"
+     "        let last_transferred = {\n"
+     "            if let Some(v) = last_update_jobs_status.1.get(&job.id()) {\n"
+     "                v.to_owned()\n"
+     "            } else {\n"
+     "                0\n"
+     "            }\n"
+     "        };\n"
+     "        last_update_jobs_status.1.insert(job.id(), transferred);\n"
+     "        let speed = (transferred - last_transferred) as f64 / (elapsed as f64 / 1000.);\n",
+     T27_IO_SPEED, "the speed a person sees (t27)"),
+    (FILE_MGR, "  Widget headTools() {\n", T27_DRIVES + "  Widget headTools() {\n", "drive list loader (t27)"),
+    (FILE_MGR, "        children: [\n          headTools(),\n",
+     "        children: [\n          headTools(),\n"
+     "          TransferDrives(load: _boringLoadDrives, onOpen: controller.openDirectory), // boring-remote (v1.7 t27)\n",
+     "drive list on each side (t27)"),
+]
 
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
