@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
 import 'package:flutter_hbb/desktop/kit/lan_macs.dart';
@@ -300,5 +301,128 @@ void main() {
     expect(calls, 1);
     await tester.pump(MacHome.discoverEvery);
     expect(calls, 2);
+  });
+
+  // boring-remote (v1.7 t29): Transfer files from Home. The row is control; the button is transfer-only.
+  group('Transfer files', () {
+    late List<String> control, transfer;
+    setUp(() {
+      control = [];
+      transfer = [];
+    });
+    MacHome both() => MacHome(
+        macs: const [MacEntry(name: 'Edit Bay 2', target: '123456789')],
+        lan: const [LanMac(name: 'stage-left', ip: '10.0.4.7')],
+        tailscaleAddress: () async => null,
+        onConnect: control.add,
+        onTransferFiles: transfer.add);
+    Finder onRow(String name) => find.descendant(
+        of: find.ancestor(of: find.text(name), matching: find.byType(ListTile)), matching: find.text('Transfer files'));
+
+    testWidgets('each machine in both lists has a visible button; it opens transfer, not control', (tester) async {
+      await tester.pumpWidget(host(both()));
+      expect(find.text('Transfer files'), findsNWidgets(2));
+      await tester.tap(onRow('stage-left'));
+      await tester.tap(onRow('Edit Bay 2'));
+      expect(transfer, ['10.0.4.7', '123456789']);
+      expect(control, isEmpty);
+    });
+
+    testWidgets('clicking the row still means control', (tester) async {
+      await tester.pumpWidget(host(both()));
+      await tester.tap(find.text('stage-left'));
+      await tester.tap(find.text('Edit Bay 2'));
+      expect(control, ['10.0.4.7', '123456789']);
+      expect(transfer, isEmpty);
+    });
+
+    testWidgets('the row button is reachable by keyboard: Tab to it, Return opens transfer', (tester) async {
+      await tester.pumpWidget(host(both()));
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab); // first row
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab); // its button
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+      expect(transfer, ['10.0.4.7']);
+      expect(control, isEmpty);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+    testWidgets('keyboard focus on the button is visible: a coral border', (tester) async {
+      await tester.pumpWidget(host(both()));
+      await tester.pump();
+      BorderSide side() {
+        final material = tester.widget<Material>(
+            find.descendant(of: find.byType(OutlinedButton).first, matching: find.byType(Material)).first);
+        return (material.shape! as OutlinedBorder).side;
+      }
+
+      expect(side().color, Kit.muted);
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.pumpAndSettle();
+      expect(side().color, Kit.coral);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+    testWidgets('the address box offers it once something is typed: the same target Return would dial',
+        (tester) async {
+      await tester.pumpWidget(host(both()));
+      final box = find.byKey(MacHome.addressKey);
+      final button = find.byKey(MacHome.addressTransferKey);
+      expect(button, findsNothing);
+      for (final (typed, target) in [
+        (' 192.168.1.40 ', '192.168.1.40'), // an IP
+        ('m1-d2.tailnet.ts.net', 'm1-d2.tailnet.ts.net'), // a name nothing lists
+        ('STAGE-LEFT', '10.0.4.7'), // a machine on this network: its IP
+        ('edit bay 2', '123456789'), // a machine used before
+      ]) {
+        await tester.enterText(box, typed);
+        await tester.pump();
+        expect(find.descendant(of: button, matching: find.text('Transfer files')), findsOneWidget);
+        await tester.tap(button);
+        await tester.testTextInput.receiveAction(TextInputAction.done);
+        expect(transfer.last, target);
+        expect(control.last, target);
+      }
+      expect(transfer.length, 4);
+      expect(control.length, 4);
+      await tester.enterText(box, '   ');
+      await tester.pump();
+      expect(button, findsNothing);
+    });
+
+    testWidgets('the address box button is the next Tab stop after the box', (tester) async {
+      await tester.pumpWidget(host(both()));
+      await tester.pump();
+      await tester.enterText(find.byKey(MacHome.addressKey), '192.168.1.40');
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+      expect(transfer, ['192.168.1.40']);
+      expect(control, isEmpty);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.macOS));
+
+    testWidgets('a long machine name still leaves the button whole on a narrow window', (tester) async {
+      tester.view.physicalSize = const Size(420, 700);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(host(MacHome(
+          macs: const [MacEntry(name: 'The long-named edit bay computer upstairs by the loading dock', target: 'a')],
+          tailscaleAddress: () async => null,
+          onConnect: control.add,
+          onTransferFiles: transfer.add)));
+      expect(tester.takeException(), isNull);
+      expect(find.text('Transfer files'), findsOneWidget);
+      expect(tester.getRect(find.text('Transfer files')).right, lessThanOrEqualTo(420));
+    });
+
+    testWidgets('with no transfer callback Home shows no button (a page that has not wired it)', (tester) async {
+      await tester.pumpWidget(host(home()));
+      expect(find.text('Transfer files'), findsNothing);
+    });
   });
 }

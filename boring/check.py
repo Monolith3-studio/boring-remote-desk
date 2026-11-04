@@ -1079,6 +1079,82 @@ def target_word_checks(c):
            not why, "; ".join(why))
 
 
+TRANSFER_HOME = "Home's Transfer files opens a transfer-only connection, on every row and the address box (t29)"
+TRANSFER_ASK = "a transfer-only connection gets Allow like any other, and the ask says transfer files (t29)"
+TRANSFER_NO_CAPTURE = "a transfer-only connection starts no screen capture or encoder on the Target (t29)"
+
+
+def transfer_checks(c):
+    """v1.7 t29: File Transfer alone from Home. It dials through _start like everything else, so the
+    connect box facts above cover it; these are what's new about it."""
+    home_kit = c.read("flutter/lib/desktop/kit/mac_home.dart")
+    method = fn_body(c.read(rebrand.HOME), "  Widget buildBoringHome(BuildContext context) {") or ""
+    why = []
+    if "onTransferFiles: (t) => connect(context, t, isFileTransfer: true)," not in method:
+        why.append("buildBoringHome does not open File Transfer alone")
+    if "onConnect: (t) => connect(context, t)," not in method:
+        why.append("a row no longer means control")
+    if "transferFiles = 'Transfer files'" not in home_kit:
+        why.append("the button lost its words")
+    # One for each of On this network and Used before, one for the Address box, with the typed target.
+    if home_kit.count("trailing: _transferButton(") != 2 or "_transferButton(() => _typedTarget(" not in home_kit:
+        why.append("a list or the Address box has no Transfer files")
+    c.fact(TRANSFER_HOME, not why, "; ".join(why))
+
+    trust, approval = c.read("flutter/lib/desktop/kit/trust.dart"), c.read("flutter/lib/desktop/kit/approval.dart")
+    page, model = c.read(rebrand.CM_PAGE), c.read(rebrand.SERVER_MODEL)
+    conn = strip_tests_and_comments(c.read("src/server/connection.rs"))
+    why = []
+    if "wants to transfer files with this ${KitWords.one}." not in trust:
+        why.append("the ask does not say transfer files in this machine's word")
+    for text, need in ((trust, "approvalQuestion(name, files: files)"), (approval, "approvalQuestion(name, files: files)"),
+                       (approval, "approvalQuestion(w.name, files: w.files)"),
+                       (page, "files: client.type_() == ClientType.file,")):
+        if need not in text:
+            why.append(f"lost {need}")
+    if model.count("approvalAsk(") != model.count("files: client.type_() == ClientType.file,"):
+        why.append("an ask to the main window does not say what kind it is")
+    # The trust gate runs once the login's kind is known and does not look at the kind.
+    login = conn.find("if self.boring_trust.is_trusted() {")
+    ask = conn.find("if self.boring_trust.must_ask() {")
+    kind = conn.find("self.file_transfer = Some((ft.dir, ft.show_hidden));")
+    if not 0 <= kind < login < ask:
+        why.append("the trust gate does not run on every kind of login")
+    if re.search(r"file_transfer[^\n]*\n[^\n]*boring_trust|boring_trust[^\n]*file_transfer", conn):
+        why.append("the trust gate treats a transfer differently")
+    c.fact(TRANSFER_ASK, not why, "; ".join(why))
+
+    logon = fn_body(conn, "    async fn send_logon_response_and_keep_alive(&mut self) -> bool {") or ""
+    only_info = "if self.file_transfer.is_some() || self.terminal {\n            res.set_peer_info(pi);\n        } else if"
+    why = []
+    if only_info not in logon or "sub_service = true" not in logon \
+            or logon.index("sub_service = true") < logon.index(only_info):
+        why.append("the login may reach sub_service before the file-transfer branch")
+    if "if let Some((dir, show_hidden)) = self.file_transfer.clone() {" not in logon or "} else if sub_service {" not in logon \
+            or logon.index("} else if sub_service {") < logon.index("self.file_transfer.clone()"):
+        why.append("a transfer's login may subscribe the monitor services")
+    if "self.file_transfer.is_none()" not in (fn_body(conn, "    fn is_remote(&self) -> bool {") or ""):
+        why.append("is_remote counts a transfer")
+    sub = fn_body(conn, "    fn try_sub_monitor_services(&mut self) {") or ""
+    if "let is_remote = self.is_remote();" not in sub or "if is_remote && !self.services_subed {" not in sub:
+        why.append("try_sub_monitor_services is not only for a remote connection")
+    for call in ("try_add_monitor_service(", "add_monitor_connection("):
+        if conn.count(call) != 1 or call not in sub:
+            why.append(f"{call} is reached outside try_sub_monitor_services")
+    scoped = fn_body(conn, "    fn is_file_transfer_scoped_message(msg: &Message) -> bool {") or ""
+    misc = fn_body(conn, "    fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {") or ""
+    if set(re.findall(r"message::Union::(\w+)", scoped)) != {"FileAction", "FileResponse", "Misc"}:
+        why.append("a transfer may send messages other than files")
+    if set(re.findall(r"misc::Union::(\w+)", misc)) != {"SelectedSid"}:
+        why.append("a transfer may send a Misc that can pick a display")
+    if "if let Some(message) = self.authorized_scope_violation(&msg) {" not in conn:
+        why.append("the scope gate no longer runs on messages")
+    svc = c.read("src/server/service.rs")
+    if svc.count("if sp.has_subscribes() {") != 2:
+        why.append("a service runs with no subscriber")
+    c.fact(TRANSFER_NO_CAPTURE, not why, "; ".join(why))
+
+
 def rust_hook_checks(c):
     """v1.7: our Rust lives in new files under libs/base/src; upstream files only get these hooks,
     through rebrand.py. On a raw checkout every one of them is missing."""
@@ -1665,6 +1741,7 @@ def run_checks(root):
     msi_checks(c, workflows)
     branding_checks(c)
     connect_checks(c)
+    transfer_checks(c)  # v1.7 t29
     look_checks(c)  # v1.7 review: nothing left in the RustDesk look
 
     # protocol untouched: every .proto in the tree is upstream's, byte for byte

@@ -26,14 +26,16 @@ class ApprovalMsg {
   final String key;
   final String ip;
   final bool allow; // answer only
+  final bool files; // ask only: a transfer-only connection (v1.7 t29)
   const ApprovalMsg(this.kind, this.id,
-      {this.name = '', this.trust = '', this.key = '', this.ip = '', this.allow = false});
+      {this.name = '', this.trust = '', this.key = '', this.ip = '', this.allow = false, this.files = false});
 }
 
 /// `ask:<id>:<trust>:<key>:<ip>:<name>`, ip and name percent-encoded (an IPv6 address has colons).
-String approvalAsk(int id, String name, {String trust = '', String key = '', String ip = ''}) =>
+/// A transfer-only ask ends in `:files` (v1.7 t29).
+String approvalAsk(int id, String name, {String trust = '', String key = '', String ip = '', bool files = false}) =>
     '$kApprovalAsk$id:${Uri.encodeComponent(trust)}:${Uri.encodeComponent(key)}:'
-    '${Uri.encodeComponent(ip)}:${Uri.encodeComponent(name)}';
+    '${Uri.encodeComponent(ip)}:${Uri.encodeComponent(name)}${files ? ':files' : ''}';
 String approvalDone(int id) => '$kApprovalDone$id';
 String approvalAnswer(int id, bool allow) => '$kApprovalAnswer$id:${allow ? 'allow' : 'deny'}';
 
@@ -59,8 +61,9 @@ ApprovalMsg? parseApproval(String msg) {
           }
         }
         final f = tail.split(':');
-        if (f.length != 4) return ApprovalMsg(kind, id, name: dec(tail));
-        return ApprovalMsg(kind, id, trust: dec(f[0]), key: dec(f[1]), ip: dec(f[2]), name: dec(f[3]));
+        final files = f.length == 5 && f[4] == 'files';
+        if (f.length != 4 && !files) return ApprovalMsg(kind, id, name: dec(tail));
+        return ApprovalMsg(kind, id, trust: dec(f[0]), key: dec(f[1]), ip: dec(f[2]), name: dec(f[3]), files: files);
       case ApprovalKind.done:
         return ApprovalMsg(kind, id);
       case ApprovalKind.answer:
@@ -77,11 +80,18 @@ class ApprovalRequestView extends StatelessWidget {
   final String name;
   final String trust;
   final String ip;
+  final bool files; // a transfer-only connection (v1.7 t29)
   final VoidCallback onAllow;
   final VoidCallback onDeny;
 
   const ApprovalRequestView(
-      {super.key, required this.name, this.trust = '', this.ip = '', required this.onAllow, required this.onDeny});
+      {super.key,
+      required this.name,
+      this.trust = '',
+      this.ip = '',
+      this.files = false,
+      required this.onAllow,
+      required this.onDeny});
 
   @override
   Widget build(BuildContext context) {
@@ -132,7 +142,7 @@ class ApprovalRequestView extends StatelessWidget {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Text(approvalQuestion(name),
+                      Text(approvalQuestion(name, files: files),
                           textAlign: TextAlign.center,
                           style: t.headlineSmall?.copyWith(height: 1.25)),
                       if (approvalWho(trust, ip).isNotEmpty) ...[
@@ -214,7 +224,7 @@ class ApprovalDesk {
   }
 
   void _publish() => waitingNow.value = [
-        for (final m in _waiting.values) WaitingAsk(m.id, m.name, trust: m.trust, key: m.key, ip: m.ip)
+        for (final m in _waiting.values) WaitingAsk(m.id, m.name, trust: m.trust, key: m.key, ip: m.ip, files: m.files)
       ];
 
   void _hide() {
@@ -241,6 +251,7 @@ class ApprovalDesk {
           name: ask.name,
           trust: ask.trust,
           ip: ask.ip,
+          files: ask.files,
           onAllow: () => decide(id, true),
           onDeny: () => decide(id, false),
         ),
@@ -256,7 +267,8 @@ class WaitingAsk {
   final String trust;
   final String key;
   final String ip;
-  const WaitingAsk(this.id, this.name, {this.trust = '', this.key = '', this.ip = ''});
+  final bool files; // a transfer-only connection (v1.7 t29)
+  const WaitingAsk(this.id, this.name, {this.trust = '', this.key = '', this.ip = '', this.files = false});
 }
 
 /// Settings → Trusted list → Allow on removed [c]: the waiting asks that presented its token
@@ -294,7 +306,7 @@ class WaitingApprovals extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(approvalQuestion(w.name), style: t.titleMedium),
+                  Text(approvalQuestion(w.name, files: w.files), style: t.titleMedium),
                   if (approvalWho(w.trust, w.ip).isNotEmpty) Text(approvalWho(w.trust, w.ip), style: t.bodyMedium),
                   const SizedBox(height: Kit.s3),
                   Row(children: [

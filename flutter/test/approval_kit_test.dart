@@ -202,4 +202,46 @@ void main() {
     expect(find.text('Jason M Studio'), findsOneWidget); // now listed as Trusted, with Remove
     expect(find.text('Remove'), findsNWidgets(2));
   });
+
+  // boring-remote (v1.7 t29): a transfer-only ask says so. It still needs Allow, and Allow still trusts.
+  test('a transfer-only ask keeps its kind through the message; a control ask stays as it was', () {
+    final m = parseApproval(approvalAsk(9, 'Edit Bay 2', trust: 'new', key: 'k', ip: 'fe80::1', files: true))!;
+    expect(m.files, isTrue);
+    expect([m.id, m.name, m.trust, m.key, m.ip], [9, 'Edit Bay 2', 'new', 'k', 'fe80::1']);
+    expect(approvalAsk(7, 'a b'), 'boring-approval-ask:7::::a%20b');
+    expect(parseApproval(approvalAsk(7, 'a b'))!.files, isFalse);
+  });
+
+  testWidgets('every surface of a transfer-only ask says transfer files, and that Allow trusts it', (tester) async {
+    await mainWindow(tester, const Size(900, 700));
+    const q = 'Edit Bay 2 wants to transfer files with this Mac.';
+    await tester.pumpWidget(MaterialApp(
+        theme: Kit.theme(),
+        home: Scaffold(
+            body: ApprovalRequestView(name: 'Edit Bay 2', files: true, onAllow: () {}, onDeny: () {}))));
+    expect(find.text(q), findsOneWidget);
+    expect(find.text(kApprovalWhy), findsOneWidget);
+    await tester.pumpWidget(MaterialApp(
+        theme: Kit.theme(),
+        home: Scaffold(body: ApprovalPrompt(name: 'Edit Bay 2', files: true, onAllow: () {}, onDeny: () {}))));
+    expect(find.text(q), findsOneWidget);
+    expect(find.text(kApprovalWhy), findsOneWidget);
+    await tester.pumpWidget(MaterialApp(
+        theme: Kit.theme(),
+        home: Scaffold(
+            body: WaitingApprovals(
+                waiting: ValueNotifier(const [WaitingAsk(1, 'Edit Bay 2', files: true)]), onDecide: (_, __) {}))));
+    expect(find.text(q), findsOneWidget);
+  });
+
+  testWidgets('the main window desk carries a transfer-only ask to the middle of the window', (tester) async {
+    final nav = await mainWindow(tester, const Size(900, 700));
+    final desk = ApprovalDesk(overlay: () => nav.currentState?.overlay, toFront: () async {}, answer: (_, __) {});
+    desk.take(parseApproval(approvalAsk(3, 'FOH', files: true))!);
+    await tester.pump();
+    expect(find.text('FOH wants to transfer files with this Mac.'), findsOneWidget);
+    expect(ApprovalDesk.waitingNow.value.single.files, isTrue);
+    desk.decide(3, true);
+    await tester.pump();
+  });
 }

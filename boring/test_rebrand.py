@@ -322,6 +322,65 @@ class RebrandSeam(unittest.TestCase):
         self.edit("flutter/lib/desktop/kit/mac_home.dart", "To reach this $one", "To reach this computer")
         self.assert_check_fails(self.TARGET_WORDS)
 
+    # --- v1.7 t29: Transfer files from Home, with no screen capture on the Target -
+    def test_t29_passes_after_rebrand(self):
+        self.rebrand()
+        out = run(CHECK, self.root).stdout
+        for fact in (check.TRANSFER_HOME, check.TRANSFER_ASK, check.TRANSFER_NO_CAPTURE, CONNECT_DIRECT):
+            self.assertIn(f"PASS {fact}", out)
+
+    def test_home_transfer_opening_a_session_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "connect(context, t, isFileTransfer: true)", "connect(context, t)")
+        self.assert_check_fails(check.TRANSFER_HOME)
+
+    def test_a_list_without_the_button_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/mac_home.dart", "trailing: _transferButton(() => m.ip),\n", "")
+        self.assert_check_fails(check.TRANSFER_HOME)
+
+    def test_address_box_without_the_button_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/mac_home.dart", "_transferButton(() => _typedTarget(_address.text)", "_transferButton(() => ''")
+        self.assert_check_fails(check.TRANSFER_HOME)
+
+    def test_a_transfer_skipping_the_trust_gate_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "if self.boring_trust.must_ask() {",
+                  "if self.file_transfer.is_none() && self.boring_trust.must_ask() {")
+        self.assert_check_fails(check.TRANSFER_ASK)
+
+    def test_ask_saying_control_for_a_transfer_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SERVER_MODEL, "files: client.type_() == ClientType.file,", "files: false,")
+        self.assert_check_fails(check.TRANSFER_ASK)
+
+    def test_a_transfer_subscribing_the_screen_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "if self.file_transfer.is_some() || self.terminal {\n            res.set_peer_info(pi);",
+                  "if self.terminal {\n            res.set_peer_info(pi);")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
+    def test_is_remote_counting_a_transfer_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "self.file_transfer.is_none()\n            && !self.is_port_forward()",
+                  "!self.is_port_forward()")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
+    def test_a_new_way_to_the_monitor_service_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "    fn try_sub_camera_displays(&mut self) {\n",
+                  "    fn sneak(&mut self, s: &mut Server) { s.try_add_monitor_service(0); }\n"
+                  "    fn try_sub_camera_displays(&mut self) {\n")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
+    def test_a_transfer_allowed_to_pick_a_display_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) => true,",
+                  "Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) | Some(message::Union::VideoReceived(_)) => true,")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
     def test_home_listing_every_address_fails_check(self):
         self.rebrand()
         self.edit(rebrand.HOME, "oneEntryPerMachine(", "List.of(")

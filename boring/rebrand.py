@@ -1011,6 +1011,8 @@ MAC_HOME_METHOD = (
     "            lan: lanMacs.macs,\n"
     "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
+    "            // boring-remote (v1.7 t29): File Transfer alone, same dial and trust as a session.\n"
+    "            onTransferFiles: (t) => connect(context, t, isFileTransfer: true),\n"
     "            notices: [\n"
     "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n"
     + NOTICE_BANNER +
@@ -1558,6 +1560,7 @@ T04_PROMPT = (
     "            name: client.name,\n"
     "            trust: client.boringTrust,\n"
     "            ip: client.boringIp,\n"
+    "            files: client.type_() == ClientType.file, // v1.7 t29: says transfer, not control\n"
     "            onAllow: () {\n"
     "              handleAccept(context);\n"
     "              windowManager.minimize();\n"
@@ -1650,6 +1653,7 @@ T04B_ASK = (
     "        bind.boringApprovalSend(\n"
     "            msg: !client.authorized && approveMode != 'password'\n"
     "                ? approvalAsk(client.id, client.name,\n"
+    "                    files: client.type_() == ClientType.file, // v1.7 t29\n"
     "                    trust: client.boringTrust, key: client.boringKey, ip: client.boringIp)\n"
     "                : approvalDone(client.id));\n"
     "      }\n")
