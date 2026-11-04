@@ -50,6 +50,10 @@ List<MacEntry> oneEntryPerMachine(List<MacEntry> newestFirst) {
 /// Mac Home (v1.7): one Address box and the Macs list. Bridge-free; the home page passes data and callbacks.
 class MacHome extends StatefulWidget {
   static const addressKey = Key('mac-home-address');
+  static const addressTransferKey = Key('mac-home-address-transfer');
+
+  /// boring-remote (v1.7 t29): the button that opens a transfer-only connection, with no remote screen.
+  static const transferFiles = 'Transfer files';
 
   /// What Home says while no other Boring Remote has answered on this network (ticket 21).
   static List<String> emptyLines() => [
@@ -76,6 +80,9 @@ class MacHome extends StatefulWidget {
   final Future<String?> Function() tailscaleAddress;
   final void Function(String target) onConnect;
 
+  /// boring-remote (v1.7 t29): opens File Transfer alone for a machine. Null hides the buttons.
+  final void Function(String target)? onTransferFiles;
+
   /// Page-level notices (the update banner), shown above the Address box.
   final List<Widget> notices;
 
@@ -84,6 +91,7 @@ class MacHome extends StatefulWidget {
     required this.macs,
     required this.tailscaleAddress,
     required this.onConnect,
+    this.onTransferFiles,
     this.notices = const [],
     this.lan = const [],
     this.discover,
@@ -114,15 +122,35 @@ class _MacHomeState extends State<MacHome> {
     super.dispose();
   }
 
-  /// Return connects to the Mac whose name matches (any case): one on this network first (its IP),
-  /// then a recent one, else to whatever was typed (an IP).
-  void _submit(String text) {
+  /// What the Address box dials: the Mac whose name matches (any case), one on this network first
+  /// (its IP), then a recent one, else whatever was typed (an IP).
+  String _typedTarget(String text) {
     final q = text.trim();
-    if (q.isEmpty) return;
     final low = q.toLowerCase();
     final here = widget.lan.where((m) => m.name.toLowerCase() == low);
     final recent = widget.macs.where((m) => m.name.toLowerCase() == low);
-    widget.onConnect(here.isNotEmpty ? here.first.ip : (recent.isNotEmpty ? recent.first.target : q));
+    return here.isNotEmpty ? here.first.ip : (recent.isNotEmpty ? recent.first.target : q);
+  }
+
+  void _submit(String text) {
+    if (text.trim().isNotEmpty) widget.onConnect(_typedTarget(text));
+  }
+
+  /// boring-remote (v1.7 t29): the row or the box means control; this button means transfer only.
+  /// Coral marks keyboard focus, as it does on the Address box.
+  Widget? _transferButton(String Function() target, {Key? key}) {
+    final open = widget.onTransferFiles;
+    if (open == null) return null;
+    return OutlinedButton(
+      key: key,
+      style: ButtonStyle(
+        side: WidgetStateProperty.resolveWith((states) => BorderSide(
+            color: states.contains(WidgetState.focused) ? Kit.coral : Kit.muted,
+            width: states.contains(WidgetState.focused) ? 1.5 : 1)),
+      ),
+      onPressed: () => open(target()),
+      child: const Text(MacHome.transferFiles),
+    );
   }
 
   @override
@@ -146,6 +174,13 @@ class _MacHomeState extends State<MacHome> {
             decoration: InputDecoration(
               hintText: "Type a computer's name",
               prefixIcon: const Icon(Icons.search, color: Kit.muted),
+              // boring-remote (v1.7 t29): Return is control, this is transfer, for the same target.
+              suffixIcon: q.isEmpty || widget.onTransferFiles == null
+                  ? null
+                  : Padding(
+                      padding: const EdgeInsets.only(right: Kit.s2),
+                      child: _transferButton(() => _typedTarget(_address.text), key: MacHome.addressTransferKey),
+                    ),
             ),
             onChanged: (_) => setState(() {}),
             onSubmitted: _submit,
@@ -171,6 +206,7 @@ class _MacHomeState extends State<MacHome> {
                       leading: const Icon(Icons.lan_outlined),
                       title: Text(m.name),
                       subtitle: Text(m.ip, style: const TextStyle(color: Kit.muted)),
+                      trailing: _transferButton(() => m.ip),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Kit.radius)),
                       hoverColor: Kit.glass,
                       onTap: () => widget.onConnect(m.ip),
@@ -188,6 +224,7 @@ class _MacHomeState extends State<MacHome> {
                   ListTile(
                     leading: const Icon(Icons.desktop_mac_outlined),
                     title: Text(m.name),
+                    trailing: _transferButton(() => m.target),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(Kit.radius)),
                     hoverColor: Kit.glass,
                     onTap: () => widget.onConnect(m.target),
