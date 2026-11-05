@@ -14,7 +14,7 @@ path bar and status bar on every window.
 
 The fonts are Boring Type and are NOT in this repo (they are not ours to publish).
 Point --fonts (or BORING_TYPE_DIR) at a folder holding neue-corp-ultrabold.otf and
-neue-corp-medium.otf. The script stops if a face is missing rather than fall back.
+soehne-buch.otf. The script stops if a face is missing rather than fall back.
 Needs Pillow. Output is deterministic: same fonts, same bytes.
 """
 import argparse
@@ -29,11 +29,13 @@ HERE = pathlib.Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("msi_art", HERE.parent / "msi" / "make_art.py")
 _msi = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_msi)
-CORAL, INK, MUTED, PAPER, SS = _msi.CORAL, _msi.INK, _msi.MUTED, _msi.PAPER, _msi.SS
-canvas, eyebrow, face, text = _msi.canvas, _msi.eyebrow, _msi.face, _msi.text
+CORAL, INK, MUTED, SS = _msi.CORAL, _msi.INK, _msi.MUTED, _msi.SS
+canvas, face, flask, text = _msi.canvas, _msi.face, _msi.flask, _msi.text
 
 W, H = 640, 440
+BODY = "soehne-buch.otf"
 APP_XY, APPS_XY = (160, 178), (480, 178)  # icon centres, must match settings.py
+PAPER = (0xEE, 0xEA, 0xDF)
 PANEL = (0x19, 0x17, 0x1A)
 PLATE = (0x7D, 0x7D, 0x82)  # mid grey: Finder draws icon names black in Light Mode, white in Dark
 
@@ -53,11 +55,12 @@ def background(fonts, scale):
     im, d = canvas(W, H, INK)
     R = lambda x0, y0, x1, y1: [x0 * SS, y0 * SS, x1 * SS, y1 * SS]
 
-    label = face(fonts, "neue-corp-medium.otf", 12)
+    label = face(fonts, BODY, 12)
     ew = 17 + sum(label.getlength(ch) for ch in "BORING LABS") / SS + 1.2 * 10
-    eyebrow(d, (W - ew) / 2, 22, fonts, INK)
+    d.polygon(flask(d, (W - ew) / 2, 22, 12), fill=INK)
+    text(d, ((W - ew) / 2 + 17, 21), "BORING LABS", label, MUTED, kern=1.2)
     centred(d, 40, "Boring Remote", face(fonts, "neue-corp-ultrabold.otf", 36), PAPER)
-    centred(d, 88, "Drive your other computers over your tailnet.", face(fonts, "neue-corp-medium.otf", 16), MUTED)
+    centred(d, 92, "Drive your other computers over your tailnet.", face(fonts, BODY, 16), MUTED)
 
     # Drag arrow between the icons.
     y = APP_XY[1]
@@ -72,10 +75,10 @@ def background(fonts, scale):
     d.rounded_rectangle(R(x0, y0, x1, y1), 2 * SS, fill=PANEL)
     d.rectangle(R(x0, y0, x0 + 3, y1), fill=CORAL)
     num = face(fonts, "neue-corp-ultrabold.otf", 16)
-    body = face(fonts, "neue-corp-medium.otf", 16)
+    body = face(fonts, BODY, 16)
     for i, s in enumerate(STEPS):
         ry = y0 + 14 + i * 25
-        text(d, (x0 + 24, ry), str(i + 1), num, CORAL)
+        text(d, (x0 + 24, ry - 3), str(i + 1), num, CORAL)  # baselines match the Soehne line
         text(d, (x0 + 48, ry), s, body, PAPER)
 
     return im.resize((W * scale, H * scale), Image.LANCZOS)
