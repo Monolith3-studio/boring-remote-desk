@@ -344,7 +344,7 @@ class UpdatePackage(unittest.TestCase):
 
 class Workflow(unittest.TestCase):
     def test_ci_never_publishes_an_approved_release(self):
-        # The Engine installs GitHub's Latest release (the approved release); only Jason sets it.
+        # The Engine installs GitHub's Latest release (the approved release); only a person sets it.
         creates = [l for l in WORKFLOW.read_text().splitlines() if "gh release create" in l]
         self.assertEqual(len(creates), 2)
         for l in creates:

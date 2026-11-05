@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'license_key_field.dart';
 
-// ASSUMPTION (unconfirmed by Jason, spec "Assumptions"): the page that tells
+// ASSUMPTION (unconfirmed, spec "Assumptions"): the page that tells
 // buyers to use the Download Link in their purchase email. Confirm before
 // this ships. This is the only place the URL lives.
 const kBoringUpdatePageUrl = 'https://boringlabs.online/remote/update';

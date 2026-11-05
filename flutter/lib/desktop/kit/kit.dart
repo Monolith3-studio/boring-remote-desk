@@ -39,7 +39,7 @@ class Kit {
   static const Color coral = Color(0xFFFF5949); // accent, non-text only
   static const Color ok = Color(0xFF0DBC79); // done / allowed: Setup's green checks
 
-  // The app uses the platform UI font (SF Pro on Mac, Segoe UI on Windows): Jason, 2026-11-02.
+  // The app uses the platform UI font (SF Pro on Mac, Segoe UI on Windows), 2026-11-02.
 
   static const double s1 = 4, s2 = 8, s3 = 12, s4 = 16, s5 = 24, s6 = 32, s7 = 48;
   static const double radius = 10;

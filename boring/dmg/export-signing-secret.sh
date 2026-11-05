@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-time, on Jason's Mac: put the "Boring Remote Code Signing" identity into the fork's
+# One-time, on the release Mac: put the "Boring Remote Code Signing" identity into the fork's
 # GitHub Actions secrets MAC_SIGN_P12 (base64 PKCS#12) and MAC_SIGN_P12_PASSWORD.
 #   boring/dmg/export-signing-secret.sh [--dry-run]
 # Exports ONLY that identity, pinned by name and certificate SHA-1 (the login keychain also

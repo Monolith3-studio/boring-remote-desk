@@ -27,9 +27,13 @@ WINDOWS_RULE = f"{DISPLAY_NAME} Service"  # t17: Windows firewall rule and servi
 AGENT_ID = "io.boringlabs.remote.agent"   # app bundle + LaunchAgent (TCC holder)
 HOSTD_ID = "io.boringlabs.remote.hostd"   # root LaunchDaemon
 ORG = "io.boringlabs"                      # Mac config dir: ~/Library/Preferences/io.boringlabs.BoringRemote
-FORK_URL = "https://github.com/Monolith3-studio/boring-remote-desk"  # our source; the only link we ship
-# The one place RustDesk is named (AGPL attribution), as plain text on the About page.
-LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Source: {FORK_URL}"
+FORK_URL = "https://boringlabs.online/remote/source/"  # our source page: one tarball per version (AGPL 6, 13)
+UPDATE_PAGE_URL = "https://boringlabs.online/remote/update"  # where buyers get a new version; update_notice_banner.dart
+# Ticket 32. The one place RustDesk is named (AGPL 5(d)): this literal, in the kit's Legal dialog, opened from the
+# plain Legal item on the About page. check.py wants the literal there and nowhere else.
+LEGAL_DART = "flutter/lib/desktop/kit/legal.dart"
+LEGAL_CREDIT = "Boring Remote is based on RustDesk, \u00a9 Purslane Tech Pte. Ltd."
+LICENCE_ASSET = "flutter/assets/LICENCE.txt"  # the license text, bundled so Legal can show it with no network
 # Tailscale's address ranges, both tailnet-only: IPv4 CGNAT and the IPv6 ULA a
 # MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
 # as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
@@ -345,7 +349,7 @@ IPC_AUTH_OLD = (
 WIN_SC_NAME = 'start= auto DisplayName= \\"{app_name} Service\\"'
 WIN_FW_DELETE = '    netsh advfirewall firewall delete rule name=\\"{app_name} Service\\"\n'
 PATCHES += [
-    # Jason (2026-11-02): Settings is a gear, not upstream's three-line menu icon (Mac and Windows tab bar).
+    # 2026-11-02: Settings is a gear, not upstream's three-line menu icon (Mac and Windows tab bar).
     ("flutter/lib/desktop/pages/desktop_tab_page.dart", "                  icon: IconFont.menu,\n",
      "                  icon: Icons.settings_outlined, // boring-remote (v1.7 t17): a gear opens Settings\n",
      "Settings button is a gear"),
@@ -457,7 +461,7 @@ PATCHES += [
 # --- branding: no RustDesk name, link or logo a person sees on Mac or Windows --
 # Code names, crate names, IPC and config keys stay (boring/check.py INTERNAL says
 # which and why). Every rustdesk.com / github.com/rustdesk link goes, or points at
-# our fork. RustDesk is named once, as plain text: LEGAL_LINE on the About page.
+# our source page. RustDesk is named once: LEGAL_CREDIT in the kit's Legal dialog.
 SETTINGS = "flutter/lib/desktop/pages/desktop_setting_page.dart"
 HOME = "flutter/lib/desktop/pages/desktop_home_page.dart"
 CORAL, INK, PAPER = "FF5949", "0C0B11", "F0EFEB"  # Boring Labs kit
@@ -469,14 +473,20 @@ TEXT_PAIRS = [
     (PAPER, "18191E", "accent text, dark theme page"), (PAPER, "24252B", "accent text, dark theme card"),
 ]
 ABOUT_OLD = "              InkWell(\n                  onTap: () {\n                    launchUrlString('https://rustdesk.com/privacy.html');\n                  },\n                  child: Text(\n                    translate('Privacy Statement'),\n                    style: linkStyle,\n                  ).marginSymmetric(vertical: 4.0)),\n              InkWell(\n                  onTap: () {\n                    launchUrlString('https://rustdesk.com');\n                  },\n                  child: Text(\n                    translate('Website'),\n                    style: linkStyle,\n                  ).marginSymmetric(vertical: 4.0)),\n              Container(\n                decoration: const BoxDecoration(color: Color(0xFF2c8cff)),\n                padding:\n                    const EdgeInsets.symmetric(vertical: 24, horizontal: 8),\n                child: SelectionArea(\n                    child: Row(\n                  children: [\n                    Expanded(\n                      child: Column(\n                        crossAxisAlignment: CrossAxisAlignment.start,\n                        children: [\n                          Text(\n                            'Copyright © ${DateTime.now().toString().substring(0, 4)} Purslane Tech Pte. Ltd.\\n$license',\n                            style: const TextStyle(color: Colors.white),\n                          ),\n                          Text(\n                            translate('Slogan_tip'),\n                            style: TextStyle(\n                                fontWeight: FontWeight.w800,\n                                color: Colors.white),\n                          )\n                        ],\n                      ),\n                    ),\n                  ],\n                )),\n              ).marginSymmetric(vertical: 4.0)\n"
-ABOUT_NEW = ("              SelectionArea(\n"  # plain text, selectable, no link
-             f"                  child: Text('{LEGAL_LINE}')\n"
-             "                      .marginSymmetric(vertical: 4.0)),\n")
+ABOUT_NEW = ("              InkWell(\n"  # ticket 32: one plain item; the notices live in the dialog it opens
+             "                  onTap: () => showLegalDialog(context),\n"
+             "                  child: Text(\n"
+             "                    LegalWords.title,\n"
+             "                    style: linkStyle,\n"
+             "                  ).marginSymmetric(vertical: 4.0)),\n")
 PATCHES += [
-    # About page: one plain legal line, no logo, no links, no RustDesk blue
+    # About page: one plain Legal item, no logo, no other links, no RustDesk blue
     (SETTINGS, "translate('About RustDesk')", f"'About {DISPLAY_NAME}'", "About title"),
-    (SETTINGS, ABOUT_OLD, ABOUT_NEW, "About: privacy/website links and copyright block become the legal line"),
-    # links: none to RustDesk; the few that need a target point at our fork
+    (SETTINGS, ABOUT_OLD, ABOUT_NEW, "About: privacy/website links and copyright block become the Legal item"),
+    (SETTINGS, "import '../../common/widgets/login.dart';\n",
+     "import '../../common/widgets/login.dart';\nimport 'package:flutter_hbb/desktop/kit/legal.dart';\n",
+     "Legal dialog import"),
+    # links: none to RustDesk; the few that need a target point at our own pages
     ("flutter/lib/common.dart", "  if (bind.mainGetBuildinOption(key: \"hide-powered-by-me\") == 'Y') {\n",
      "  if (true) {  // boring-remote: no powered-by line\n", "no 'Powered by' line"),
     ("flutter/lib/common.dart", "        launchUrl(Uri.parse('https://rustdesk.com'));\n",
@@ -485,9 +495,9 @@ PATCHES += [
      f"'{FORK_URL}'", "Wayland keyboard help link"),
     ("flutter/lib/desktop/pages/connection_page.dart", '"https://rustdesk.com/pricing"', f'"{FORK_URL}"',
      "public-server guide link"),
-    (HOME, "'https://rustdesk.com/download'", f"'{FORK_URL}/releases'", "download link"),
+    (HOME, "'https://rustdesk.com/download'", f"'{UPDATE_PAGE_URL}'", "download link"),
     (HOME, "'https://github.com/rustdesk/rustdesk/releases/tag/${bind.mainGetNewVersion()}'",
-     f"'{FORK_URL}/releases'", "changelog link"),
+     f"'{UPDATE_PAGE_URL}'", "changelog link"),
     (HOME, re.compile(r"'https://rustdesk\.com/docs/en/client/linux/#[a-z0-9-]+'"), f"'{FORK_URL}'",
      "Linux help links"),
     (HOME, ", help: 'Help', link: translate(\"doc_mac_permission\"));", ");",
@@ -2230,7 +2240,8 @@ LOOK_INSTALL_METHOD = (
     "        onInstall: install,\n"
     "        onCancel: () => windowManager.close(),\n"
     "        onTryWithoutInstalling: () => bind.installRunWithoutInstall(),\n"
-    f"        onLicence: () => launchUrlString('{FORK_URL}'),\n"
+    # this.context: path.dart's top-level context would win over State's otherwise
+    "        onLicence: () => showLegalDialog(this.context),\n"
     "      ));\n\n")
 # Allow keeps the connection window up (review: minimising was not asked for). t04's prompt is
 # folded in its own patch, as t04 and t06 did, so a second rebrand still finds it whole.
@@ -2397,7 +2408,8 @@ PATCHES += [
     (LOOK_INSTALL, "import 'package:flutter_hbb/models/state_model.dart';\n",
      "import 'package:flutter_hbb/models/state_model.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
-     "import 'package:flutter_hbb/desktop/kit/install.dart';\n", "install screen imports"),
+     "import 'package:flutter_hbb/desktop/kit/install.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/legal.dart';\n", "install screen imports"),
     (LOOK_INSTALL, "        child: Scaffold(\n            backgroundColor: Theme.of(context).colorScheme.background,\n"
      "            body: DesktopTab(controller: tabController)),\n",
      "        child: boringKit(Scaffold(\n"
@@ -3625,6 +3637,7 @@ COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),
     ("msi/License.rtf", f"{MSI}/License.rtf", "installer license: AGPL notice, not upstream's privacy policy"),
+    ("../LICENCE", LICENCE_ASSET, "the license text, bundled: Legal shows it (AGPL 5(d))"),
     ("msi/icon.ico", "res/icon.ico", "product icon (MSI, shortcuts, Apps list)"),
     ("msi/icon.ico", "flutter/windows/runner/resources/app_icon.ico", "exe icon"),
 ] + [  # branding, from boring/art/make_app_art.py: every upstream logo slot (boring/upstream-logos.sha256)

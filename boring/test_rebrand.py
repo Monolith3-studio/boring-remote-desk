@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -101,7 +102,7 @@ class RebrandSeam(unittest.TestCase):
                      "MSI product name", "MSI banner art"):
             self.assertIn(fact, r.stdout)
         for fact in ("no RustDesk name or link in the Mac and Windows app's strings",
-                     "About page has the one plain AGPL legal line",
+                     check.ABOUT_LEGAL, check.LICENCE_BUNDLED, check.SOURCE_LINK,
                      "no RustDesk name or link in any translation",
                      "no RustDesk in app metadata", "window titles and tray tooltip say Boring Remote",
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
@@ -508,11 +509,93 @@ class RebrandSeam(unittest.TestCase):
         self.assertRegex(r.stdout, r"FAIL no RustDesk name or link in the Mac and Windows app's strings: "
                                    r".*desktop_setting_page.dart: .*rustdesk.com/privacy")
 
-    def test_second_legal_line_fails_check(self):
+    def test_second_rustdesk_credit_fails_check(self):
         self.rebrand()
         self.edit("flutter/lib/desktop/widgets/tabbar_widget.dart", "'Boring Remote'",
-                  "'" + rebrand.LEGAL_LINE + "'")
-        self.assert_check_fails("About page has the one plain AGPL legal line")
+                  "'" + rebrand.LEGAL_CREDIT + "'")
+        self.assert_check_fails(check.ABOUT_LEGAL)
+
+    def test_legal_passes_on_a_rebranded_tree(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (check.ABOUT_LEGAL, check.LEGAL_NOTICES, check.LICENCE_BUNDLED, check.SOURCE_LINK,
+                     check.SOURCE_NOTICE, check.NO_OWNER):
+            self.assertIn(f"PASS {fact}", r.stdout)
+        self.assertEqual(rebrand.FORK_URL, "https://boringlabs.online/remote/source/")
+        about = (self.root / rebrand.SETTINGS).read_text()
+        self.assertNotIn("Purslane", about)
+        self.assertNotIn("AGPL", about)
+        self.assertNotIn("Purslane", (self.root / "flutter/lib/common.dart").read_text())
+        self.assertIn("The source code for each version is at https://boringlabs.online/remote/source/",
+                      (self.root / "res/msi/Package/License.rtf").read_text())
+        self.assertEqual((self.root / rebrand.LICENCE_ASSET).read_bytes(), (self.root / "LICENCE").read_bytes())
+
+    def test_legal_item_gone_from_about_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, rebrand.ABOUT_NEW, "")
+        self.assert_check_fails(check.ABOUT_LEGAL)
+
+    def test_a_missing_notice_in_legal_fails_check(self):
+        self.rebrand()
+        for line in ("Text(LegalWords.noWarranty),", "Text(LegalWords.credit),", "Text(LegalWords.license),",
+                     "child: const Text(LegalWords.readLicense)),", "Text(LegalWords.sourceUrl),"):
+            self.edit(rebrand.LEGAL_DART, line, "")
+            self.assert_check_fails(check.LEGAL_NOTICES)
+            self.rebrand_reset_legal()
+
+    def rebrand_reset_legal(self):
+        shutil.copy(REPO / rebrand.LEGAL_DART, self.root / rebrand.LEGAL_DART)
+
+    def test_source_button_gone_from_legal_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.LEGAL_DART, "openUrl(LegalWords.sourceUrl)", "null")
+        self.assert_check_fails(check.LEGAL_NOTICES)
+
+    def test_source_link_moved_or_gone_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.LEGAL_DART, rebrand.FORK_URL, "https://example.com/")
+        self.assert_check_fails(check.SOURCE_LINK)
+        self.rebrand_reset_legal()
+        self.edit("res/msi/Package/License.rtf", rebrand.FORK_URL, "")
+        self.assert_check_fails(check.SOURCE_LINK)
+
+    def test_license_missing_from_the_app_fails_check(self):
+        self.rebrand()
+        (self.root / rebrand.LICENCE_ASSET).unlink()
+        self.assert_check_fails(check.LICENCE_BUNDLED)
+
+    def test_notice_gone_fails_check(self):
+        self.rebrand()
+        (self.root / "NOTICE").unlink()
+        self.assert_check_fails(check.SOURCE_NOTICE)
+
+    def test_owner_name_in_shipped_text_fails_check(self):
+        self.rebrand()
+        for rel, old, new in (("flutter/lib/desktop/kit/kit.dart", "// The app uses", f"// {check.OWNER_WORDS[0]} uses"),
+                              ("res/msi/Package/License.rtf", "Boring Labs", check.OWNER_WORDS[1].title())):
+            self.edit(rel, old, new)
+            self.assert_check_fails(check.NO_OWNER)
+            self.edit(rel, new, old)
+
+    def test_source_tarball(self):
+        """What goes on the source page: both repos, NOTICE dated, no history, no owner on the files."""
+        out = self.tmp / "out"
+        r = subprocess.run(["bash", str(HERE / "release/source-tarball.sh"), "HEAD", str(out)],
+                           capture_output=True, text=True, cwd=REPO)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        name = f"BoringRemote-{head[:9]}-source"
+        path = out / f"{name}.tar.gz"
+        self.assertEqual(r.stdout.split()[0], str(path))
+        with tarfile.open(path) as tar:
+            members = tar.getmembers()
+            names = {m.name for m in members}
+            for rel in ("NOTICE", "LICENCE", "boring/rebrand.py", "libs/hbb_common/Cargo.toml", "Cargo.toml"):
+                self.assertIn(f"{name}/{rel}", names)
+            self.assertFalse([n for n in names if n.endswith("/.git") or "/.git/" in n])
+            self.assertEqual({(m.uid, m.gid, m.uname, m.gname) for m in members}, {(0, 0, "", "")})
+            self.assertRegex(tar.extractfile(f"{name}/NOTICE").read().decode(),
+                             rf"This copy is commit {head}, dated \d{{4}}-\d{{2}}-\d{{2}}\.\n$")
 
     def test_rustdesk_back_in_a_translation_fails_check(self):
         self.rebrand()
