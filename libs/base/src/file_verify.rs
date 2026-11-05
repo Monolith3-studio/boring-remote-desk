@@ -68,8 +68,15 @@ pub fn os_from_platform(platform: &str) -> String {
 }
 
 pub fn peer_says_verified(platform_additions: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(platform_additions)
-        .map_or(false, |v| v.get(MARKER).and_then(|k| k.as_bool()) == Some(true))
+    // A build that can't get past the system's cached copy doesn't start what it can't finish.
+    cfg!(any(windows, target_os = "macos"))
+        && serde_json::from_str::<serde_json::Value>(platform_additions)
+            .map_or(false, |v| v.get(MARKER).and_then(|k| k.as_bool()) == Some(true))
+}
+
+/// The other computer's report counts only if it did the receiving, and said it could prove it.
+pub fn report_is_wanted(peer_can_verify: bool, receiving_here: bool) -> bool {
+    peer_can_verify && !receiving_here
 }
 
 // --- what goes on the wire ------------------------------------------------------------------
@@ -119,7 +126,8 @@ pub enum SealKind {
     Sent,
     /// Not sent: already there, or the person said to keep what's there. Compare what's there.
     Skipped,
-    /// From before a job's resume. Compare what's there, resend if it's wrong.
+    /// From before a job's resume. Compare what's there, and send it only if it's gone: what differs
+    /// may be what the person chose to keep, and this run can't tell.
     Resumed,
     /// The sender gave up on it: `why`.
     Failed,
@@ -151,7 +159,15 @@ pub enum Wire {
         listed: Vec<Listed>,
     },
     Seal(Seal),
-    Verdict { id: i32, file_num: i32, ok: bool, why: String, size: u64, hash: String },
+    /// `resend`: this copy is a file the person has no stake in, so sending it again is safe.
+    Verdict {
+        id: i32,
+        file_num: i32,
+        ok: bool,
+        why: String,
+        #[serde(default)]
+        resend: bool,
+    },
     Report { id: i32, report: Report },
 }
 
@@ -237,9 +253,14 @@ fn names_words(items: &[Listed]) -> String {
 }
 
 impl Report {
-    /// The only way to the word Verified: every file on the list passed.
+    /// The only way to the word Verified: every file on the list passed, nothing was left behind,
+    /// and there was something to prove.
     pub fn all_passed(&self) -> bool {
-        self.failed.is_empty() && self.skipped.is_empty() && self.verified == self.files
+        self.failed.is_empty()
+            && self.skipped.is_empty()
+            && self.not_copied.is_empty()
+            && self.verified == self.files
+            && self.files + self.folders > 0
     }
 
     pub fn words(&self) -> String {
@@ -267,9 +288,8 @@ impl Report {
                     names_words(&self.skipped)
                 ));
             }
-            let mut s = format!("Not verified: {}", parts.join(". "));
-            s.push_str(&format!(". {} proved, {}", self.verified, size_words(self.bytes)));
-            s
+            parts.push(format!("{} proved, {}", self.verified, size_words(self.bytes)));
+            format!("Not verified: {}", parts.join(". "))
         };
         if !self.not_copied.is_empty() {
             out.push_str(&format!(". Not copied: {}", names_words(&self.not_copied)));
@@ -312,14 +332,16 @@ pub fn log_path() -> PathBuf {
 /// One line per file, tab-separated: when, what happened, size, hash, path, why.
 fn log_line(status: &str, size: u64, hash: &str, path: &str, why: &str) {
     use std::io::Write;
+    // Names and reasons can come from the other computer. One file is one line.
+    let clean = |text: &str| text.replace(['\t', '\n', '\r'], " ");
     let line = format!(
         "{}\t{}\t{}\tblake3:{}\t{}\t{}\n",
         hbb_common::chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
         status,
         size,
-        hash,
-        path.replace(['\t', '\n'], " "),
-        why.replace(['\t', '\n'], " ")
+        clean(hash),
+        clean(path),
+        clean(why)
     );
     let _guard = LOG_LOCK.lock().unwrap();
     let path = log_path();
@@ -482,21 +504,30 @@ mod mac {
     }
 
     /// Reads from the disk, not the system's copy of what was just written: `msync` drops the
-    /// cached pages and `F_NOCACHE` keeps this read from adding them back.
-    pub fn drop_cached(file: &std::fs::File) {
+    /// cached pages and `F_NOCACHE` keeps this read from adding them back. An error means what
+    /// follows could come from memory, so nothing may be proved by it.
+    pub fn drop_cached(file: &std::fs::File) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
-        let len = file.metadata().map_or(0, |m| m.len()) as usize;
+        let len = file.metadata()?.len() as usize;
         unsafe {
             if len > 0 {
                 let map = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
-                if map != libc::MAP_FAILED {
-                    libc::msync(map, len, libc::MS_SYNC | libc::MS_INVALIDATE);
-                    libc::munmap(map, len);
+                if map == libc::MAP_FAILED {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let synced = libc::msync(map, len, libc::MS_SYNC | libc::MS_INVALIDATE);
+                let err = std::io::Error::last_os_error();
+                libc::munmap(map, len);
+                if synced != 0 {
+                    return Err(err);
                 }
             }
-            libc::fcntl(fd, libc::F_NOCACHE, 1);
+            if libc::fcntl(fd, libc::F_NOCACHE, 1) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
+        Ok(())
     }
 }
 
@@ -509,6 +540,18 @@ mod win {
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     pub const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+
+    pub fn set_hidden(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            let now = winapi::um::fileapi::GetFileAttributesW(wide.as_ptr());
+            now != INVALID_FILE_ATTRIBUTES
+                && winapi::um::fileapi::SetFileAttributesW(wide.as_ptr(), now | FILE_ATTRIBUTE_HIDDEN) != 0
+        }
+    }
 
     /// 100 ns ticks since 1601, which is what Windows keeps a date in.
     pub fn set_created(path: &Path, created: (i64, u32)) -> bool {
@@ -581,7 +624,11 @@ fn apply_contents_meta(path: &Path, meta: &Meta, peer_os: &str) -> Vec<String> {
             lost.push("permissions".to_string());
         }
     }
-    #[cfg(unix)]
+    #[cfg(windows)]
+    if meta.windows_hidden && !win::set_hidden(path) {
+        lost.push("Windows hidden flag".to_string());
+    }
+    #[cfg(not(windows))]
     if meta.windows_hidden {
         lost.push("Windows hidden flag".to_string());
     }
@@ -796,7 +843,20 @@ pub fn check_room(job: &TransferJob) -> Result<(), String> {
 /// slowest part of a job: 411 MiB/s on one thread on the T9, against 678 for its read alone. Every
 /// read checks `cancel`.
 pub fn hash_from_disk(path: &Path, cancel: &AtomicBool) -> std::io::Result<(u64, String)> {
-    let mut file = open_for_read_back(path)?;
+    let file = open_for_read_back(path)?;
+    // Windows' unbuffered read needs its position on a sector boundary, and a last short read
+    // leaves it off one: another read there is an error. So it stops at the length instead.
+    let stop_at = if cfg!(windows) { Some(file.metadata()?.len()) } else { None };
+    hash_reader(file, stop_at, cancel)
+}
+
+/// The original, which only has to read as it reads. What the system has cached of it is fine, and
+/// a card or share that won't drop its cache is no reason to fail.
+fn hash_source(path: &Path, cancel: &AtomicBool) -> std::io::Result<(u64, String)> {
+    hash_reader(std::fs::File::open(path)?, None, cancel)
+}
+
+fn hash_reader<R: Read>(mut file: R, stop_at: Option<u64>, cancel: &AtomicBool) -> std::io::Result<(u64, String)> {
     let (full_tx, full_rx) = mpsc::sync_channel::<(Vec<u8>, usize, usize)>(READ_AHEAD);
     let (empty_tx, empty_rx) = mpsc::channel::<(Vec<u8>, usize)>();
     for _ in 0..READ_AHEAD + 1 {
@@ -817,9 +877,13 @@ pub fn hash_from_disk(path: &Path, cancel: &AtomicBool) -> std::io::Result<(u64,
             (size, hasher.finalize().to_hex().to_string())
         });
         let mut failed = None;
+        let mut total = 0u64;
         while let Ok((mut raw, start)) = empty_rx.recv() {
             if cancel.load(Ordering::Relaxed) {
                 failed = Some(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+                break;
+            }
+            if stop_at.map_or(false, |len| total >= len) {
                 break;
             }
             let n = match read_retrying(&mut file, &mut raw[start..start + CHUNK]) {
@@ -832,6 +896,7 @@ pub fn hash_from_disk(path: &Path, cancel: &AtomicBool) -> std::io::Result<(u64,
             if n == 0 {
                 break;
             }
+            total += n as u64;
             if full_tx.send((raw, start, n)).is_err() {
                 break;
             }
@@ -845,7 +910,7 @@ pub fn hash_from_disk(path: &Path, cancel: &AtomicBool) -> std::io::Result<(u64,
     })
 }
 
-fn read_retrying(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+fn read_retrying<R: Read>(file: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match file.read(buf) {
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -857,7 +922,13 @@ fn read_retrying(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<us
 #[cfg(target_os = "macos")]
 fn open_for_read_back(path: &Path) -> std::io::Result<std::fs::File> {
     let file = std::fs::File::open(path)?;
-    mac::drop_cached(&file);
+    let dropped = mac::drop_cached(&file);
+    #[cfg(test)]
+    let dropped = match DROP_FAILS_UNDER.lock().unwrap().as_ref() {
+        Some(dir) if path.starts_with(dir) => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "not on this disk")),
+        _ => dropped,
+    };
+    dropped.map_err(|err| std::io::Error::new(err.kind(), format!("couldn't get past the system's cached copy: {}", err)))?;
     Ok(file)
 }
 
@@ -876,6 +947,80 @@ fn open_for_read_back(path: &Path) -> std::io::Result<std::fs::File> {
 lazy_static::lazy_static! {
     /// Runs between the write and the read-back: (path, attempt).
     static ref BEFORE_READ_BACK: Mutex<Option<Arc<dyn Fn(&Path, u32) + Send + Sync>>> = Mutex::new(None);
+    /// A disk under here refuses to drop its cached pages, as one might.
+    static ref DROP_FAILS_UNDER: Mutex<Option<PathBuf>> = Mutex::new(None);
+}
+
+// --- the job's work files -------------------------------------------------------------------
+
+/// A copy being written goes under its name plus one of these. Never ours to give anything else.
+const WORK_SUFFIXES: [&str; 2] = [".download", ".digest"];
+
+fn is_work_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    WORK_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+pub fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).map_or(false, |m| m.file_type().is_symlink())
+}
+
+fn no_link_here(path: &Path) -> std::io::Result<()> {
+    if is_link(path) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("a link is in the way: {}", path.display())));
+    }
+    Ok(())
+}
+
+/// `File::create`, except a link under this name is refused and not written through.
+pub async fn create_work_file(path: &str) -> std::io::Result<tokio::fs::File> {
+    no_link_here(Path::new(path))?;
+    let mut open = tokio::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    open.custom_flags(libc::O_NOFOLLOW);
+    open.open(path).await
+}
+
+/// `std::fs::write`, the same way.
+pub fn write_work_file(path: &str, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    no_link_here(Path::new(path))?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW);
+    }
+    open.open(path)?.write_all(text.as_bytes())
+}
+
+/// Files in one job that would destroy each other, and why: names a disk may call the same, and a
+/// name another file's copy goes through while it's written. The later of a pair is refused, or the
+/// one in the way, before anything is written. Whether capitals matter is the disk's business and
+/// this end may not know, so it's always refused. What gets past this meets [`last_look`].
+fn colliding_names(files: &[FileEntry]) -> HashMap<i32, String> {
+    let fold = |name: &str| name.replace('\\', "/").to_lowercase();
+    let mut out = HashMap::new();
+    let mut first: HashMap<String, &str> = HashMap::new();
+    for (i, f) in files.iter().enumerate().filter(|(_, f)| !f.name.is_empty()) {
+        match first.get(&fold(&f.name)) {
+            Some(other) => {
+                out.insert(i as i32, format!("same name as {} apart from capitals", other));
+            }
+            None => {
+                first.insert(fold(&f.name), &f.name);
+            }
+        }
+    }
+    for (i, f) in files.iter().enumerate() {
+        let name = fold(&f.name);
+        for owner in WORK_SUFFIXES.iter().filter_map(|s| name.strip_suffix(s)).filter_map(|stem| first.get(stem)) {
+            out.entry(i as i32).or_insert(format!("{} needs this name while it copies", owner));
+        }
+    }
+    out
 }
 
 // --- the sender -----------------------------------------------------------------------------
@@ -888,11 +1033,18 @@ enum Hashing {
 }
 
 type Queue = Arc<Mutex<VecDeque<Message>>>;
+/// What this side sealed: file_num to (size, hash). The verify log's numbers, not the peer's echo.
+type Sealed = Arc<Mutex<HashMap<i32, (u64, String)>>>;
 
-fn hashing_thread(rx: mpsc::Receiver<Hashing>, out: Queue, cancel: Arc<AtomicBool>) {
+fn hashing_thread(rx: mpsc::Receiver<Hashing>, out: Queue, sealed: Sealed, cancel: Arc<AtomicBool>) {
     let mut hasher = blake3::Hasher::new();
     let mut size = 0u64;
-    let push = |seal: Seal| out.lock().unwrap().push_back(Wire::Seal(seal).to_message());
+    let push = |seal: Seal| {
+        if seal.kind != SealKind::Failed {
+            sealed.lock().unwrap().insert(seal.file_num, (seal.size, seal.hash.clone()));
+        }
+        out.lock().unwrap().push_back(Wire::Seal(seal).to_message())
+    };
     while let Ok(msg) = rx.recv() {
         match msg {
             Hashing::Bytes(b) => {
@@ -910,7 +1062,7 @@ fn hashing_thread(rx: mpsc::Receiver<Hashing>, out: Queue, cancel: Arc<AtomicBoo
                 size = 0;
             }
             Hashing::FromDisk { id, file_num, path, kind, meta } => {
-                let seal = match hash_from_disk(&path, &cancel) {
+                let seal = match hash_source(&path, &cancel) {
                     Ok((size, hash)) => Seal { id, file_num, kind, size, hash, meta, why: String::new() },
                     Err(err) => Seal {
                         id,
@@ -941,8 +1093,15 @@ struct Sending {
     resending: bool,
     /// The stream moved, so what went through the hasher isn't the whole file.
     partial: bool,
+    sealed: Sealed,
+    /// The open file, as its first read found it, and how much has been read of it since.
+    stamp: Option<FileStamp>,
+    read_len: u64,
     cancel: Arc<AtomicBool>,
 }
+
+/// A file's length and modified time, from its handle.
+pub type FileStamp = (u64, Option<SystemTime>);
 
 struct Receiving {
     id: i32,
@@ -953,6 +1112,8 @@ struct Receiving {
     dirs: Vec<DirEntry>,
     links: Vec<LinkEntry>,
     listed: Vec<Listed>,
+    /// Names this side won't write, whatever the sender does.
+    refused: HashMap<i32, String>,
     results: Arc<Mutex<Results>>,
     /// Bytes the job has counted for a file that's coming again.
     rewinds: HashMap<i32, u64>,
@@ -1015,14 +1176,38 @@ impl JobVerify {
             return;
         }
         if let JobVerify::Send(s) = self {
+            s.read_len += bytes.len() as u64;
             s.tx.send(Hashing::Bytes(bytes.to_vec())).ok();
         }
+    }
+
+    /// Before a file's first read.
+    #[inline]
+    pub fn wants_stamp(&self) -> bool {
+        matches!(self, JobVerify::Send(s) if s.stamp.is_none())
+    }
+
+    pub fn stamp_opened(&mut self, stamp: FileStamp) {
+        if let JobVerify::Send(s) = self {
+            s.stamp = Some(stamp);
+        }
+    }
+
+    /// At a file's end. A hash of what was read matches a copy of what was read, so a file that
+    /// moved under the read, or a read that stopped short of the file, would prove nothing.
+    pub fn stamp_closed(&mut self, now: FileStamp) -> Option<String> {
+        let JobVerify::Send(s) = self else { return None };
+        let opened = s.stamp.take();
+        let read_len = std::mem::take(&mut s.read_len);
+        let changed = opened.map_or(false, |o| o != now) || (!s.partial && read_len != now.0);
+        changed.then(|| "it changed while being read".to_string())
     }
 
     /// The stream moved, for a resume. The hash at the end comes from the whole file on disk.
     pub fn stream_moved(&mut self) {
         if let JobVerify::Send(s) = self {
             s.partial = true;
+            s.stamp = None;
         }
     }
 
@@ -1051,6 +1236,8 @@ impl JobVerify {
         log::warn!("job {}: reading {:?} failed: {}", s.id, path, err);
         s.tx.send(Hashing::Reset).ok();
         s.partial = false;
+        s.stamp = None;
+        s.read_len = 0;
         if s.tried.insert(file_num) {
             s.resends.push_back(file_num);
         } else {
@@ -1067,6 +1254,8 @@ impl JobVerify {
     pub fn skipped(&mut self, file_num: i32, path: &Path) {
         if let JobVerify::Send(s) = self {
             s.partial = false;
+            s.stamp = None;
+            s.read_len = 0;
             s.tx.send(Hashing::Reset).ok();
             s.tx.send(Hashing::FromDisk {
                 id: s.id,
@@ -1102,6 +1291,8 @@ impl JobVerify {
         if let JobVerify::Send(s) = self {
             s.resending = true;
             s.partial = false;
+            s.stamp = None;
+            s.read_len = 0;
             s.tx.send(Hashing::Reset).ok();
         }
     }
@@ -1127,6 +1318,12 @@ impl JobVerify {
             JobVerify::Send(s) => s.out.lock().unwrap().drain(..).collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// A name the receiver refused: its blocks go nowhere.
+    #[inline]
+    pub fn refuses_file(&self, file_num: i32) -> bool {
+        matches!(self, JobVerify::Receive(r) if r.refused.contains_key(&file_num))
     }
 
     /// Bytes the receiver's job shouldn't count twice, once per resend.
@@ -1162,17 +1359,24 @@ impl Sending {
         );
     }
 
-    fn on_verdict(&mut self, file_num: i32, ok: bool, why: &str, size: u64, hash: &str) {
+    fn on_verdict(&mut self, file_num: i32, ok: bool, why: &str, resend: bool) {
         let Some((path, kind)) = self.waiting.remove(&file_num) else {
             return;
         };
+        let (size, hash) = self.sealed.lock().unwrap().remove(&file_num).unwrap_or_default();
         if ok {
-            log_line("sent", size, hash, &path.to_string_lossy(), "");
+            log_line("sent", size, &hash, &path.to_string_lossy(), "");
             return;
         }
-        log::warn!("job {}: {:?} came back wrong: {}", self.id, path, why);
-        // Once, then it's named in the job. A file the person chose to keep stays as it is.
-        if kind != SealKind::Skipped && self.tried.insert(file_num) {
+        log::warn!("job {}: {:?} came back wrong: {:?}", self.id, path, why);
+        // Once, then it's named in the job. What was just sent is ours to send again. From before
+        // a resume, it may be what the person chose to keep, so only if the receiver finds it gone.
+        let again = match kind {
+            SealKind::Sent => true,
+            SealKind::Resumed => resend,
+            SealKind::Skipped | SealKind::Failed => false,
+        };
+        if again && self.tried.insert(file_num) {
             self.resends.push_back(file_num);
         }
     }
@@ -1203,6 +1407,9 @@ pub fn enable_send(job: &mut TransferJob, peer_os: &str) {
         if let Some(why) = why {
             refused.insert(i as i32, why);
         }
+    }
+    for (i, why) in colliding_names(job.files()) {
+        refused.entry(i).or_insert(why);
     }
     let mut listed = std::mem::take(&mut walked.listed);
     for (name, why) in walked.not_files.drain() {
@@ -1238,9 +1445,10 @@ pub fn enable_send(job: &mut TransferJob, peer_os: &str) {
     // 16 MiB in hand. A hasher that far behind holds up reading, not memory.
     let (tx, rx) = mpsc::sync_channel(128);
     let cancel = Arc::new(AtomicBool::new(false));
+    let sealed: Sealed = Default::default();
     {
-        let (out, cancel) = (out.clone(), cancel.clone());
-        std::thread::spawn(move || hashing_thread(rx, out, cancel));
+        let (out, sealed, cancel) = (out.clone(), sealed.clone(), cancel.clone());
+        std::thread::spawn(move || hashing_thread(rx, out, sealed, cancel));
     }
     let mut sending = Sending {
         id: job.id,
@@ -1252,6 +1460,9 @@ pub fn enable_send(job: &mut TransferJob, peer_os: &str) {
         refused,
         resending: false,
         partial: false,
+        sealed,
+        stamp: None,
+        read_len: 0,
         cancel,
     };
     // A resumed job: what went before is compared too, this run having no memory of it.
@@ -1300,7 +1511,8 @@ pub type Outbox = Arc<dyn Fn(Message) + Send + Sync>;
 enum Outcome {
     Passed,
     Bad(String),
-    SkipDiffers,
+    /// What's there stays: it may be what the person chose to keep.
+    LeftAlone(String),
 }
 
 #[derive(Default, Debug)]
@@ -1351,20 +1563,16 @@ fn receive_thread(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        let (state, ok, why) = match outcome {
-            Outcome::Passed => (FileState::Verified, true, String::new()),
-            Outcome::Bad(why) => (FileState::Failed(why.clone()), false, why),
-            Outcome::SkipDiffers => {
-                let why = "already there, and not the same as the original".to_string();
-                (FileState::Skipped(why.clone()), false, why)
-            }
+        let (state, ok, resend, why) = match outcome {
+            Outcome::Passed => (FileState::Verified, true, false, String::new()),
+            Outcome::Bad(why) => (FileState::Failed(why.clone()), false, true, why),
+            Outcome::LeftAlone(why) => (FileState::Skipped(why.clone()), false, false, why),
         };
         results.lock().unwrap().files.insert(
             file_num,
             FileResult { name: task.name.clone(), size: task.seal.size, state },
         );
-        let (size, hash) = (task.seal.size, task.seal.hash);
-        outbox(Wire::Verdict { id, file_num, ok, why, size, hash }.to_message());
+        outbox(Wire::Verdict { id, file_num, ok, why, resend }.to_message());
     }
 }
 
@@ -1385,19 +1593,18 @@ fn check_one(
                 Outcome::Passed
             }
             Ok((size, hash)) => {
-                let why = "doesn't match the original";
-                log_line("different", size, &hash, &shown, why);
-                if seal.kind == SealKind::Skipped {
-                    Outcome::SkipDiffers
-                } else {
-                    Outcome::Bad(why.to_string())
-                }
+                log_line("different", size, &hash, &shown, "doesn't match the original");
+                Outcome::LeftAlone("already there, and not the same as the original".to_string())
             }
-            Err(err) if seal.kind == SealKind::Skipped => {
+            // Gone from before a resume: nothing to protect, so it can come across.
+            Err(err) if seal.kind == SealKind::Resumed && err.kind() == std::io::ErrorKind::NotFound => {
+                log_line("missing", 0, "", &shown, &err.to_string());
+                Outcome::Bad("it isn't there".to_string())
+            }
+            Err(err) => {
                 log_line("different", 0, "", &shown, &err.to_string());
-                Outcome::SkipDiffers
+                Outcome::LeftAlone(format!("already there, and couldn't read it: {}", err))
             }
-            Err(err) => Outcome::Bad(format!("couldn't read it: {}", err)),
         };
     }
     let download = PathBuf::from(format!("{}.download", shown));
@@ -1411,6 +1618,11 @@ fn check_one(
     }
     #[cfg(not(test))]
     let _ = attempt;
+    if let Err(err) = no_link_here(&download) {
+        let why = err.to_string();
+        log_line("failed", 0, "", &shown_download, &why);
+        return Outcome::Bad(why);
+    }
     // Write access, since Windows won't flush a file opened for reading.
     let flushed = std::fs::OpenOptions::new().read(true).write(true).open(&download).and_then(|f| f.sync_all());
     if let Err(err) = flushed {
@@ -1467,6 +1679,7 @@ pub fn on_wire(job: &mut TransferJob, wire: Wire, outbox: Option<&Outbox>) {
                 let (results, outbox, os, cancel) = (results.clone(), outbox.clone(), os.clone(), cancel.clone());
                 std::thread::spawn(move || receive_thread(rx, results, outbox, os, cancel));
             }
+            let refused = colliding_names(job.files());
             job.boring = JobVerify::Receive(Box::new(Receiving {
                 id,
                 peer_os: os,
@@ -1476,15 +1689,16 @@ pub fn on_wire(job: &mut TransferJob, wire: Wire, outbox: Option<&Outbox>) {
                 dirs,
                 links,
                 listed,
+                refused,
                 results,
                 rewinds: HashMap::new(),
                 cancel,
             }));
         }
         Wire::Seal(seal) => on_seal(job, seal, outbox),
-        Wire::Verdict { file_num, ok, why, size, hash, .. } => {
+        Wire::Verdict { file_num, ok, why, resend, .. } => {
             if let JobVerify::Send(s) = &mut job.boring {
-                s.on_verdict(file_num, ok, &why, size, &hash);
+                s.on_verdict(file_num, ok, &why, resend);
             }
         }
         Wire::StartRead { os, .. } => enable_send(job, &os),
@@ -1515,26 +1729,25 @@ fn on_seal(job: &mut TransferJob, seal: Seal, outbox: Option<&Outbox>) {
     let JobVerify::Receive(r) = &mut job.boring else {
         return;
     };
-    let Some((name, path)) = found else {
+    let id = r.id;
+    // The sender waits for a word on every seal, and Done waits for the sender.
+    let answer = |why: &str| {
         if let Some(outbox) = outbox {
-            outbox(
-                Wire::Verdict {
-                    id: r.id,
-                    file_num,
-                    ok: false,
-                    why: "no such file in this job".to_string(),
-                    size: 0,
-                    hash: String::new(),
-                }
-                .to_message(),
-            );
+            outbox(Wire::Verdict { id, file_num, ok: false, why: why.to_string(), resend: false }.to_message());
         }
+    };
+    let Some((name, path)) = found else {
+        answer("no such file in this job");
         return;
     };
-    if seal.kind == SealKind::Failed {
+    let refused = r.refused.get(&file_num).cloned();
+    if seal.kind == SealKind::Failed || refused.is_some() {
+        let why = refused.unwrap_or(seal.why);
+        log_line("failed", 0, "", &path.to_string_lossy(), &why);
+        answer(&why);
         r.results.lock().unwrap().files.insert(
             file_num,
-            FileResult { name, size: 0, state: FileState::Failed(seal.why) },
+            FileResult { name, size: 0, state: FileState::Failed(why) },
         );
         return;
     }
@@ -1611,6 +1824,10 @@ fn apply_manifest(r: &Receiving, base: &Path) -> (usize, Vec<Listed>, Vec<Listed
 /// Why the link couldn't be made, if it couldn't. A link never goes over something that's there,
 /// and a name passing through a link was already refused by `join_validated_path`.
 fn make_link(base: &Path, link: &LinkEntry) -> Option<String> {
+    // A link at the folder's own name or a copy's work name is a way to write somewhere else.
+    if link.path.is_empty() || is_work_name(&link.path) {
+        return Some("a link can't have this name".to_string());
+    }
     let path = match fs::join_validated_path(&base.to_path_buf(), &link.path) {
         Ok(p) => p,
         Err(err) => return Some(err.to_string()),
@@ -1649,6 +1866,41 @@ fn make_link(base: &Path, link: &LinkEntry) -> Option<String> {
     }
 }
 
+/// Verified files that aren't what they were by the end of the job, and why: another file's copy
+/// went over them, or two names landed on one file on a disk that calls them the same.
+fn last_look(base: &PathBuf, files: &[FileEntry], results: &Results) -> HashMap<i32, String> {
+    let mut wrong = HashMap::new();
+    let mut landed: HashMap<(u64, u64), i32> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        let i = i as i32;
+        let Some(FileResult { size, state: FileState::Verified, .. }) = results.files.get(&i) else {
+            continue;
+        };
+        match std::fs::symlink_metadata(TransferJob::join(base, &f.name)) {
+            Ok(m) if m.is_file() && m.len() == *size => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if let Some(other) = landed.insert((m.dev(), m.ino()), i) {
+                        let why = "another file in this job is the same file on this disk".to_string();
+                        wrong.insert(other, why.clone());
+                        wrong.insert(i, why);
+                    }
+                }
+            }
+            Ok(_) => {
+                wrong.insert(i, "it changed after it was checked".to_string());
+            }
+            Err(err) => {
+                wrong.insert(i, format!("it's gone since it was checked: {}", err));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = &mut landed; // Windows' file ids aren't in stable std. Its names are folded up front.
+    wrong
+}
+
 /// When Done lands on a receiving job. Everything the sender waited for is settled by then.
 pub fn finish(job: &TransferJob) -> Option<Report> {
     let JobVerify::Receive(r) = &job.boring else {
@@ -1659,8 +1911,15 @@ pub fn finish(job: &TransferJob) -> Option<Report> {
     };
     let (folders, not_copied, mut not_kept) = apply_manifest(r, base);
     let results = r.results.lock().unwrap();
+    let wrong = last_look(base, job.files(), &results);
     let mut report = Report { files: job.files().len(), folders, not_copied, ..Default::default() };
     for (i, f) in job.files().iter().enumerate() {
+        if let Some(why) = wrong.get(&(i as i32)) {
+            let name = shown_name(base, &f.name);
+            log_line("failed", 0, "", &TransferJob::join(base, &f.name).to_string_lossy(), why);
+            report.failed.push(Listed::new(name, why.clone()));
+            continue;
+        }
         match results.files.get(&(i as i32)) {
             Some(FileResult { size, state: FileState::Verified, .. }) => {
                 report.verified += 1;
@@ -1852,13 +2111,76 @@ mod tests {
     }
 
     async fn copy(src: &Path, dst: &Path) -> Report {
-        let job = read_job(src, false);
+        copy_job(read_job(src, false), dst).await
+    }
+
+    async fn copy_job(job: TransferJob, dst: &Path) -> Report {
         let (a, b) = pair().await;
         let rx = tokio::spawn(receive(b, write_job(dst, job.files().clone())));
         let tx = tokio::spawn(send(a, job));
         let report = time::timeout(Duration::from_secs(120), rx).await.expect("the job hung").unwrap();
         tx.await.unwrap();
         report
+    }
+
+    /// A job whose list is in this order, as a peer could send it.
+    fn read_job_listing(src: &Path, names: &[&str]) -> TransferJob {
+        let mut job = read_job(src, false);
+        let files = names
+            .iter()
+            .map(|n| FileEntry { name: n.to_string(), ..Default::default() })
+            .collect::<Vec<_>>();
+        job.set_files(files).unwrap();
+        job
+    }
+
+    /// The sender's loop, one call at a time, and `each` runs after every call.
+    async fn send_stepping(mut stream: Stream, job: TransferJob, mut each: impl FnMut(u32, &mut TransferJob) + Send + 'static) {
+        let id = job.id;
+        let mut jobs = vec![job];
+        enable_sends(&mut jobs, Some(this_os()));
+        let mut step = 0;
+        let mut tick = time::interval(Duration::from_millis(1));
+        while !jobs.is_empty() {
+            tokio::select! {
+                _ = tick.tick() => {
+                    fs::handle_read_jobs(&mut jobs, &mut stream).await.unwrap();
+                    step += 1;
+                    if let Some(job) = jobs.first_mut() {
+                        each(step, job);
+                    }
+                }
+                res = stream.next() => {
+                    let bytes = res.expect("receiver went away").unwrap();
+                    if let Some(message::Union::Misc(m)) = Message::parse_from_bytes(&bytes).unwrap().union {
+                        if let Some(misc::Union::PluginRequest(p)) = m.union {
+                            let wire = Wire::from_json(&p.content).unwrap();
+                            if let Some(job) = fs::get_job(id, &mut jobs) {
+                                on_wire(job, wire, None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answers a resumed job's first question and drives it to its end.
+    async fn drive(jobs: &mut Vec<TransferJob>, a: &mut Stream) {
+        let mut tick = time::interval(Duration::from_millis(1));
+        while !jobs.is_empty() {
+            tokio::select! {
+                _ = tick.tick() => { crate::file_speed::pump_read_jobs(jobs, a).await.unwrap(); }
+                res = a.next() => {
+                    let bytes = res.unwrap().unwrap();
+                    if let Some(message::Union::Misc(m)) = Message::parse_from_bytes(&bytes).unwrap().union {
+                        if let Some(misc::Union::PluginRequest(p)) = m.union {
+                            on_wire(&mut jobs[0], Wire::from_json(&p.content).unwrap(), None);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// One log for the run, since the path is global and these tests run side by side.
@@ -1888,7 +2210,7 @@ mod tests {
 
     #[test]
     fn a_wire_message_is_a_plugin_request_and_survives_the_trip() {
-        let w = Wire::Verdict { id: 3, file_num: 2, ok: false, why: "x".into(), size: 1, hash: "h".into() };
+        let w = Wire::Verdict { id: 3, file_num: 2, ok: false, why: "x".into(), resend: true };
         let bytes = w.to_message().write_to_bytes().unwrap();
         let Some(message::Union::Misc(m)) = Message::parse_from_bytes(&bytes).unwrap().union else {
             panic!()
@@ -1897,7 +2219,7 @@ mod tests {
         assert_eq!(p.id, WIRE_ID);
         assert!(matches!(
             Wire::from_json(&p.content),
-            Some(Wire::Verdict { id: 3, file_num: 2, ok: false, .. })
+            Some(Wire::Verdict { id: 3, file_num: 2, ok: false, resend: true, .. })
         ));
         assert!(Wire::from_json(b"{not json").is_none());
     }
@@ -1940,8 +2262,32 @@ mod tests {
         };
         assert_eq!(
             extras.words(),
-            "Verified: 1 file, 1 KB. Not copied: l (this link couldn't be made here). Couldn't keep: a (permissions)"
+            "Not verified: 1 proved, 1 KB. Not copied: l (this link couldn't be made here). Couldn't keep: a (permissions)"
         );
+        // Every file proved and a folder left behind is not a Verified job.
+        let dropped = Report {
+            files: 12,
+            verified: 12,
+            bytes: 4_300_000_000,
+            folders: 3,
+            not_copied: vec![Listed::new("B002", "couldn't read this folder")],
+            ..Default::default()
+        };
+        assert!(!dropped.all_passed());
+        assert_eq!(dropped.words(), "Not verified: 12 proved, 4.3 GB. Not copied: B002 (couldn't read this folder)");
+        // What's gone is the attributes, not the content, and the words say so.
+        let kept = Report {
+            files: 1,
+            verified: 1,
+            bytes: 1000,
+            not_kept: vec![Listed::new("a", "permissions")],
+            ..Default::default()
+        };
+        assert_eq!(kept.words(), "Verified: 1 file, 1 KB. Couldn't keep: a (permissions)");
+        // A folder job needs a folder. Nothing at all proves nothing.
+        assert_eq!(Report { folders: 3, ..Default::default() }.words(), "Verified: 3 folders");
+        assert_eq!(Report::default().words(), "Not verified: 0 proved, 0 bytes");
+        assert!(!Report::default().all_passed());
     }
 
     #[test]
@@ -2184,6 +2530,9 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(to.join("locked"), std::fs::Permissions::from_mode(0o755)).ok();
         assert!(report.not_copied.iter().any(|l| l.name == "locked"), "{:?}", report);
+        assert_eq!(report.verified, 1);
+        assert!(report.words().starts_with("Not verified: 1 proved, "), "{}", report.words());
+        assert!(report.words().contains(". Not copied: locked ("), "{}", report.words());
     }
 
     #[cfg(target_os = "macos")]
@@ -2389,9 +2738,10 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), data);
     }
 
-    /// A job resumed at a later file: the ones before it get compared, without being sent.
+    /// A job resumed at a later file: the ones before it get compared, without being sent. What's
+    /// there may be what the person chose to keep, and this run can't know, so it stays and is named.
     #[tokio::test(flavor = "multi_thread")]
-    async fn resuming_at_a_later_file_compares_the_earlier_ones() {
+    async fn a_resume_leaves_a_different_file_alone_and_names_it() {
         let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
         with_log(&logs);
         let one = noise(10_000, 12);
@@ -2400,20 +2750,583 @@ mod tests {
         src.file("b.mov", &two);
         let to = dst.0.join("copy");
         std::fs::create_dir_all(&to).unwrap();
-        let mut wrong = one.clone();
-        wrong[5] ^= 1;
-        std::fs::write(to.join("a.mov"), &wrong).unwrap();
-        let mut job = read_job(&src.0, false);
+        let mut kept = one.clone();
+        kept[5] ^= 1;
+        std::fs::write(to.join("a.mov"), &kept).unwrap();
+        let mut job = read_job_listing(&src.0, &["a.mov", "b.mov"]);
         job.file_num = 1;
         let (a, b) = pair().await;
         let mut w = write_job(&to, job.files().clone());
         w.file_num = 1;
         let rx = tokio::spawn(receive(b, w));
         tokio::spawn(send(a, job));
-        let report = time::timeout(Duration::from_secs(60), rx).await.unwrap().unwrap();
-        assert!(report.all_passed(), "{}", report.words());
-        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), one, "the wrong one was caught and resent");
+        let report = time::timeout(Duration::from_secs(60), rx).await.expect("the job hung").unwrap();
+        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), kept, "what the person kept is never replaced");
         assert_eq!(std::fs::read(to.join("b.mov")).unwrap(), two);
+        assert_eq!(report.verified, 1, "{:?}", report);
+        assert_eq!(report.skipped[0].name, "a.mov");
+        assert!(report.words().starts_with("Not verified: 1 of 2 files skipped: a.mov ("), "{}", report.words());
+    }
+
+    /// The same, when the source has gone bad since: the good copy stays.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_cannot_read_what_is_there_so_it_stays_and_is_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        src.file("a.mov", &noise(10_000, 40));
+        src.file("b.mov", &noise(10_000, 41));
+        let to = dst.0.join("copy");
+        std::fs::create_dir_all(&to).unwrap();
+        let there = noise(10_000, 42);
+        std::fs::write(to.join("a.mov"), &there).unwrap();
+        std::fs::set_permissions(to.join("a.mov"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut job = read_job_listing(&src.0, &["a.mov", "b.mov"]);
+        job.file_num = 1;
+        let (a, b) = pair().await;
+        let mut w = write_job(&to, job.files().clone());
+        w.file_num = 1;
+        let rx = tokio::spawn(receive(b, w));
+        tokio::spawn(send(a, job));
+        let report = time::timeout(Duration::from_secs(60), rx).await.expect("the job hung").unwrap();
+        std::fs::set_permissions(to.join("a.mov"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), there);
+        assert_eq!(report.skipped[0].name, "a.mov");
+        assert!(!report.all_passed());
+    }
+
+    /// A file that isn't there has nothing to protect, so it is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_sends_a_file_that_is_missing() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let one = noise(10_000, 43);
+        let two = noise(10_000, 44);
+        src.file("a.mov", &one);
+        src.file("b.mov", &two);
+        let to = dst.0.join("copy");
+        std::fs::create_dir_all(&to).unwrap();
+        let mut job = read_job_listing(&src.0, &["a.mov", "b.mov"]);
+        job.file_num = 1;
+        let (a, b) = pair().await;
+        let mut w = write_job(&to, job.files().clone());
+        w.file_num = 1;
+        let rx = tokio::spawn(receive(b, w));
+        tokio::spawn(send(a, job));
+        let report = time::timeout(Duration::from_secs(60), rx).await.expect("the job hung").unwrap();
+        assert!(report.all_passed(), "{}", report.words());
+        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), one);
+        assert_eq!(std::fs::read(to.join("b.mov")).unwrap(), two);
+    }
+
+    // Finding 6: an earlier source that moved before the resume never answered, so Done never went.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_after_an_earlier_source_moved_still_ends_and_names_it() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let one = noise(10_000, 45);
+        let two = noise(10_000, 46);
+        src.file("a.mov", &one);
+        src.file("b.mov", &two);
+        let to = dst.0.join("copy");
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("a.mov"), &one).unwrap();
+        let mut job = read_job_listing(&src.0, &["a.mov", "b.mov"]);
+        job.file_num = 1;
+        std::fs::remove_file(src.0.join("a.mov")).unwrap();
+        let (a, b) = pair().await;
+        let mut w = write_job(&to, job.files().clone());
+        w.file_num = 1;
+        let rx = tokio::spawn(receive(b, w));
+        let tx = tokio::spawn(send(a, job));
+        let report = time::timeout(Duration::from_secs(20), rx).await.expect("the job hung").unwrap();
+        tx.abort();
+        assert_eq!(report.failed[0].name, "a.mov");
+        assert!(report.failed[0].why.contains("couldn't read the original"), "{:?}", report.failed);
+        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), one, "and the copy stays");
+        assert_eq!(std::fs::read(to.join("b.mov")).unwrap(), two);
+    }
+
+    /// The same for a file resumed mid-way whose whole-file hash can't be read: a resend, which
+    /// can't open it either, and then the job ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_file_resume_whose_source_goes_still_ends_and_names_it() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(1024 * 1024 + 3, 47);
+        let file = src.file("a.mov", &data);
+        let to = dst.0.join("a.mov");
+        let offset = 512 * 1024;
+        std::fs::write(format!("{}.download", to.display()), &data[..offset]).unwrap();
+        std::fs::write(format!("{}.digest", to.display()), b"{}").unwrap();
+        let (mut a, b) = pair().await;
+        let mut job = read_job(&file, true);
+        job.is_resume = true;
+        let mut w = write_job(&to, job.files().clone());
+        let answer = FileTransferSendConfirmRequest {
+            id: 1,
+            file_num: 0,
+            union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(offset as u32)),
+            ..Default::default()
+        };
+        w.confirm(&answer).await;
+        let rx = tokio::spawn(receive(b, w));
+        let mut jobs = vec![job];
+        enable_sends(&mut jobs, Some(this_os()));
+        crate::file_speed::pump_read_jobs(&mut jobs, &mut a).await.unwrap();
+        jobs[0].confirm(&answer).await;
+        std::fs::remove_file(&file).unwrap();
+        let driven = tokio::spawn(async move {
+            drive(&mut jobs, &mut a).await;
+        });
+        let report = time::timeout(Duration::from_secs(20), rx).await.expect("the job hung").unwrap();
+        driven.abort();
+        assert_eq!(report.verified, 0, "{:?}", report);
+        assert!(report.failed[0].why.contains("couldn't read the original"), "{:?}", report.failed);
+        assert!(!to.exists());
+    }
+
+    // Finding 2: a Target's manifest can leave a link under the name a later download writes through.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_cannot_take_a_name_the_job_writes_through() {
+        let dir = Dir::new("work");
+        for name in ["x.download", "x.DOWNLOAD", "sub/x.digest", "x.Digest", ""] {
+            let link = LinkEntry { path: name.into(), target: "/etc/passwd".into(), to_dir: false, modified: None };
+            assert!(make_link(&dir.0, &link).is_some(), "{}", name);
+            assert!(std::fs::symlink_metadata(dir.0.join(name)).map_or(true, |m| !m.file_type().is_symlink()), "{}", name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_download_never_writes_through_a_link_under_its_work_names() {
+        let (src, dst, out, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("out"), Dir::new("log"));
+        with_log(&logs);
+        src.file("x.mov", &noise(4096, 48));
+        src.file("y.mov", &noise(4096, 49));
+        let victim = out.file("victim", b"mine");
+        let new_file = out.0.join("made-by-a-link");
+        let to = dst.0.join("copy");
+        std::fs::create_dir_all(&to).unwrap();
+        std::os::unix::fs::symlink(&victim, to.join("x.mov.download")).unwrap();
+        std::os::unix::fs::symlink(&new_file, to.join("y.mov.digest")).unwrap();
+        let report = copy(&src.0, &to).await;
+        assert_eq!(std::fs::read(&victim).unwrap(), b"mine", "nothing goes through .download");
+        assert!(!new_file.exists(), "nothing goes through .digest");
+        assert!(report.failed.iter().any(|f| f.name == "x.mov"), "{:?}", report);
+        assert!(!report.all_passed());
+        assert!(!to.join("x.mov").exists(), "a link never gets the real name");
+    }
+
+    /// With no verification at all, as with an old peer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverified_download_never_writes_through_a_link_either() {
+        let (dst, out) = (Dir::new("dst"), Dir::new("out"));
+        let victim = out.file("victim", b"mine");
+        std::os::unix::fs::symlink(&victim, dst.0.join("x.mov.download")).unwrap();
+        let mut w = write_job(
+            &dst.0,
+            vec![
+                FileEntry { name: "a.mov".into(), size: 3, ..Default::default() },
+                FileEntry { name: "x.mov".into(), size: 3, ..Default::default() },
+            ],
+        );
+        let block = |file_num| FileTransferBlock { id: 1, file_num, data: b"new".to_vec().into(), ..Default::default() };
+        w.write(block(0)).await.unwrap();
+        assert!(w.write(block(1)).await.is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"mine");
+    }
+
+    /// A resume that reopens `.download` is the third way through.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_never_reopens_a_link() {
+        let (dst, out) = (Dir::new("dst"), Dir::new("out"));
+        let victim = out.file("victim", b"mine and more");
+        let to = dst.0.join("x.mov");
+        std::os::unix::fs::symlink(&victim, format!("{}.download", to.display())).unwrap();
+        std::fs::write(format!("{}.digest", to.display()), b"{}").unwrap();
+        let mut w = write_job(&to, vec![FileEntry { name: String::new(), size: 13, ..Default::default() }]);
+        w.confirm(&FileTransferSendConfirmRequest {
+            id: 1,
+            file_num: 0,
+            union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(4)),
+            ..Default::default()
+        })
+        .await;
+        let block = FileTransferBlock { id: 1, file_num: 0, data: b"XXXX".to_vec().into(), ..Default::default() };
+        w.write(block).await.ok();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"mine and more");
+    }
+
+    // Finding 3: names in one job that destroy each other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_named_like_another_files_download_is_refused_not_destroyed() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(5000, 50);
+        src.file("A.MOV", &data);
+        src.file("A.MOV.download", &noise(5000, 51));
+        let to = dst.0.join("copy");
+        let report = copy_job(read_job_listing(&src.0, &["A.MOV.download", "A.MOV"]), &to).await;
+        assert_eq!(std::fs::read(to.join("A.MOV")).unwrap(), data);
+        assert_eq!(report.verified, 1, "{:?}", report);
+        assert_eq!(report.failed[0].name, "A.MOV.download");
+        assert!(report.words().starts_with("Not verified: 1 of 2 files failed: A.MOV.download ("), "{}", report.words());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_named_like_another_files_digest_is_refused_not_destroyed() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(5000, 52);
+        src.file("A.MOV", &data);
+        src.file("A.MOV.digest", &noise(5000, 53));
+        let to = dst.0.join("copy");
+        let report = copy_job(read_job_listing(&src.0, &["A.MOV.digest", "A.MOV"]), &to).await;
+        assert_eq!(std::fs::read(to.join("A.MOV")).unwrap(), data);
+        assert_eq!(report.failed[0].name, "A.MOV.digest");
+        assert!(!report.all_passed());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn names_that_differ_only_by_capitals_are_refused_not_destroyed() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(5000, 54);
+        src.file("A.MOV", &data);
+        src.file("a.mov", &data);
+        let to = dst.0.join("copy");
+        let report = copy_job(read_job_listing(&src.0, &["A.MOV", "a.mov"]), &to).await;
+        assert_eq!(report.verified, 1, "{:?}", report);
+        assert_eq!(report.failed[0].name, "a.mov");
+        assert!(report.failed[0].why.contains("A.MOV"), "{:?}", report.failed);
+        assert!(to.join("A.MOV").exists());
+    }
+
+    /// A sender that ignores all that, as a hostile one would: the receiver refuses too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_receiver_refuses_those_names_too() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(5000, 55);
+        let first = noise(5000, 56);
+        src.file("A.MOV", &data);
+        src.file("A.MOV.download", &first);
+        let to = dst.0.join("copy");
+        let mut job = read_job_listing(&src.0, &["A.MOV", "A.MOV.download"]);
+        enable_send(&mut job, this_os());
+        if let JobVerify::Send(s) = &mut job.boring {
+            s.refused.clear();
+        }
+        let report = copy_job(job, &to).await;
+        assert_eq!(std::fs::read(to.join("A.MOV")).unwrap(), data);
+        assert!(!to.join("A.MOV.download").exists());
+        assert_eq!(report.verified, 1, "{:?}", report);
+        assert_eq!(report.failed[0].name, "A.MOV.download");
+    }
+
+    /// Two spellings of one name that no list can spot here, since these are two different strings
+    /// that only the disk calls the same: the check at the end sees one file where there were two.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_names_landing_on_one_file_are_never_verified() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let (composed, decomposed) = ("caf\u{e9}.mov", "cafe\u{301}.mov");
+        src.file(composed, &noise(5000, 57));
+        if !src.0.join(decomposed).exists() {
+            return; // This volume keeps them apart, so there's nothing to destroy.
+        }
+        let to = dst.0.join("copy");
+        let report = copy_job(read_job_listing(&src.0, &[composed, decomposed]), &to).await;
+        assert!(!report.all_passed(), "{}", report.words());
+        assert!(report.words().starts_with("Not verified: "), "{}", report.words());
+    }
+
+    /// A verified file that isn't what it was by the end of the job.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verified_file_gone_or_cut_short_by_the_end_is_not_verified() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let _turn = HOOK_LOCK.lock().await;
+        src.file("a.mov", &noise(5000, 58));
+        src.file("b.mov", &noise(5000, 59));
+        src.file("c.mov", &noise(5000, 60));
+        let to = dst.0.join("copy");
+        {
+            let to = to.clone();
+            hook(&to.clone(), move |path, _| {
+                // c.mov's read-back runs after a and b have their names.
+                if path.to_string_lossy().contains("c.mov") {
+                    let cut = std::fs::OpenOptions::new().write(true).open(to.join("a.mov")).unwrap();
+                    cut.set_len(10).unwrap();
+                    std::fs::remove_file(to.join("b.mov")).unwrap();
+                }
+            });
+        }
+        let report = copy_job(read_job_listing(&src.0, &["a.mov", "b.mov", "c.mov"]), &to).await;
+        *BEFORE_READ_BACK.lock().unwrap() = None;
+        assert_eq!(report.verified, 1, "{:?}", report);
+        assert_eq!(report.failed.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["a.mov", "b.mov"]);
+    }
+
+    // Finding 4: the headline and what's missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_folder_made_is_never_verified() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        std::fs::create_dir_all(src.0.join("empty")).unwrap();
+        let to = dst.0.join("copy");
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("empty"), b"a file sits where the folder goes").unwrap();
+        let report = copy(&src.0, &to).await;
+        assert!(!report.all_passed(), "{}", report.words());
+        assert!(report.words().starts_with("Not verified: 0 proved, 0 bytes. Not copied: empty ("), "{}", report.words());
+    }
+
+    // Finding 5: a file that changes while it's read matches its copy but not the source.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_changed_during_the_send_goes_again_and_the_copy_matches_the_source() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(3 * 1024 * 1024, 61);
+        let file = src.file("a.mov", &data);
+        let to = dst.0.join("copy");
+        let job = read_job_listing(&src.0, &["a.mov"]);
+        let (a, b) = pair().await;
+        let rx = tokio::spawn(receive(b, write_job(&to, job.files().clone())));
+        let tx = tokio::spawn(send_stepping(a, job, move |step, _| {
+            // Its start has been read by now: this copy would have the old start and the new end.
+            if step == 3 {
+                use std::os::unix::fs::FileExt;
+                let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+                f.write_all_at(b"changed", 0).unwrap();
+            }
+        }));
+        let report = time::timeout(Duration::from_secs(30), rx).await.expect("the job hung").unwrap();
+        tx.abort();
+        let mut now = data.clone();
+        now[..7].copy_from_slice(b"changed");
+        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), now, "words: {}", report.words());
+        assert!(report.all_passed(), "{}", report.words());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_that_keeps_changing_is_named_and_never_gets_the_real_name() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(3 * 1024 * 1024, 62);
+        let file = src.file("a.mov", &data);
+        let to = dst.0.join("copy");
+        let job = read_job_listing(&src.0, &["a.mov"]);
+        let (a, b) = pair().await;
+        let rx = tokio::spawn(receive(b, write_job(&to, job.files().clone())));
+        let tx = tokio::spawn(send_stepping(a, job, move |step, _| {
+            if step % 2 == 0 {
+                use std::os::unix::fs::FileExt;
+                let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+                f.write_all_at(&step.to_le_bytes(), 0).unwrap();
+            }
+        }));
+        let report = time::timeout(Duration::from_secs(30), rx).await.expect("the job hung").unwrap();
+        tx.abort();
+        assert!(!report.all_passed(), "{}", report.words());
+        assert_eq!(report.failed[0].name, "a.mov");
+        assert!(report.failed[0].why.contains("changed"), "{:?}", report.failed);
+        assert!(!to.join("a.mov").exists());
+    }
+
+    // Finding 7: a read error part way, and the receiver's stream still open on the partial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_error_part_way_through_the_only_file_starts_it_over() {
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        let data = noise(3 * 1024 * 1024, 63);
+        src.file("a.mov", &data);
+        let to = dst.0.join("copy");
+        let job = read_job_listing(&src.0, &["a.mov"]);
+        let (a, b) = pair().await;
+        let rx = tokio::spawn(receive(b, write_job(&to, job.files().clone())));
+        let broken = dst.0.clone();
+        let tx = tokio::spawn(send_stepping(a, job, move |step, job| {
+            if step == 3 {
+                job.boring_break_stream(&broken);
+            }
+        }));
+        let report = time::timeout(Duration::from_secs(30), rx).await.expect("the job hung").unwrap();
+        tx.abort();
+        assert!(report.all_passed(), "{}", report.words());
+        assert_eq!(std::fs::read(to.join("a.mov")).unwrap(), data);
+    }
+
+    // Finding 10: what the peer says is not what the log records.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_verify_log_holds_the_senders_own_hash_not_the_peers_words() {
+        let (src, logs) = (Dir::new("src"), Dir::new("log"));
+        let log = with_log(&logs);
+        let data = noise(4096, 64);
+        src.file("a.mov", &data);
+        let mut job = read_job_listing(&src.0, &["a.mov"]);
+        enable_send(&mut job, this_os());
+        job.init_data_stream_for_cm().await.unwrap();
+        while job.read().await.unwrap().map_or(false, |b| !b.data.is_empty()) {}
+        // Wait for the seal.
+        for _ in 0..500 {
+            if job.boring.take_outgoing().iter().any(|m| {
+                matches!(m.union, Some(message::Union::Misc(ref x)) if matches!(x.union, Some(misc::Union::PluginRequest(ref p)) if String::from_utf8_lossy(&p.content).contains("seal")))
+            }) {
+                break;
+            }
+            time::sleep(Duration::from_millis(5)).await;
+        }
+        let forged = r#"{"t":"verdict","id":1,"file_num":0,"ok":true,"why":"","size":1,"hash":"ab\n2026-01-01T00:00:00Z\tverified\t1\tblake3:FORGEDFORGED\t/forged\t\n"}"#;
+        on_wire(&mut job, Wire::from_json(forged.as_bytes()).unwrap(), None);
+        let lines = std::fs::read_to_string(log).unwrap();
+        assert!(!lines.contains("FORGEDFORGED"), "{}", lines);
+        let wanted = format!("	{}	blake3:{}	{}", data.len(), blake3::hash(&data).to_hex(), src.0.join("a.mov").display());
+        assert!(lines.lines().any(|l| l.contains("	sent	") && l.contains(&wanted)), "{}", lines);
+    }
+
+    // Finding 8: a read-back that may have come from memory proves nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dropping_the_cached_copy_says_when_it_could_not() {
+        let dir = Dir::new("drop");
+        let p = dir.file("x", b"something");
+        assert!(mac::drop_cached(&std::fs::File::open(&p).unwrap()).is_ok());
+        // mmap for reading can't work on a file opened only for writing.
+        let write_only = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        assert!(mac::drop_cached(&write_only).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_disk_that_wont_drop_its_cache_is_never_verified() {
+        let _turn = HOOK_LOCK.lock().await;
+        let (src, dst, logs) = (Dir::new("src"), Dir::new("dst"), Dir::new("log"));
+        with_log(&logs);
+        src.file("a.mov", &noise(5000, 65));
+        let to = dst.0.join("copy");
+        *DROP_FAILS_UNDER.lock().unwrap() = Some(to.clone());
+        let report = copy(&src.0, &to).await;
+        *DROP_FAILS_UNDER.lock().unwrap() = None;
+        assert!(!report.all_passed(), "{}", report.words());
+        assert!(report.failed[0].why.contains("cached copy"), "{:?}", report.failed);
+        assert!(!to.join("a.mov").exists());
+        assert!(to.join("a.mov.download").exists());
+    }
+
+    /// The original only has to read as it reads, so that same disk can still be the source.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_that_wont_drop_its_cache_is_still_read() {
+        let _turn = HOOK_LOCK.lock().await;
+        let dir = Dir::new("src");
+        let data = noise(5000, 66);
+        let p = dir.file("a.mov", &data);
+        *DROP_FAILS_UNDER.lock().unwrap() = Some(dir.0.clone());
+        let cancel = AtomicBool::new(false);
+        let got = hash_source(&p, &cancel).unwrap();
+        let refused = hash_from_disk(&p, &cancel).is_err();
+        *DROP_FAILS_UNDER.lock().unwrap() = None;
+        assert_eq!(got, (data.len() as u64, blake3::hash(&data).to_hex().to_string()));
+        assert!(refused);
+    }
+
+    // Finding 9: what Windows' unbuffered read does, as a reader: a short last read, then an error.
+    struct Unbuffered {
+        data: Vec<u8>,
+        at: usize,
+    }
+
+    impl Read for Unbuffered {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at % 4096 != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+            }
+            let n = buf.len().min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stopping_at_the_length_never_reads_past_a_short_last_read() {
+        let cancel = AtomicBool::new(false);
+        for len in [0, 1, 4096, CHUNK, CHUNK + 1, 2 * CHUNK + 4097] {
+            let data = noise(len, 67);
+            let want = (len as u64, blake3::hash(&data).to_hex().to_string());
+            let got = hash_reader(Unbuffered { data, at: 0 }, Some(len as u64), &cancel).unwrap();
+            assert_eq!(got, want, "{}", len);
+        }
+        // And without it, this is the failure.
+        let data = noise(CHUNK + 1, 68);
+        assert!(hash_reader(Unbuffered { data, at: 0 }, None, &cancel).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_flag_lands_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+        let dir = Dir::new("hidden");
+        let p = dir.file("x", b"x");
+        let meta = Meta { windows_hidden: true, ..Default::default() };
+        assert!(apply_contents_meta(&p, &meta, "windows").is_empty());
+        assert_ne!(std::fs::metadata(&p).unwrap().file_attributes() & 0x2, 0);
+        assert!(capture_meta(&p).windows_hidden);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_hidden_flag_is_listed_where_it_cant_land() {
+        let dir = Dir::new("hidden");
+        let p = dir.file("x", b"x");
+        let meta = Meta { windows_hidden: true, ..Default::default() };
+        assert_eq!(apply_contents_meta(&p, &meta, "windows"), vec!["Windows hidden flag".to_string()]);
+    }
+
+    // Finding 10: a report only from the side that received.
+    #[test]
+    fn a_report_counts_only_from_a_receiver_that_said_it_could_prove() {
+        assert!(report_is_wanted(true, false), "an upload to a peer that verifies");
+        assert!(!report_is_wanted(false, false), "an upload to an old peer");
+        assert!(!report_is_wanted(true, true), "a download: only this side's read-back counts");
+        assert!(!report_is_wanted(false, true), "an unverified download");
+    }
+
+    #[test]
+    fn one_file_is_one_line_in_the_log() {
+        let logs = Dir::new("log");
+        let log = with_log(&logs);
+        log_line("verified", 1, "a\nb", "/path\r\nforged-one-line\t", "why\nforged-one-line");
+        let lines = std::fs::read_to_string(log).unwrap();
+        assert!(lines.lines().filter(|l| l.contains("forged-one-line")).count() == 1, "{}", lines);
+        assert!(lines.lines().all(|l| !l.starts_with("forged-one-line") && !l.starts_with('b')), "{}", lines);
+    }
+
+    #[test]
+    fn names_that_would_destroy_each_other_are_found_in_any_order() {
+        let list = |names: &[&str]| {
+            names.iter().map(|n| FileEntry { name: n.to_string(), ..Default::default() }).collect::<Vec<_>>()
+        };
+        assert!(colliding_names(&list(&["A.MOV", "B.MOV", "sub/A.MOV", ""])).is_empty());
+        let got = colliding_names(&list(&["A.MOV", "a.mov"]));
+        assert_eq!(got.keys().collect::<Vec<_>>(), [&1]);
+        let got = colliding_names(&list(&["Sub\\A.MOV", "sub/a.mov"]));
+        assert_eq!(got.keys().collect::<Vec<_>>(), [&1]);
+        for names in [["A.MOV", "a.mov.DOWNLOAD"], ["a.mov.DOWNLOAD", "A.MOV"], ["A.MOV", "a.mov.digest"], ["a.mov.digest", "A.MOV"]] {
+            let got = colliding_names(&list(&names));
+            let at = names.iter().position(|n| n.len() > 5).unwrap() as i32;
+            assert_eq!(got.keys().collect::<Vec<_>>(), [&at], "{:?}", names);
+        }
+        assert!(colliding_names(&list(&["x.download", "y.digest"])).is_empty(), "no owner, nothing in the way");
     }
 
     /// An overwrite answered "skip": nothing is sent. Same file counts, different file is listed

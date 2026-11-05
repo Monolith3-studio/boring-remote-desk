@@ -3046,6 +3046,15 @@ T30_LOCK_CTE = (
     "checksum = \"7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6\"\n\n")
 T30_HOOKS = (
     "// boring-remote (v1.7 t30): the job's end of crate::file_verify, here for the private fields.\n"
+    "async fn boring_file_stamp(stream: &Option<DataStream>) -> crate::file_verify::FileStamp {\n"
+    "    match stream {\n"
+    "        Some(DataStream::FileStream(file)) => match file.metadata().await {\n"
+    "            Ok(m) => (m.len(), m.modified().ok()),\n"
+    "            Err(_) => Default::default(),\n"
+    "        },\n"
+    "        _ => Default::default(),\n"
+    "    }\n"
+    "}\n\n"
     "impl TransferJob {\n"
     "    /// Before a read job's next read: what never gets read is listed, and a file that came back\n"
     "    /// wrong goes again, once the first pass is over. It doesn't ask about overwriting again.\n"
@@ -3106,8 +3115,19 @@ T30_HOOKS = (
     "            Some(err) => self.boring.read_failed(n, &path, &err, next, len),\n"
     "        };\n"
     "    }\n\n"
+    "    /// Whether the open file changed under the read, or the read stopped short of it.\n"
+    "    async fn boring_file_changed(&mut self) -> Option<String> {\n"
+    "        if !self.boring.sending() {\n"
+    "            return None;\n"
+    "        }\n"
+    "        let now = boring_file_stamp(&self.data_stream).await;\n"
+    "        self.boring.stamp_closed(now)\n"
+    "    }\n\n"
     "    pub async fn write(&mut self, block: FileTransferBlock) -> ResultType<()> {\n"
     "        let (end_of_file, file_num) = (block.data.is_empty() && !block.compressed, block.file_num);\n"
+    "        if self.boring.refuses_file(file_num) {\n"
+    "            return Ok(());\n"
+    "        }\n"
     "        let counted = self.boring.rewind(file_num);\n"
     "        self.finished_size = self.finished_size.saturating_sub(counted);\n"
     "        let res = self.boring_write(block).await;\n"
@@ -3127,12 +3147,22 @@ T30_HOOKS = (
     "            crate::file_verify::file_closed(self, file_num);\n"
     "        }\n"
     "        Ok(())\n"
+    "    }\n\n"
+    "    /// What a disk failing part way through a file looks like: the next real read is an error.\n"
+    "    #[cfg(test)]\n"
+    "    pub fn boring_break_stream(&mut self, dir: &Path) {\n"
+    "        let dir = std::fs::File::open(dir).unwrap();\n"
+    "        self.data_stream = Some(DataStream::FileStream(File::from_std(dir)));\n"
     "    }\n"
     "}\n\n")
 T30_READ_GUARD = (
     "        // boring-remote (v1.7 t30): a file that wouldn't open is listed, and the next call moves on.\n"
     "        if self.boring.sending() && self.data_stream.is_none() {\n"
     "            return Ok(None);\n"
+    "        }\n"
+    "        if self.boring.wants_stamp() {\n"
+    "            let stamp = boring_file_stamp(&self.data_stream).await;\n"
+    "            self.boring.stamp_opened(stamp);\n"
     "        }\n")
 T30_TICK = (
     "    // boring-remote (v1.7 t30): seals and manifests go out between blocks, in order.\n"
@@ -3150,7 +3180,10 @@ T30_IO_ON_WIRE = (
     "            return;\n"
     "        };\n"
     "        if let Wire::Report { id, report } = wire {\n"
-    "            self.boring_reports.insert(id, report);\n"
+    "            let receiving_here = fs::get_job(id, &mut self.write_jobs).is_some();\n"
+    "            if verify::report_is_wanted(self.boring_verify_os.is_some(), receiving_here) {\n"
+    "                self.boring_reports.insert(id, report);\n"
+    "            }\n"
     "            return;\n"
     "        }\n"
     "        let Some(id) = wire.job_id() else {\n"
@@ -3181,7 +3214,7 @@ T30_IO_REPORT = (
     "                                fs::JobType::Generic => {\n"
     "                                    // boring-remote (v1.7 t30): the job says what happened, in plain words. Ours\n"
     "                                    // if this side received, the other side's if it did.\n"
-    "                                    let report = boring_report.or_else(|| self.boring_reports.remove(&d.id));\n"
+    "                                    let report = if boring_received { boring_report } else { self.boring_reports.remove(&d.id) };\n"
     "                                    self.handler.boring_job_report(\n"
     "                                        d.id,\n"
     "                                        base::file_verify::job_words(report.as_ref(), self.boring_verify_os.is_some()),\n"
@@ -3218,7 +3251,8 @@ T30_CONN_SCOPE = (
     "        }\n")
 T30_MARKER = (
     "        // boring-remote (v1.7 t30): this Target proves files (base::file_verify). Upstream never sends the key.\n"
-    "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+    "        // Not on Linux, which ships nothing and whose read-back would come from the cache.\n"
+    "        #[cfg(any(target_os = \"windows\", target_os = \"macos\"))]\n"
     "        platform_additions.insert(base::file_verify::MARKER.into(), json!(true));\n")
 T30_CONN_ENABLE = (
     "        // boring-remote (v1.7 t30)\n"
@@ -3333,6 +3367,22 @@ PATCHES += [
      "                            }\n"
      "                            return Err(err.into());\n",
      "a file that won't open doesn't end the job (t30)"),
+    (FS_RS, "                    self.data_stream = Some(DataStream::FileStream(File::create(&path).await?));\n",
+     "                    // boring-remote (v1.7 t30): a link under this name is refused, not written through.\n"
+     "                    self.data_stream = Some(DataStream::FileStream(crate::file_verify::create_work_file(&path).await?));\n",
+     "a copy never writes through a link (t30)"),
+    (FS_RS, "                        std::fs::write(dp, json!(self.digest).to_string()).ok();\n",
+     "                        crate::file_verify::write_work_file(dp, &json!(self.digest).to_string()).ok(); // boring-remote (v1.7 t30)\n",
+     "a digest never writes through a link (t30)"),
+    (FS_RS, "            let digest_path = format!(\"{}.digest\", &file_path);\n\n            let mut f = if Path::new(&download_path).exists()",
+     "            let digest_path = format!(\"{}.digest\", &file_path);\n\n"
+     "            // boring-remote (v1.7 t30): a resume never reopens a link.\n"
+     "            if crate::file_verify::is_link(Path::new(&download_path)) {\n"
+     "                log::warn!(\"A link is in the way of {}, not resuming\", download_path);\n"
+     "                return;\n"
+     "            }\n"
+     "            let mut f = if Path::new(&download_path).exists()",
+     "a resume never reopens a link (t30)"),
     (FS_RS, "        const BUF_SIZE: usize = 128 * 1024;\n", T30_READ_GUARD + "        const BUF_SIZE: usize = 128 * 1024;\n", "a read waits for the next file (t30)"),
     (FS_RS,
      "                    self.file_num += 1;\n"
@@ -3348,7 +3398,12 @@ PATCHES += [
      "                    if self.boring.sending() {\n"
      "                        self.boring_ahead.clear();\n"
      "                        self.boring_after_read(file_num, Some(err.to_string()));\n"
-     "                        return Ok(None);\n"
+     "                        // Ends the receiver's stream, so a resend starts the file over.\n"
+     "                        return Ok(Some(FileTransferBlock {\n"
+     "                            id: self.id,\n"
+     "                            file_num: file_num as _,\n"
+     "                            ..Default::default()\n"
+     "                        }));\n"
      "                    }\n"
      "                    return Err(err.into());\n",
      "a read error doesn't end the job (t30)"),
@@ -3362,11 +3417,12 @@ PATCHES += [
      "            self.file_confirmed = false;\n"
      "            self.file_is_waiting = false;\n"
      "        } else {\n",
+     "            let boring_changed = self.boring_file_changed().await; // boring-remote (v1.7 t30)\n"
      "            self.file_num += 1;\n"
      "            self.data_stream = None;\n"
      "            self.file_confirmed = false;\n"
      "            self.file_is_waiting = false;\n"
-     "            self.boring_after_read(file_num, None); // boring-remote (v1.7 t30)\n"
+     "            self.boring_after_read(file_num, boring_changed); // boring-remote (v1.7 t30)\n"
      "        } else {\n",
      "the seal follows a file's last block (t30)"),
     (FS_RS, "        if self.job_skipped() {\n            return Some(\"skipped\".to_string());\n",
@@ -3464,9 +3520,10 @@ PATCHES += [
      "Controller checks free space first (t30)"),
     (IO_LOOP, "                            let mut printer_data = None;\n                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {\n                                job.modify_time();\n",
      "                            let mut printer_data = None;\n"
-     "                            let mut boring_report = None; // boring-remote (v1.7 t30)\n"
+     "                            let (mut boring_report, mut boring_received) = (None, false); // boring-remote (v1.7 t30)\n"
      "                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {\n                                job.modify_time();\n"
-     "                                boring_report = base::file_verify::finish(&job);\n",
+     "                                boring_report = base::file_verify::finish(&job);\n"
+     "                                boring_received = true;\n",
      "Controller finishes a job it received (t30)"),
     (IO_LOOP, "                                fs::JobType::Generic => {\n                                    self.handle_job_status(d.id, d.file_num, err);\n",
      T30_IO_REPORT + "                                    self.handle_job_status(d.id, d.file_num, err);\n", "the job says what happened (t30)"),

@@ -57,6 +57,7 @@ void main() {
     const verified = 'Verified: 12 files, 4.3 GB';
     const partial = 'Not verified: 1 of 12 files failed: A001.MOV (the copy doesn\'t match the original). 11 proved, 4.0 GB';
     const oldPeer = 'Not verified: the other computer needs the latest Boring Remote';
+    const leftBehind = 'Not verified: 12 proved, 4.3 GB. Not copied: B002 (couldn\'t read this folder)';
 
     test('says the engine\'s words, with the average after them', () {
       expect(job('done', err: verified, averageSpeed: 97e6).status, 'Verified: 12 files, 4.3 GB · 97 MB/s average');
@@ -69,6 +70,7 @@ void main() {
       expect(job('done', err: verified).notVerified, isFalse);
       expect(job('done', err: partial).notVerified, isTrue);
       expect(job('done', err: oldPeer).notVerified, isTrue);
+      expect(job('done', err: leftBehind).notVerified, isTrue);
     });
 
     test('a job with no report never claims anything', () {

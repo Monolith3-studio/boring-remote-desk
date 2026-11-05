@@ -975,9 +975,46 @@ class RebrandSeam(unittest.TestCase):
     def test_a_softer_verified_fails_check(self):
         self.rebrand()
         rel = "libs/base/src/file_verify.rs"
-        self.edit(rel, "self.failed.is_empty() && self.skipped.is_empty() && self.verified == self.files\n",
+        self.edit(rel, "self.failed.is_empty()\n            && self.skipped.is_empty()\n",
                   "self.failed.is_empty()\n")
         self.assert_check_fails(check.VERIFY_WORDS)
+
+    def test_verified_with_something_left_behind_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/file_verify.rs", "            && self.not_copied.is_empty()\n", "")
+        self.assert_check_fails(check.VERIFY_WORDS)
+
+    def test_verified_with_nothing_proved_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/file_verify.rs", "            && self.files + self.folders > 0\n", "")
+        self.assert_check_fails(check.VERIFY_WORDS)
+
+    def test_writing_through_a_link_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.FS_RS, "crate::file_verify::create_work_file(&path).await?", "File::create(&path).await?")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_a_forged_report_on_a_download_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.IO_LOOP, "if verify::report_is_wanted(self.boring_verify_os.is_some(), receiving_here) {", "if true {")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_a_download_taking_the_peers_report_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.IO_LOOP, "let report = if boring_received { boring_report } else { self.boring_reports.remove(&d.id) };",
+                  "let report = boring_report.or_else(|| self.boring_reports.remove(&d.id));")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_a_file_changed_under_the_read_going_unnoticed_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.FS_RS, "self.boring_after_read(file_num, boring_changed);", "self.boring_after_read(file_num, None);")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_linux_announcing_it_proves_files_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CONN, '#[cfg(any(target_os = "windows", target_os = "macos"))]\n        platform_additions.insert(base::file_verify::MARKER',
+                  '#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]\n        platform_additions.insert(base::file_verify::MARKER')
+        self.assert_check_fails(check.VERIFY_HOOKS)
 
     def test_changing_the_old_peer_words_fails_check(self):
         self.rebrand()

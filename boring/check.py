@@ -1266,6 +1266,11 @@ def transfer_verify_checks(c):
         (rebrand.FS_RS, "if self.r#type == JobType::Printer || self.boring.receiving() {"),
         (rebrand.FS_RS, "if !job.boring_holds_done() && job.job_completed() {"),
         (rebrand.FS_RS, "self.boring.stream_moved();"),
+        (rebrand.FS_RS, "crate::file_verify::create_work_file(&path).await?"),
+        (rebrand.FS_RS, "crate::file_verify::write_work_file(dp,"),
+        (rebrand.FS_RS, "if crate::file_verify::is_link(Path::new(&download_path)) {"),
+        (rebrand.FS_RS, "self.boring_after_read(file_num, boring_changed);"),
+        (rebrand.FS_RS, "self.boring.stamp_opened(stamp);"),
         (rebrand.IPC, "BoringWire(String),"),
         (rebrand.UI_CM, rebrand.T30_CM_WIRE),
         (rebrand.UI_CM, rebrand.T30_CM_DONE),
@@ -1296,7 +1301,9 @@ def transfer_verify_checks(c):
     why = []
     if '"Not verified: the other computer needs the latest Boring Remote"' not in verify:
         why.append("the old peer's words changed")
-    if "pub fn all_passed(&self) -> bool {\n        self.failed.is_empty() && self.skipped.is_empty() && self.verified == self.files\n" not in verify:
+    if ("pub fn all_passed(&self) -> bool {\n        self.failed.is_empty()\n            && self.skipped.is_empty()\n"
+            "            && self.not_copied.is_empty()\n            && self.verified == self.files\n"
+            "            && self.files + self.folders > 0\n") not in verify:
         why.append("all_passed no longer takes every file")
     if verify.count('"Verified: ') != 2 or "let mut out = if self.all_passed() {" not in verify:
         why.append("Verified can be said outside all_passed")
