@@ -37,7 +37,7 @@ SetupFlow flow({
 }) =>
     SetupFlow(
       platform: platform,
-      computerName: computerName ?? Future.value("Jason's MacBook Pro"),
+      computerName: computerName ?? Future.value("Sam's MacBook Pro"),
       onName: onName ?? (_) async {},
       canSeeScreen: canSeeScreen ?? () => false,
       canControl: canControl ?? () => false,
@@ -64,7 +64,7 @@ void main() {
       await tester.pump();
       expect(find.text(setupCopy['name.title']!), findsOneWidget);
       expect(find.text('Step 1 of 3'), findsOneWidget);
-      expect(find.text("Jason's MacBook Pro"), findsOneWidget);
+      expect(find.text("Sam's MacBook Pro"), findsOneWidget);
       await tester.enterText(find.byKey(SetupFlow.nameKey), '  Edit Bay 2 ');
       await tapText(tester, setupCopy['next']!);
       await tester.pumpAndSettle();

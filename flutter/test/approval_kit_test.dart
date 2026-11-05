@@ -37,8 +37,8 @@ void expectWhole(WidgetTester tester, Size size, String question) {
 
 void main() {
   test('messages round-trip in the format src/boring_approval.rs carries', () {
-    final ask = parseApproval(approvalAsk(7, 'Jason M Studio: edit bay'))!;
-    expect((ask.kind, ask.id, ask.name), (ApprovalKind.ask, 7, 'Jason M Studio: edit bay'));
+    final ask = parseApproval(approvalAsk(7, 'Sam M Studio: edit bay'))!;
+    expect((ask.kind, ask.id, ask.name), (ApprovalKind.ask, 7, 'Sam M Studio: edit bay'));
     expect(approvalAsk(7, 'a b'), 'boring-approval-ask:7::::a%20b');
     // Audit H1: the ask carries new / removed, the trust key and the address, not just a name.
     final v6 = parseApproval(approvalAsk(8, 'Edit Bay 2', trust: 'removed', key: 'bb22cc33dd44ee55', ip: 'fe80::1'))!;
@@ -65,10 +65,10 @@ void main() {
         toFront: () async => fronted++,
         answer: (id, allow) => answers.add('$id:$allow'),
       );
-      desk.take(ApprovalMsg(ApprovalKind.ask, 3, name: 'Jason M Studio, the long-named edit bay Mac upstairs'));
+      desk.take(ApprovalMsg(ApprovalKind.ask, 3, name: 'Sam M Studio, the long-named edit bay Mac upstairs'));
       await tester.pumpAndSettle();
       expect(fronted, 1);
-      const q = 'Jason M Studio, the long-named edit bay Mac upstairs wants to control this Mac.';
+      const q = 'Sam M Studio, the long-named edit bay Mac upstairs wants to control this Mac.';
       // A short window scrolls the card; the buttons are reachable and then fully in view.
       await tester.ensureVisible(find.byKey(const ValueKey('approval-allow')));
       await tester.pumpAndSettle();
@@ -120,15 +120,15 @@ void main() {
       toFront: () async {},
       answer: (id, allow) => answers.add('$id:$allow'),
     );
-    desk.take(const ApprovalMsg(ApprovalKind.ask, 9, name: 'Jason M Studio'));
+    desk.take(const ApprovalMsg(ApprovalKind.ask, 9, name: 'Sam M Studio'));
     await tester.pumpAndSettle();
     final rows = WaitingApprovals(waiting: ApprovalDesk.waitingNow, onDecide: desk.decide);
     await tester.pumpWidget(MaterialApp(theme: Kit.theme(), home: Scaffold(body: rows)));
-    expect(find.text('Jason M Studio wants to control this Mac.'), findsOneWidget);
+    expect(find.text('Sam M Studio wants to control this Mac.'), findsOneWidget);
     await tester.tap(find.text('Allow'));
     await tester.pumpAndSettle();
     expect(answers, ['9:true']);
-    expect(find.text('Jason M Studio wants to control this Mac.'), findsNothing);
+    expect(find.text('Sam M Studio wants to control this Mac.'), findsNothing);
     desk.decide(9, true); // already answered: nothing sent twice
     expect(answers, ['9:true']);
   });
@@ -150,28 +150,28 @@ void main() {
   });
 
   test('Allow on a removed row lets in only the ask that holds its key, never one with its name', () {
-    const removed = TrustedController(key: 'bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff001122334455', name: 'Jason M Studio');
+    const removed = TrustedController(key: 'bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff001122334455', name: 'Sam M Studio');
     const waiting = [
-      WaitingAsk(1, 'Jason M Studio', trust: 'new', key: '0123456789abcdef', ip: '192.168.1.66'),
-      WaitingAsk(2, 'Jason M Studio', trust: 'removed', key: 'bb22cc33dd44ee55', ip: '192.168.1.20'),
-      WaitingAsk(3, 'Jason M Studio', trust: 'removed', key: 'ffffffffffffffff', ip: '192.168.1.67'),
-      WaitingAsk(4, 'Jason M Studio', trust: 'new', key: 'bb22cc33dd44ee55', ip: '192.168.1.68'),
-      WaitingAsk(5, 'Jason M Studio'),
+      WaitingAsk(1, 'Sam M Studio', trust: 'new', key: '0123456789abcdef', ip: '192.168.1.66'),
+      WaitingAsk(2, 'Sam M Studio', trust: 'removed', key: 'bb22cc33dd44ee55', ip: '192.168.1.20'),
+      WaitingAsk(3, 'Sam M Studio', trust: 'removed', key: 'ffffffffffffffff', ip: '192.168.1.67'),
+      WaitingAsk(4, 'Sam M Studio', trust: 'new', key: 'bb22cc33dd44ee55', ip: '192.168.1.68'),
+      WaitingAsk(5, 'Sam M Studio'),
       WaitingAsk(6, 'Someone', trust: 'removed', key: 'bb22', ip: '192.168.1.69'),
     ];
     expect(waitingFrom(removed, waiting), [2]);
-    expect(waitingFrom(const TrustedController(key: '', name: 'Jason M Studio'), waiting), isEmpty);
+    expect(waitingFrom(const TrustedController(key: '', name: 'Sam M Studio'), waiting), isEmpty);
   });
 
   const trusted = '[{"key":"aa11","name":"Edit Bay 2","added":1761955200},'
-      '{"key":"bb22","name":"Jason M Studio","added":1761955300,"removed":true}]';
+      '{"key":"bb22","name":"Sam M Studio","added":1761955300,"removed":true}]';
 
   test('Allow on a removed Controller does what trust.rs reinstate does', () {
-    expect(parseRemoved(trusted).map((c) => c.name), ['Jason M Studio']);
+    expect(parseRemoved(trusted).map((c) => c.name), ['Sam M Studio']);
     final back = reinstateTrusted(trusted, 'bb22', now: 1793660000);
     expect(parseRemoved(back), isEmpty);
     expect(parseTrusted(back).map((c) => c.key), ['aa11', 'bb22']);
-    expect((jsonDecode(back) as List)[1], {'key': 'bb22', 'name': 'Jason M Studio', 'added': 1793660000});
+    expect((jsonDecode(back) as List)[1], {'key': 'bb22', 'name': 'Sam M Studio', 'added': 1793660000});
     expect(reinstateTrusted('not json', 'bb22'), '[]');
   });
 
@@ -199,7 +199,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(allowed, ['bb22']);
     expect(find.text('Removed'), findsNothing);
-    expect(find.text('Jason M Studio'), findsOneWidget); // now listed as Trusted, with Remove
+    expect(find.text('Sam M Studio'), findsOneWidget); // now listed as Trusted, with Remove
     expect(find.text('Remove'), findsNWidgets(2));
   });
 

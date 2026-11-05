@@ -10,7 +10,7 @@ test / updater unreachable, LAN discovery on (ADR 0003) (ADR 0004: only the vers
 no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
 Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
 tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
-translations, app metadata, every logo slot; one AGPL line on the About page), that
+translations, app metadata, every logo slot; AGPL notices in the Legal dialog, license and source link), that
 the connect box takes an IP or a tailnet name and never reaches the ID/rendezvous
 path, and that the protocol files are upstream's. It only reads the tree.
 Idempotence is proved by test_rebrand.py and the CI clean-diff step.
@@ -322,7 +322,7 @@ def ui_brand_hits(root):
             for s, line in string_literals(text, DART_TOKENS if p.suffix == ".dart" else C_TOKENS):
                 if not BRAND.search(s) or LOG_CALL.search(line):
                     continue
-                if s == rebrand.LEGAL_LINE:
+                if s == rebrand.LEGAL_CREDIT:
                     legal.append(rel)
                 elif not any(f == rel and re.fullmatch(pat, s) for f, pat in INTERNAL):
                     hits.append(f"{rel}: {s[:80]}")
@@ -446,14 +446,73 @@ def coral_text_hits(root):
     return sorted(set(out))
 
 
+ABOUT_LEGAL = "About page has a plain Legal item that opens the Legal dialog, the one place RustDesk is named"
+LEGAL_NOTICES = "Legal dialog has AGPL's notices: RustDesk's copyright, no warranty, may share, read the license, source"
+LICENCE_BUNDLED = "the license ships inside the app, byte for byte, and Legal reads it from there"
+SOURCE_LINK = "the source link reaches the user: Legal and the installer license name FORK_URL, the install screen opens Legal"
+SOURCE_NOTICE = "the source says it is modified, with a date, and source-tarball.sh can make it (AGPL 5(a), 6)"
+NO_OWNER = "nothing shipped names Monolith3 or Jason"
+# Text that ships, or that the app is built from. boring/ and tests don't ship.
+OWNER = re.compile(r"monolith3|jason|boringstories", re.I)
+OWNER_DIRS = ("flutter/lib", "flutter/macos/Runner", "flutter/windows/runner", "flutter/assets", "src", "libs", "res")
+OWNER_FILES = ("Cargo.toml", "flutter/pubspec.yaml", "flutter/macos/Runner.xcodeproj/project.pbxproj")
+OWNER_EXTS = {".dart", ".rs", ".swift", ".cpp", ".cc", ".c", ".h", ".mm", ".m", ".plist", ".xcconfig", ".xib",
+              ".rc", ".wxl", ".wxs", ".rtf", ".txt", ".toml", ".yaml", ".json", ".py", ".strings"}
+NOT_THE_OWNER = "Copyright 2012 Jason Champion"  # libs/clipboard/src/windows/wf_cliprdr.c: upstream's header stays
+LEGAL_ITEM = "onTap: () => showLegalDialog(context),"
+
+
+def owner_hits(root):
+    paths = [root / f for f in OWNER_FILES]
+    for base in OWNER_DIRS:
+        paths += [p for p in (root / base).rglob("*") if p.suffix in OWNER_EXTS]
+    out = []
+    for p in paths:
+        if p.is_file() and not p.relative_to(root).as_posix().startswith("flutter/assets/LICENCE"):
+            text = p.read_text(encoding="utf-8", errors="replace").replace(NOT_THE_OWNER, "")
+            if OWNER.search(text):
+                out.append(p.relative_to(root).as_posix())
+    return sorted(out)
+
+
+def legal_checks(c, legal):
+    """AGPL 5(d) + 0, 6 + 13: the notices, the license and the source stay reachable (ticket 32)."""
+    words = c.read(rebrand.LEGAL_DART)
+    about = c.read(rebrand.SETTINGS)
+    c.fact(ABOUT_LEGAL, legal == [rebrand.LEGAL_DART] and rebrand.ABOUT_NEW in about and LEGAL_ITEM in about,
+           f"credit found in {legal}")
+    missing = [w for w in (f"credit = '{rebrand.LEGAL_CREDIT}'", "licensed under the GNU AGPL, version 3",
+                           "copy, change and share it", "no warranty", "readLicense = 'Read the license'",
+                           "Text(LegalWords.credit)", "Text(LegalWords.license)", "Text(LegalWords.noWarranty)",
+                           "Text(LegalWords.readLicense)", "Text(LegalWords.sourceUrl)",
+                           "openUrl(LegalWords.sourceUrl)", "Text(LegalWords.getSource)") if w not in words]
+    c.fact(LEGAL_NOTICES, not missing, "; ".join(missing))
+    asset, licence = c.root / rebrand.LICENCE_ASSET, c.root / "LICENCE"
+    c.fact(LICENCE_BUNDLED,
+           asset.is_file() and licence.is_file() and asset.read_bytes() == licence.read_bytes()
+           and "GNU AFFERO GENERAL PUBLIC LICENSE" in licence.read_text()
+           and "    - assets/\n" in c.read("flutter/pubspec.yaml")
+           and f"kLicenseAsset = '{rebrand.LICENCE_ASSET.removeprefix('flutter/')}'" in words)
+    rtf = c.read(f"{MSI_DIR}/License.rtf")
+    bad = [w for w, ok in ((f"Legal: sourceUrl is not {rebrand.FORK_URL}",
+                            f"sourceUrl = '{rebrand.FORK_URL}'" in words),
+                           ("installer license has no source link", rebrand.FORK_URL in rtf),
+                           ("install screen does not open Legal",
+                            "onLicence: () => showLegalDialog(context)," in c.read(rebrand.LOOK_INSTALL))) if not ok]
+    c.fact(SOURCE_LINK, not bad, "; ".join(bad))
+    notice = c.read("NOTICE")
+    c.fact(SOURCE_NOTICE, "modified version of RustDesk" in notice and "Purslane" in notice
+           and re.search(r"since \d{4}-\d{2}-\d{2}", notice) is not None
+           and (c.root / "boring/release/source-tarball.sh").is_file())
+    hits = owner_hits(c.root)
+    c.fact(NO_OWNER, not hits, ", ".join(hits[:12]))
+
+
 def branding_checks(c):
     """No RustDesk name, link or logo a person sees in the Mac and Windows app."""
     hits, legal = ui_brand_hits(c.root)
     c.fact("no RustDesk name or link in the Mac and Windows app's strings", not hits, "; ".join(hits[:12]))
-    c.fact("About page has the one plain AGPL legal line, crediting RustDesk with our source URL",
-           legal == ["flutter/lib/desktop/pages/desktop_setting_page.dart"]
-           and rebrand.FORK_URL in rebrand.LEGAL_LINE and "Purslane" in rebrand.LEGAL_LINE,
-           f"legal line found in {legal}")
+    legal_checks(c, legal)
     lang = lang_hits(c.root)
     c.fact("no RustDesk name or link in any translation", (c.root / "src/lang").is_dir() and not lang,
            f"{len(lang)} values: " + "; ".join(lang[:8]))
@@ -1654,7 +1713,7 @@ def look_checks(c):
 
     inst = c.read(rebrand.LOOK_INSTALL)
     missing = [n for n in (f"if {gate} return boringInstallScreen();", "Obx(() => InstallScreen(",
-                           "child: boringKit(Scaffold(", f"onLicence: () => launchUrlString('{rebrand.FORK_URL}'),")
+                           "child: boringKit(Scaffold(", "onLicence: () => showLegalDialog(context),")
                if n not in inst]
     c.fact("Windows install screen in the kit, plain words", not missing, "; ".join(missing))
 

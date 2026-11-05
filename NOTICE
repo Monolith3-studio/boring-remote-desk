@@ -1,0 +1,16 @@
+Boring Remote is a modified version of RustDesk.
+
+RustDesk is Copyright (C) Purslane Tech Pte. Ltd. and the RustDesk contributors.
+It is licensed under the GNU Affero General Public License, version 3. Boring
+Remote is too. The license is in the LICENCE file.
+
+Boring Labs has been modifying this work since 2026-10-22. The base is RustDesk
+1.6.4 (the version in Cargo.toml).
+
+What changed: the boring/ folder and flutter/lib/desktop/kit/ are new, and so
+are the other files listed in boring/REBASE.md. boring/rebrand.py patches the
+rest of the tree at build time. Upstream copyright headers and LICENCE are as
+RustDesk left them.
+
+To build: python3 boring/rebrand.py, then follow
+.github/workflows/boring-build.yml.

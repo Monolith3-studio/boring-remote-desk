@@ -62,7 +62,7 @@ class _FakeBridge implements RustdeskImpl {
 
 FileDirectory movies() => FileDirectory.fromJson({
       'id': 0,
-      'path': '/Users/jason/Movies',
+      'path': '/Users/sam/Movies',
       'entries': [
         {'entry_type': 3, 'name': 'cut.mov', 'size': 1000, 'modified_time': 1700000000},
         {'entry_type': 2, 'name': 'Footage', 'size': 0, 'modified_time': 1700000000},

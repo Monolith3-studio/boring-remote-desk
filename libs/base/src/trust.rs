@@ -447,7 +447,7 @@ mod tests {
     async fn a_removed_controller_is_asked_again_and_the_password_does_not_undo_remove() {
         let mut trusted = Trusted::default();
         let (mut a, issued) = connect(&trusted, None).await;
-        a.approve_into(&mut trusted, SignIn::Allowed, "Jason M Studio");
+        a.approve_into(&mut trusted, SignIn::Allowed, "Sam M Studio");
         let key = trusted.list()[0].key.clone();
         assert!(trusted.remove(&key));
         assert!(trusted.list().is_empty(), "Settings no longer lists it");
@@ -457,20 +457,20 @@ mod tests {
         let (mut back, reissued) = connect(&trusted, issued.clone()).await;
         assert!(!back.is_trusted());
         assert!(back.must_ask(), "a removed Controller is asked here, password or not");
-        assert!(!back.approve_into(&mut trusted, SignIn::UnattendedPassword, "Jason M Studio"),
+        assert!(!back.approve_into(&mut trusted, SignIn::UnattendedPassword, "Sam M Studio"),
                 "the Unattended Password does not undo Remove");
-        assert!(!back.approve_into(&mut trusted, SignIn::ThisSessionOnly, "Jason M Studio"));
+        assert!(!back.approve_into(&mut trusted, SignIn::ThisSessionOnly, "Sam M Studio"));
         assert!(trusted.list().is_empty());
 
         // Still removed next time, whatever token it now holds.
         let holding = reissued.or(issued);
         let (mut again, kept) = connect(&trusted, holding.clone()).await;
         assert!(again.must_ask());
-        assert!(!again.approve_into(&mut trusted, SignIn::UnattendedPassword, "Jason M Studio"));
+        assert!(!again.approve_into(&mut trusted, SignIn::UnattendedPassword, "Sam M Studio"));
 
         // Allow on this Mac trusts it again, and the next connect skips the ask.
         let holding = kept.or(holding);
-        assert!(again.approve_into(&mut trusted, SignIn::Allowed, "Jason M Studio"));
+        assert!(again.approve_into(&mut trusted, SignIn::Allowed, "Sam M Studio"));
         assert_eq!(trusted.list().len(), 1);
         let (fourth, _) = connect(&trusted, holding).await;
         assert!(fourth.is_trusted());
