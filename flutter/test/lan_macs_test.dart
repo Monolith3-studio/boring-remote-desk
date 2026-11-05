@@ -45,4 +45,21 @@ void main() {
     // Gone past the grace: dropped.
     expect(keepRecentLanMacs(memory, [studio], t0.add(const Duration(seconds: 33))), [studio]);
   });
+
+  // boring-remote (v1.7 t25): one computer whose best address changes stays one row.
+  test('a computer whose address changes is one row, at its newest address', () {
+    const wifi = LanMac(name: 'tori', ip: '192.168.1.79', id: '77');
+    const wired = LanMac(name: 'tori', ip: '192.168.1.112', id: '77');
+    final memory = <String, LanSeen>{};
+    final t0 = DateTime(2026, 11, 4, 13, 0, 0);
+    expect(keepRecentLanMacs(memory, [wifi], t0), [wifi]);
+    expect(keepRecentLanMacs(memory, [wired], t0.add(const Duration(seconds: 6))), [wired], reason: 'plugged in');
+    expect(keepRecentLanMacs(memory, [wifi], t0.add(const Duration(seconds: 12))), [wifi], reason: 'unplugged');
+  });
+
+  test('the id arrives with the row', () {
+    final macs = lanMacsFromJson('[{"id":"77","hostname":"tori","ip":"192.168.1.112"}]');
+    expect(macs.single.id, '77');
+    expect(macs.single.ip, '192.168.1.112');
+  });
 }

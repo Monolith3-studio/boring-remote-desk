@@ -24,6 +24,14 @@ void main() {
   });
 
   // v1.7 t26: Home keys a recent by the key pinned for its Target ID or last address.
+  // boring-remote (v1.7 t25): every address it advertised is the same machine on Home.
+  test('identities: each stored address of a Target is that Target', () {
+    final who = identitiesFromKnown('{"303012600":{"pk":"AB01","lan":"192.168.1.127:21118","tailscale":"",'
+        '"addrs":[{"ip":"192.168.1.127","link":"wired","mbps":1000},{"ip":"192.168.1.124","link":"wifi","mbps":130}]}}');
+    expect(who['192.168.1.127'], 'AB01');
+    expect(who['192.168.1.124'], 'AB01');
+  });
+
   test('identities: a pinned key under the Target ID, the LAN address and the Tailscale address', () {
     final who = identitiesFromKnown('{"303012600":{"pk":"AB01","lan":"192.168.1.124:21118",'
         '"tailscale":"[fd7a:115c:a1e0::5]:21118"},"5":{"pk":"cd","lan":"","tailscale":"100.70.1.2:21118"}}');

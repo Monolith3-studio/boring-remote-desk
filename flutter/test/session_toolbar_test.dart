@@ -118,6 +118,27 @@ void main() {
     expect(got, ['low']);
   });
 
+  // boring-remote (v1.7 t25): a slow path is visible.
+  test('the badge names the link type Rust reports', () {
+    expect(linkStateFor('LocalWired'), LinkState.localWired);
+    expect(linkStateFor('LocalWiFi'), LinkState.localWiFi);
+    expect(linkStateFor('LocalWiredHighEfficiency'), LinkState.localWiredHighEfficiency);
+    expect(linkStateFor('LocalWiFiHighEfficiency'), LinkState.localWiFiHighEfficiency);
+    expect(LinkBadge.label(LinkState.localWired), 'Local · wired');
+    expect(LinkBadge.label(LinkState.localWiFi), 'Local · Wi-Fi');
+    expect(LinkBadge.label(LinkState.localWiredHighEfficiency), 'Local · wired · High Efficiency');
+    expect(LinkBadge.label(LinkState.localWiFiHighEfficiency), 'Local · Wi-Fi · High Efficiency');
+    for (final he in LinkState.values) {
+      expect(he.isHighEfficiency, he.name.endsWith('HighEfficiency'), reason: he.name);
+    }
+  });
+
+  test('picking a quality by hand keeps the link type', () {
+    expect(streamTypeAfterQualityPick('LocalWiredHighEfficiency'), 'LocalWired');
+    expect(streamTypeAfterQualityPick('LocalWiFiHighEfficiency'), 'LocalWiFi');
+    expect(streamTypeAfterQualityPick('LocalWired'), 'LocalWired');
+  });
+
   test('picking a quality by hand drops the link back to plain Local', () {
     expect(streamTypeAfterQualityPick('LocalHighEfficiency'), 'Local');
     expect(linkStateFor(streamTypeAfterQualityPick('LocalHighEfficiency')), LinkState.local);

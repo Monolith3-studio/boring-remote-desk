@@ -322,6 +322,65 @@ class RebrandSeam(unittest.TestCase):
         self.edit("flutter/lib/desktop/kit/mac_home.dart", "To reach this $one", "To reach this computer")
         self.assert_check_fails(self.TARGET_WORDS)
 
+    # --- v1.7 t29: Transfer files from Home, with no screen capture on the Target -
+    def test_t29_passes_after_rebrand(self):
+        self.rebrand()
+        out = run(CHECK, self.root).stdout
+        for fact in (check.TRANSFER_HOME, check.TRANSFER_ASK, check.TRANSFER_NO_CAPTURE, CONNECT_DIRECT):
+            self.assertIn(f"PASS {fact}", out)
+
+    def test_home_transfer_opening_a_session_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "connect(context, t, isFileTransfer: true)", "connect(context, t)")
+        self.assert_check_fails(check.TRANSFER_HOME)
+
+    def test_a_list_without_the_button_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/mac_home.dart", "trailing: _transferButton(() => m.ip),\n", "")
+        self.assert_check_fails(check.TRANSFER_HOME)
+
+    def test_address_box_without_the_button_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/mac_home.dart", "_transferButton(() => _typedTarget(_address.text)", "_transferButton(() => ''")
+        self.assert_check_fails(check.TRANSFER_HOME)
+
+    def test_a_transfer_skipping_the_trust_gate_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "if self.boring_trust.must_ask() {",
+                  "if self.file_transfer.is_none() && self.boring_trust.must_ask() {")
+        self.assert_check_fails(check.TRANSFER_ASK)
+
+    def test_ask_saying_control_for_a_transfer_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SERVER_MODEL, "files: client.type_() == ClientType.file,", "files: false,")
+        self.assert_check_fails(check.TRANSFER_ASK)
+
+    def test_a_transfer_subscribing_the_screen_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "if self.file_transfer.is_some() || self.terminal {\n            res.set_peer_info(pi);",
+                  "if self.terminal {\n            res.set_peer_info(pi);")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
+    def test_is_remote_counting_a_transfer_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "self.file_transfer.is_none()\n            && !self.is_port_forward()",
+                  "!self.is_port_forward()")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
+    def test_a_new_way_to_the_monitor_service_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "    fn try_sub_camera_displays(&mut self) {\n",
+                  "    fn sneak(&mut self, s: &mut Server) { s.try_add_monitor_service(0); }\n"
+                  "    fn try_sub_camera_displays(&mut self) {\n")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
+    def test_a_transfer_allowed_to_pick_a_display_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) => true,",
+                  "Some(message::Union::FileAction(_)) | Some(message::Union::FileResponse(_)) | Some(message::Union::VideoReceived(_)) => true,")
+        self.assert_check_fails(check.TRANSFER_NO_CAPTURE)
+
     def test_home_listing_every_address_fails_check(self):
         self.rebrand()
         self.edit(rebrand.HOME, "oneEntryPerMachine(", "List.of(")
@@ -544,6 +603,49 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("libs/base/src/direct_link.rs", rebrand.NOT_ON_NETWORK, "failed to connect")
         self.assert_check_fails(CONNECT_TAILNET)
+
+    # v1.7 t25: every LAN address, fastest first
+    def test_fastest_lan_passes_on_a_clean_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {check.FASTEST_LAN}", run(CHECK, self.root).stdout)
+
+    def test_pong_without_the_address_list_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T25_PONG, rebrand.T25_PONG_OLD)
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_pong_addresses_not_kept_fails_check(self):
+        self.rebrand()
+        self.edit("src/lan.rs", rebrand.T25_STORE, rebrand.T25_STORE_OLD)
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_public_address_from_a_pong_fails_check(self):  # ADR 0003
+        self.rebrand()
+        self.edit("libs/base/src/lan.rs", "        .filter(|a| is_lan(a.ip))\n", "")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_public_address_as_a_candidate_fails_check(self):  # ADR 0003
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "if crate::lan::is_lan(ip) && !mine && !dial.contains(&addr) {",
+                  "if !mine && !dial.contains(&addr) {")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_is_lan_widened_to_public_fails_check(self):  # ADR 0003
+        self.rebrand()
+        self.edit("libs/base/src/lan.rs", "is_allowed(ip) && !crate::direct_link::is_tailscale(ip)", "true")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_dial_skipping_the_handshake_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "judge(strict, addr, handshake(stream, addr, known, HANDSHAKE_TIMEOUT_MS).await)",
+                  "judge(strict, addr, Ok((stream, None)))")
+        self.assert_check_fails(check.FASTEST_LAN)
+
+    def test_race_stopping_at_the_first_address_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "std::iter::once(plan.direct).chain(plan.others).chain(tailscale)",
+                  "std::iter::once(plan.direct).chain(tailscale)")
+        self.assert_check_fails(check.FASTEST_LAN)
 
     def test_fallback_past_a_refusal_fails_check(self):
         self.rebrand()
@@ -882,6 +984,15 @@ class RebrandSeam(unittest.TestCase):
         rel = "libs/base/src/file_verify.rs"
         self.edit(rel, "Not verified: the other computer needs the latest Boring Remote", "Sent")
         self.assert_check_fails(check.VERIFY_WORDS)
+    def test_transfer_theme_without_extensions_fails_check(self):  # v1.7 t28
+        self.rebrand()
+        self.edit(rebrand.FILE_MGR, "            data: boringKitTheme,\n", "            data: Kit.theme(),\n")
+        self.assert_check_fails("File Transfer theme carries the extensions upstream's location bar reads (v1.7 t28)")
+
+    def test_ui_errors_not_logged_fails_check(self):  # v1.7 t28
+        self.rebrand()
+        self.edit("flutter/lib/main.dart", "  logUiErrors((text) => bind.mainLogUiError(text: text));\n", "")
+        self.assert_check_fails("UI errors reach the app log (v1.7 t28)")
 
     def test_windows_setup_falling_back_to_scutil_fails_check(self):  # v1.7 t12 follow-up
         self.rebrand()

@@ -122,7 +122,7 @@ List<KnownMac> parseKnown(String json) {
 
 /// boring-remote (v1.7 t26): who a recent on Home is. A Known entry's pinned key (its Target ID
 /// when it has none) under the Target ID and each address it last answered on, no port. An address
-/// with no entry here is one nothing is pinned for now (Known keeps only the latest LAN address).
+/// with no entry here is one nothing is stored for now (Known keeps what it last listed).
 Map<String, String> identitiesFromKnown(String json) {
   final who = <String, String>{};
   try {
@@ -136,6 +136,14 @@ Map<String, String> identitiesFromKnown(String json) {
       for (final at in [t['lan'], t['tailscale']]) {
         final host = _host('${at ?? ''}');
         if (host.isNotEmpty) who[host] = key;
+      }
+      // boring-remote (v1.7 t25): every LAN address it listed is the same machine.
+      final addrs = t['addrs'];
+      if (addrs is List) {
+        for (final a in addrs) {
+          final ip = a is Map ? '${a['ip'] ?? ''}' : '';
+          if (ip.isNotEmpty) who[ip] = key;
+        }
       }
     }
   } catch (_) {}
@@ -283,9 +291,10 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
 const kTrustedTitle = 'Trusted list';
 
 /// The ask in plain words: who, and what it wants (the connection window and the main window).
-String approvalQuestion(String name) {
+/// boring-remote (v1.7 t29): [files] is a transfer-only connection, which has no screen to control.
+String approvalQuestion(String name, {bool files = false}) {
   final who = name.trim().isNotEmpty ? name.trim() : 'A computer on this network';
-  return '$who wants to control this ${KitWords.one}.';
+  return files ? '$who wants to transfer files with this ${KitWords.one}.' : '$who wants to control this ${KitWords.one}.';
 }
 
 /// What the ask knows about who it is (audit H1): new or removed earlier, and its address.
@@ -313,11 +322,18 @@ class ApprovalPrompt extends StatelessWidget {
   final String name;
   final String trust;
   final String ip;
+  final bool files; // a transfer-only connection (v1.7 t29)
   final VoidCallback onAllow;
   final VoidCallback onDeny;
 
   const ApprovalPrompt(
-      {super.key, required this.name, this.trust = '', this.ip = '', required this.onAllow, required this.onDeny});
+      {super.key,
+      required this.name,
+      this.trust = '',
+      this.ip = '',
+      this.files = false,
+      required this.onAllow,
+      required this.onDeny});
 
   @override
   Widget build(BuildContext context) {
@@ -328,7 +344,7 @@ class ApprovalPrompt extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text(approvalQuestion(name), style: t.titleMedium),
+          Text(approvalQuestion(name, files: files), style: t.titleMedium),
           if (approvalWho(trust, ip).isNotEmpty) Text(approvalWho(trust, ip), style: t.bodyMedium),
           const SizedBox(height: Kit.s2),
           Text(kApprovalWhy, style: t.bodySmall),

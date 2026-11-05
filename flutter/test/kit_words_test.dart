@@ -72,6 +72,8 @@ void main() {
     KitWords.windows();
     await tester.pumpWidget(host(ApprovalPrompt(name: '', onAllow: () {}, onDeny: () {})));
     expect(find.text('A computer on this network wants to control this computer.'), findsOneWidget);
+    await tester.pumpWidget(host(ApprovalPrompt(name: 'FOH', files: true, onAllow: () {}, onDeny: () {})));
+    expect(find.text('FOH wants to transfer files with this computer.'), findsOneWidget); // t29
     await tester.pumpWidget(host(TrustedControllersPage(
         trusted: const [], known: const [], onRemove: (_) async {}, onForget: (_) async {})));
     expect(texts(tester).where((s) => s.contains('Mac')), isEmpty);

@@ -1,5 +1,7 @@
 use hbb_common::config::{Config, DiscoveryPeer};
+use serde_derive::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -36,6 +38,10 @@ pub fn peer_ip(peer: &DiscoveryPeer) -> String {
     if !answered {
         return String::new();
     }
+    // boring-remote (v1.7 t25): a Target that listed its addresses is shown at its fastest one.
+    if let Some(best) = ranked(&advert_of(&peer.id), &local_nics()).first() {
+        return best.ip.to_string();
+    }
     let mut ips: Vec<IpAddr> = peer
         .ip_mac
         .keys()
@@ -52,6 +58,12 @@ pub fn peer_ip(peer: &DiscoveryPeer) -> String {
 pub fn end_cycle(peers: &[DiscoveryPeer]) {
     if let Ok(mut on) = ON_NETWORK.lock() {
         *on = peers.iter().filter(|p| p.online).map(|p| p.id.clone()).collect();
+    }
+    // boring-remote (v1.7 t25): who stayed silent has no live addresses; Known keeps the stored ones.
+    if let Ok(mut adverts) = ADVERTS.lock() {
+        if let Some(adverts) = adverts.as_mut() {
+            adverts.retain(|id, _| !peers.iter().any(|p| !p.online && p.id == *id));
+        }
     }
 }
 
@@ -228,6 +240,273 @@ pub fn heard_ping(ip: IpAddr) {
     }
 }
 
+// --- v1.7 t25: every LAN address of a computer, fastest first ---------------------------------
+// A computer with Ethernet and Wi-Fi on one network answers discovery from whichever its routing
+// picks, so Home listed the Wi-Fi address and sessions and file transfers crawled over it. The pong
+// now lists every LAN address with its link type and speed, in `PeerDiscovery.misc` (a field
+// upstream never fills, so the protocol files stay upstream's). An old peer sends none and an old
+// Controller ignores it: both behave exactly as before. What arrives here is unauthenticated, so
+// it only ever picks what to dial: every dial is still encrypted and pinned (direct_link.rs).
+
+/// What carries an address. Serialized lowercase; a word from a newer build reads as `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkKind {
+    Wired,
+    #[serde(rename = "wifi")]
+    WiFi,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl LinkKind {
+    /// The path through two ends: as slow as its slower end, and unknown if either end is unknown
+    /// and neither is Wi-Fi, so the badge never claims a wire it can't vouch for.
+    pub fn and(self, other: LinkKind) -> LinkKind {
+        match (self, other) {
+            (LinkKind::WiFi, _) | (_, LinkKind::WiFi) => LinkKind::WiFi,
+            (LinkKind::Wired, LinkKind::Wired) => LinkKind::Wired,
+            _ => LinkKind::Other,
+        }
+    }
+
+    fn order(self) -> u8 {
+        match self {
+            LinkKind::Wired => 0,
+            LinkKind::Other => 1,
+            LinkKind::WiFi => 2,
+        }
+    }
+}
+
+/// One address a computer can be dialled at. `mbps` 0 is unknown (a Mac can't say for Wi-Fi).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Address {
+    pub ip: IpAddr,
+    #[serde(default)]
+    pub link: LinkKind,
+    #[serde(default)]
+    pub mbps: u32,
+}
+
+/// One IPv4 address of one of this computer's interfaces. `label` is the OS's words for it (Windows
+/// keeps the useful ones there, its `name` is a GUID). src/lan.rs reads them from default_net.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nic {
+    pub name: String,
+    pub label: String,
+    pub ip: Ipv4Addr,
+    pub prefix: u8,
+    pub link: LinkKind,
+    pub mbps: u32,
+}
+
+/// Most addresses one computer can list, so a spoofed pong can't turn into a scan.
+pub const MAX_ADDRS: usize = 8;
+
+/// A private LAN address, not Tailscale's: Tailscale keeps its own fallback slot. Never public (ADR 0003).
+pub fn is_lan(ip: IpAddr) -> bool {
+    is_allowed(ip) && !crate::direct_link::is_tailscale(ip)
+}
+
+/// Adapters that hold a private address nobody across the room can reach.
+fn is_virtual(nic: &Nic) -> bool {
+    const WORDS: [&str; 22] = [
+        "virtual", "vethernet", "veth", "vmnet", "vmware", "vbox", "vnic", "hyper-v", "parallels", "wsl", "docker",
+        "br-", "bridge", "tun", "tap", "vpn", "wireguard", "zerotier", "awdl", "llw", "bluetooth", "loopback",
+    ];
+    let text = format!("{} {}", nic.name, nic.label).to_lowercase();
+    WORDS.iter().any(|w| text.contains(w))
+}
+
+/// Windows reports a disconnected adapter's speed as all ones.
+pub fn mbps_from_bps(bps: Option<u64>) -> u32 {
+    match bps {
+        Some(b) if b < 1_000_000_000_000 => (b / 1_000_000) as u32,
+        _ => 0,
+    }
+}
+
+fn on_subnet(ip: IpAddr, nic: &Nic) -> bool {
+    let IpAddr::V4(v4) = ip else { return false };
+    let mask = u32::MAX.checked_shl(32 - nic.prefix.min(32) as u32).unwrap_or(0);
+    u32::from(v4) & mask == u32::from(nic.ip) & mask
+}
+
+fn nic_for(ip: IpAddr, here: &[Nic]) -> bool {
+    here.is_empty() || here.iter().any(|n| on_subnet(ip, n))
+}
+
+/// Fastest first: on a network this computer is on, then wired before unknown before Wi-Fi, then
+/// the higher speed. With `here` empty (no interface list yet) every address counts as reachable.
+pub fn ranked(list: &[Address], here: &[Nic]) -> Vec<Address> {
+    let mut out = list.to_vec();
+    out.sort_by_key(|a| (!nic_for(a.ip, here), a.link.order(), std::cmp::Reverse(a.mbps), !a.ip.is_ipv4(), a.ip));
+    out
+}
+
+#[derive(Serialize, Deserialize)]
+struct Advert {
+    addrs: Vec<serde_json::Value>,
+}
+
+/// What the pong's `misc` says: this computer's LAN addresses, best first. "" when it has none.
+pub fn advert(nics: &[Nic]) -> String {
+    let list: Vec<Address> = nics
+        .iter()
+        .filter(|n| is_lan(IpAddr::V4(n.ip)) && !is_virtual(n))
+        .map(|n| Address { ip: IpAddr::V4(n.ip), link: n.link, mbps: n.mbps })
+        .collect();
+    if list.is_empty() {
+        return String::new();
+    }
+    let addrs = ranked(&list, &[]).into_iter().take(MAX_ADDRS).filter_map(|a| serde_json::to_value(a).ok()).collect();
+    serde_json::to_string(&Advert { addrs }).unwrap_or_default()
+}
+
+/// The addresses in a pong's `misc`, each checked here: public, Tailscale and junk entries are dropped.
+pub fn parse_advert(misc: &str) -> Vec<Address> {
+    let Ok(advert) = serde_json::from_str::<Advert>(misc) else { return vec![] };
+    lenient(advert.addrs)
+}
+
+/// JSON values to addresses: one bad entry never costs the others, and only LAN addresses pass.
+pub fn lenient(values: Vec<serde_json::Value>) -> Vec<Address> {
+    values
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<Address>(v).ok())
+        .filter(|a| is_lan(a.ip))
+        .take(MAX_ADDRS)
+        .collect()
+}
+
+/// Target ID -> the addresses it listed in its latest pong.
+static ADVERTS: Mutex<Option<HashMap<String, Vec<Address>>>> = Mutex::new(None);
+/// This computer's interfaces as of the last discovery cycle ([`set_local_nics`]).
+static LOCAL_NICS: Mutex<Vec<Nic>> = Mutex::new(Vec::new());
+
+/// A pong came in. Remembers what it listed and returns the `ip_mac` to store: the address it came
+/// from plus every address it listed, so the next cycle asks each of them directly and a computer
+/// that lost one is still found on the other. A pong listing nothing gives exactly what it always did.
+pub fn pong_addresses(id: &str, source: IpAddr, mac: &str, misc: &str) -> HashMap<String, String> {
+    let mut list = parse_advert(misc);
+    let mut map = HashMap::from([(source.to_string(), mac.to_owned())]);
+    for a in &list {
+        map.entry(a.ip.to_string()).or_insert_with(|| mac.to_owned());
+    }
+    if let Ok(mut adverts) = ADVERTS.lock() {
+        let adverts = adverts.get_or_insert_with(HashMap::new);
+        if list.is_empty() {
+            adverts.remove(id);
+        } else {
+            if is_lan(source) && !list.iter().any(|a| a.ip == source) {
+                list.push(Address { ip: source, link: LinkKind::Other, mbps: 0 });
+            }
+            adverts.insert(id.to_owned(), list);
+        }
+    }
+    map
+}
+
+/// What `id` listed in its latest pong. Empty for an old peer, or one that has left.
+pub fn advert_of(id: &str) -> Vec<Address> {
+    ADVERTS.lock().ok().and_then(|a| a.as_ref().and_then(|a| a.get(id).cloned())).unwrap_or_default()
+}
+
+/// Which computer last listed `ip`.
+pub fn advert_owner(ip: IpAddr) -> Option<String> {
+    let adverts = ADVERTS.lock().ok()?;
+    adverts.as_ref()?.iter().find(|(_, list)| list.iter().any(|a| a.ip == ip)).map(|(id, _)| id.clone())
+}
+
+pub fn set_local_nics(nics: Vec<Nic>) {
+    if let Ok(mut here) = LOCAL_NICS.lock() {
+        *here = nics;
+    }
+}
+
+pub fn local_nics() -> Vec<Nic> {
+    LOCAL_NICS.lock().map(|n| n.clone()).unwrap_or_default()
+}
+
+/// The link under one of this computer's own addresses.
+pub fn local_link(ip: IpAddr, here: &[Nic]) -> LinkKind {
+    here.iter().find(|n| IpAddr::V4(n.ip) == ip).map_or(LinkKind::Other, |n| n.link)
+}
+
+/// The source address to dial `target` from. This computer with two ways onto that network leaves
+/// by the fastest: without this the OS uses whichever service comes first, which on a Mac can be
+/// Wi-Fi with a wire plugged in. One way, or none, is the OS's call.
+pub fn source_for(target: IpAddr, here: &[Nic]) -> Option<IpAddr> {
+    let ways: Vec<&Nic> = here.iter().filter(|n| on_subnet(target, n) && !is_virtual(n)).collect();
+    if ways.len() < 2 {
+        return None;
+    }
+    ways.into_iter().min_by_key(|n| (n.link.order(), std::cmp::Reverse(n.mbps))).map(|n| IpAddr::V4(n.ip))
+}
+
+/// A wire's speed from ifconfig's media line: "autoselect (5000Base-T <full-duplex>)", "1000baseT",
+/// "10Gbase-T". 0 when it doesn't say (Wi-Fi never does).
+fn media_mbps(line: &str) -> u32 {
+    let Some(inner) = line.split('(').nth(1) else { return 0 };
+    let word = inner.split_whitespace().next().unwrap_or_default().to_lowercase();
+    if !word.contains("base") {
+        return 0;
+    }
+    let digits: String = word.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: u32 = digits.parse().unwrap_or(0);
+    if word[digits.len()..].starts_with('g') {
+        n.saturating_mul(1000)
+    } else {
+        n
+    }
+}
+
+/// Fills in what default_net doesn't give on a Mac, from `ifconfig` text: each wire's speed. An
+/// interface ifconfig calls inactive is dropped: a static IP stays on an unplugged port.
+pub fn with_media(nics: Vec<Nic>, ifconfig: &str) -> Vec<Nic> {
+    let mut seen: HashMap<&str, (bool, u32)> = HashMap::new();
+    let mut name = "";
+    for line in ifconfig.lines() {
+        if !line.starts_with(|c: char| c.is_whitespace()) {
+            name = line.split(':').next().unwrap_or_default();
+        } else if let Some(media) = line.trim().strip_prefix("media:") {
+            seen.entry(name).or_insert((true, 0)).1 = media_mbps(media);
+        } else if let Some(status) = line.trim().strip_prefix("status:") {
+            seen.entry(name).or_insert((true, 0)).0 = status.trim() == "active";
+        }
+    }
+    nics.into_iter()
+        .filter(|n| seen.get(n.name.as_str()).map_or(true, |(active, _)| *active))
+        .map(|mut n| {
+            if n.mbps == 0 {
+                n.mbps = seen.get(n.name.as_str()).map_or(0, |(_, mbps)| *mbps);
+            }
+            n
+        })
+        .collect()
+}
+
+/// [`with_media`] with this Mac's own `ifconfig`, read at most once per 5 s: a discovery cycle
+/// answers several pings. Other systems report speed through default_net.
+#[cfg(target_os = "macos")]
+pub fn with_live_media(nics: Vec<Nic>) -> Vec<Nic> {
+    static CACHE: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
+    let Ok(mut cache) = CACHE.lock() else { return nics };
+    if cache.as_ref().map_or(true, |(at, _)| at.elapsed().as_secs() >= 5) {
+        let out = std::process::Command::new("/sbin/ifconfig").output();
+        let text = out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        *cache = Some((std::time::Instant::now(), text));
+    }
+    with_media(nics, cache.as_ref().map_or("", |(_, t)| t.as_str()))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn with_live_media(nics: Vec<Nic>) -> Vec<Nic> {
+    nics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +678,209 @@ mod tests {
         let mut buf = [0u8; 8];
         let (n, _) = listener.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"ping");
+    }
+
+    // --- v1.7 t25: every LAN address, fastest first -----------------------------------------
+    fn nic(name: &str, ip: &str, prefix: u8, link: LinkKind, mbps: u32) -> Nic {
+        Nic { name: name.into(), label: String::new(), ip: v4(ip), prefix, link, mbps }
+    }
+
+    fn addr(ip: &str, link: LinkKind, mbps: u32) -> Address {
+        Address { ip: self::ip(ip), link, mbps }
+    }
+
+    /// Tori's laptop on 2026-11-04: USB Ethernet en10, Wi-Fi en0, Tailscale, loopback.
+    fn tori() -> Vec<Nic> {
+        vec![
+            nic("en0", "192.168.1.79", 24, LinkKind::WiFi, 0),
+            nic("en10", "192.168.1.112", 24, LinkKind::Wired, 1000),
+            nic("utun4", "100.117.206.91", 32, LinkKind::Other, 0),
+            nic("lo0", "127.0.0.1", 8, LinkKind::Other, 0),
+        ]
+    }
+
+    fn ips(list: &[Address]) -> Vec<String> {
+        list.iter().map(|a| a.ip.to_string()).collect()
+    }
+
+    #[test]
+    fn the_pong_lists_lan_addresses_with_link_and_speed_and_nothing_else() {
+        let got = parse_advert(&advert(&tori()));
+        assert_eq!(got, vec![addr("192.168.1.112", LinkKind::Wired, 1000), addr("192.168.1.79", LinkKind::WiFi, 0)]);
+    }
+
+    #[test]
+    fn virtual_adapters_public_and_link_local_addresses_are_not_advertised() {
+        let mut nics = vec![
+            nic("docker0", "172.17.0.1", 16, LinkKind::Other, 0),
+            nic("bridge100", "192.168.64.1", 24, LinkKind::Other, 0),
+            nic("en5", "169.254.10.2", 16, LinkKind::Wired, 1000),
+            nic("en6", "8.8.4.4", 24, LinkKind::Wired, 1000),
+        ];
+        let mut hyperv = nic("{GUID}", "172.20.0.1", 20, LinkKind::Wired, 10_000);
+        hyperv.label = "vEthernet (WSL) Hyper-V Virtual Ethernet Adapter".into();
+        nics.push(hyperv);
+        assert_eq!(advert(&nics), "", "nothing to say: a pong as an old build sends it");
+    }
+
+    #[test]
+    fn an_advert_keeps_only_private_lan_addresses_and_survives_junk() {
+        assert!(parse_advert("").is_empty(), "an old peer");
+        assert!(parse_advert("not json").is_empty());
+        assert!(parse_advert(r#"{"addrs":"nope"}"#).is_empty());
+        let got = parse_advert(
+            r#"{"addrs":[{"ip":"8.8.8.8","link":"wired","mbps":1000},{"ip":"junk"},{"ip":"100.100.1.1","link":"wired"},
+                {"ip":"127.0.0.1"},{"ip":"192.168.1.112","link":"warp","mbps":10}]}"#,
+        );
+        assert_eq!(got, vec![addr("192.168.1.112", LinkKind::Other, 10)], "never a public address (ADR 0003)");
+    }
+
+    #[test]
+    fn an_advert_is_capped_so_a_spoofed_pong_cannot_become_a_scan() {
+        let list: Vec<String> = (1..200).map(|i| format!(r#"{{"ip":"10.0.0.{}"}}"#, i)).collect();
+        assert_eq!(parse_advert(&format!(r#"{{"addrs":[{}]}}"#, list.join(","))).len(), MAX_ADDRS);
+    }
+
+    #[test]
+    fn a_full_advert_fits_the_discovery_buffer() {
+        let nics: Vec<Nic> = (1..=20).map(|i| nic("en1", &format!("192.168.100.{}", 100 + i), 24, LinkKind::Wired, 10_000)).collect();
+        assert!(advert(&nics).len() < 1024, "the reply buffer is 2048 with the other fields");
+    }
+
+    #[test]
+    fn wired_beats_wifi_and_the_faster_wire_beats_the_slower() {
+        let studio = [nic("en0", "192.168.1.200", 24, LinkKind::Wired, 5000)];
+        let tori_list = [addr("192.168.1.79", LinkKind::WiFi, 0), addr("192.168.1.112", LinkKind::Wired, 1000)];
+        assert_eq!(ips(&ranked(&tori_list, &studio)), ["192.168.1.112", "192.168.1.79"]);
+        // The Studio's own pair, and the PC's 1 Gb Ethernet against a 130 Mb USB Wi-Fi stick.
+        let list = [addr("192.168.1.106", LinkKind::WiFi, 0), addr("192.168.1.123", LinkKind::Wired, 5000)];
+        assert_eq!(ips(&ranked(&list, &[])), ["192.168.1.123", "192.168.1.106"]);
+        let list = [addr("192.168.1.124", LinkKind::WiFi, 130), addr("192.168.1.127", LinkKind::Wired, 1000)];
+        assert_eq!(ips(&ranked(&list, &[])), ["192.168.1.127", "192.168.1.124"]);
+        let list = [addr("10.0.0.2", LinkKind::Wired, 1000), addr("10.0.0.3", LinkKind::Wired, 5000), addr("10.0.0.4", LinkKind::Wired, 0)];
+        assert_eq!(ips(&ranked(&list, &[])), ["10.0.0.3", "10.0.0.2", "10.0.0.4"]);
+    }
+
+    #[test]
+    fn a_link_type_nobody_named_ranks_between_wired_and_wifi() {
+        let list = [addr("10.0.0.2", LinkKind::WiFi, 900), addr("10.0.0.3", LinkKind::Other, 0), addr("10.0.0.4", LinkKind::Wired, 0)];
+        assert_eq!(ips(&ranked(&list, &[])), ["10.0.0.4", "10.0.0.3", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn an_address_on_a_network_this_computer_is_on_comes_first_even_if_slower() {
+        // The Target's 10 Gb wire goes to a storage network this Controller isn't on.
+        let here = [nic("en0", "192.168.1.200", 24, LinkKind::WiFi, 0)];
+        let list = [addr("10.10.0.5", LinkKind::Wired, 10_000), addr("192.168.1.79", LinkKind::WiFi, 0)];
+        assert_eq!(ips(&ranked(&list, &here)), ["192.168.1.79", "10.10.0.5"]);
+    }
+
+    #[test]
+    fn home_lists_the_wired_address_of_tori_not_the_wifi_one() {
+        // The pong came from .79, the address Home lists today.
+        let map = pong_addresses("t25-tori", ip("192.168.1.79"), "aa:bb", &advert(&tori()));
+        assert_eq!(map.len(), 2, "the stored list keeps both, so discovery asks both directly");
+        let mut p = peer("t25-tori", true, &[]);
+        p.ip_mac = map;
+        assert_eq!(peer_ip(&p), "192.168.1.112");
+    }
+
+    #[test]
+    fn an_old_peer_with_one_address_behaves_as_it_does_today() {
+        let map = pong_addresses("t25-old", ip("192.168.1.50"), "aa:bb", "");
+        assert_eq!(map, std::collections::HashMap::from([("192.168.1.50".to_owned(), "aa:bb".to_owned())]));
+        let mut p = peer("t25-old", true, &[]);
+        p.ip_mac = map;
+        assert_eq!(peer_ip(&p), "192.168.1.50");
+        assert!(advert_of("t25-old").is_empty());
+    }
+
+    #[test]
+    fn a_laptop_unplugged_moves_home_to_its_wifi_address_on_the_next_pong() {
+        let mut p = peer("t25-unplug", true, &[]);
+        p.ip_mac = pong_addresses("t25-unplug", ip("192.168.1.112"), "aa:bb", &advert(&tori()));
+        assert_eq!(peer_ip(&p), "192.168.1.112");
+        let unplugged: Vec<Nic> = tori().into_iter().filter(|n| n.name != "en10").collect();
+        p.ip_mac = pong_addresses("t25-unplug", ip("192.168.1.79"), "aa:bb", &advert(&unplugged));
+        assert_eq!(peer_ip(&p), "192.168.1.79");
+        assert_eq!(ips(&advert_of("t25-unplug")), ["192.168.1.79"]);
+    }
+
+    #[test]
+    fn a_pong_from_an_address_it_does_not_list_still_counts() {
+        let list = r#"{"addrs":[{"ip":"192.168.1.60","link":"wired","mbps":1000}]}"#;
+        let map = pong_addresses("t25-source", ip("192.168.1.61"), "aa:bb", list);
+        assert!(map.contains_key("192.168.1.61") && map.contains_key("192.168.1.60"));
+        assert_eq!(ips(&advert_of("t25-source")), ["192.168.1.60", "192.168.1.61"]);
+    }
+
+    #[test]
+    fn who_left_the_network_loses_its_live_addresses() {
+        pong_addresses("t25-gone", ip("192.168.1.70"), "aa:bb", &advert(&tori()));
+        assert!(!advert_of("t25-gone").is_empty());
+        end_cycle(&[peer("t25-gone", false, &["192.168.1.70"])]);
+        assert!(advert_of("t25-gone").is_empty());
+    }
+
+    #[test]
+    fn the_address_finds_its_computer() {
+        pong_addresses("t25-owner", ip("192.168.77.1"), "aa:bb", r#"{"addrs":[{"ip":"192.168.77.2"}]}"#);
+        assert_eq!(advert_owner(ip("192.168.77.2")).as_deref(), Some("t25-owner"));
+        assert_eq!(advert_owner(ip("192.168.77.3")), None);
+    }
+
+    const IFCONFIG: &str = "en5: flags=8963<UP,BROADCAST> mtu 1500\n\tmedia: autoselect <full-duplex>\n\tstatus: inactive\n\
+en0: flags=8863<UP,BROADCAST> mtu 1500\n\tinet 192.168.1.123 netmask 0xffffff00 broadcast 192.168.1.255\n\
+\tmedia: autoselect (5000Base-T <full-duplex,flow-control,energy-efficient-ethernet>)\n\tstatus: active\n\
+en1: flags=8863<UP,BROADCAST> mtu 1500\n\tinet 192.168.1.106 netmask 0xffffff00\n\tmedia: autoselect\n\tstatus: active\n\
+en10: flags=8863<UP> mtu 1500\n\tmedia: autoselect (1000baseT <full-duplex>)\n\tstatus: active\n\
+en11: flags=8863<UP> mtu 1500\n\tmedia: autoselect (10Gbase-T <full-duplex>)\n\tstatus: active\n\
+en12: flags=8863<UP> mtu 1500\n\tmedia: autoselect (100baseTX <full-duplex>)\n\tstatus: active\n";
+
+    #[test]
+    fn windows_all_ones_speed_is_unknown() {
+        assert_eq!(mbps_from_bps(Some(1_000_000_000)), 1000);
+        assert_eq!(mbps_from_bps(Some(u64::MAX)), 0);
+        assert_eq!(mbps_from_bps(None), 0);
+    }
+
+    #[test]
+    fn a_macs_wire_speed_comes_from_ifconfig() {
+        let nics = vec![
+            nic("en0", "192.168.1.123", 24, LinkKind::Wired, 0),
+            nic("en1", "192.168.1.106", 24, LinkKind::WiFi, 0),
+            nic("en10", "10.0.0.2", 24, LinkKind::Wired, 0),
+            nic("en11", "10.0.0.3", 24, LinkKind::Wired, 0),
+            nic("en12", "10.0.0.4", 24, LinkKind::Wired, 0),
+            nic("utun1", "100.100.1.1", 32, LinkKind::Other, 0),
+        ];
+        let got: Vec<(String, u32)> = with_media(nics, IFCONFIG).into_iter().map(|n| (n.name, n.mbps)).collect();
+        let want = [("en0", 5000), ("en1", 0), ("en10", 1000), ("en11", 10_000), ("en12", 100), ("utun1", 0)];
+        assert_eq!(got, want.map(|(n, m)| (n.to_owned(), m)));
+    }
+
+    #[test]
+    fn an_interface_the_mac_says_is_inactive_is_not_offered() {
+        // A static IP stays on an unplugged port: its status is what says so.
+        let nics = vec![nic("en5", "192.168.1.200", 24, LinkKind::Wired, 0)];
+        assert!(with_media(nics, IFCONFIG).is_empty());
+    }
+
+    #[test]
+    fn a_controller_with_two_ways_out_leaves_by_the_wire() {
+        let studio = [nic("en1", "192.168.1.106", 24, LinkKind::WiFi, 0), nic("en0", "192.168.1.123", 24, LinkKind::Wired, 5000)];
+        assert_eq!(source_for(ip("192.168.1.112"), &studio), Some(ip("192.168.1.123")));
+        assert_eq!(source_for(ip("10.0.0.5"), &studio), None, "no shared network: the OS routes it");
+        assert_eq!(source_for(ip("192.168.1.112"), &studio[..1]), None, "one way out: nothing to pick");
+    }
+
+    #[test]
+    fn the_path_is_as_slow_as_its_slower_end() {
+        use LinkKind::*;
+        assert_eq!(Wired.and(Wired), Wired);
+        assert_eq!(Wired.and(WiFi), WiFi);
+        assert_eq!(WiFi.and(Wired), WiFi);
+        assert_eq!(WiFi.and(Other), WiFi);
+        assert_eq!(Wired.and(Other), Other, "an old peer's end is unknown, so nothing is claimed");
     }
 }

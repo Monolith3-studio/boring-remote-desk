@@ -3,22 +3,44 @@ import 'package:flutter/material.dart';
 import 'kit.dart';
 
 /// How this session reaches the other Mac. Ticket 03 feeds Local / Via internet; ticket 05 High Efficiency.
-enum LinkState { unknown, local, localHighEfficiency, viaInternet }
+/// boring-remote (v1.7 t25): Local names its link when both ends know it, so a slow path is visible.
+enum LinkState {
+  unknown,
+  local,
+  localWired,
+  localWiFi,
+  localHighEfficiency,
+  localWiredHighEfficiency,
+  localWiFiHighEfficiency,
+  viaInternet;
+
+  bool get isHighEfficiency =>
+      this == localHighEfficiency || this == localWiredHighEfficiency || this == localWiFiHighEfficiency;
+}
 
 /// The badge for the session's `stream_type` as Rust reports it (base::direct_link::Path):
 /// "Local" = Direct Link on this network, "Tailscale" = via internet. Anything else is unknown.
 /// "LocalHighEfficiency" = Local, and Rust applied High Efficiency (base::high_efficiency, t05).
 LinkState linkStateFor(String streamType) => switch (streamType) {
       'Local' => LinkState.local,
+      'LocalWired' => LinkState.localWired,
+      'LocalWiFi' => LinkState.localWiFi,
       'LocalHighEfficiency' => LinkState.localHighEfficiency,
+      'LocalWiredHighEfficiency' => LinkState.localWiredHighEfficiency,
+      'LocalWiFiHighEfficiency' => LinkState.localWiFiHighEfficiency,
       'Tailscale' => LinkState.viaInternet,
       _ => LinkState.unknown,
     };
 
 /// A quality picked by hand replaces High Efficiency for the rest of the session, so the
-/// link goes back to plain "Local" (v1.7 review). Any other stream type stays as Rust said.
-String streamTypeAfterQualityPick(String streamType) =>
-    streamType == 'LocalHighEfficiency' ? 'Local' : streamType;
+/// link goes back to plain "Local" (v1.7 review), keeping its link type (t25). Any other stream
+/// type stays as Rust said.
+String streamTypeAfterQualityPick(String streamType) => switch (streamType) {
+      'LocalHighEfficiency' => 'Local',
+      'LocalWiredHighEfficiency' => 'LocalWired',
+      'LocalWiFiHighEfficiency' => 'LocalWiFi',
+      _ => streamType,
+    };
 
 /// Link Badge: the small session label naming Direct Link vs Relay. Shows nothing while unknown.
 class LinkBadge extends StatelessWidget {
@@ -28,7 +50,11 @@ class LinkBadge extends StatelessWidget {
   static String? label(LinkState link) => switch (link) {
         LinkState.unknown => null,
         LinkState.local => 'Local',
+        LinkState.localWired => 'Local · wired',
+        LinkState.localWiFi => 'Local · Wi-Fi',
         LinkState.localHighEfficiency => 'Local · High Efficiency',
+        LinkState.localWiredHighEfficiency => 'Local · wired · High Efficiency',
+        LinkState.localWiFiHighEfficiency => 'Local · Wi-Fi · High Efficiency',
         LinkState.viaInternet => 'Via internet',
       };
 
@@ -94,7 +120,7 @@ class _SessionToolbarState extends State<SessionToolbar> {
   @override
   Widget build(BuildContext context) {
     final w = widget;
-    final he = w.link == LinkState.localHighEfficiency;
+    final he = w.link.isHighEfficiency;
     final qualities = he ? {_highEfficiency: 'High Efficiency', ...w.qualities} : w.qualities;
     final quality = he ? _highEfficiency : w.quality;
     final qualityLabel = qualities[quality] ?? qualities.values.first;

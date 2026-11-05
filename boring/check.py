@@ -1036,6 +1036,40 @@ def lan_both_ways_checks(c):
            not missing, "; ".join(missing))
 
 
+FASTEST_LAN = "every LAN address carried in the pong, public ones dropped, fastest dialled first, dead ones fall through (t25)"
+
+
+def fastest_lan_checks(c):
+    """v1.7 ticket 25: the pong lists every LAN address in `misc`, the Controller stores and ranks
+    them, a dead one falls through to the next. Never a public address (ADR 0003), and every dial
+    is still the encrypted, pinned handshake."""
+    lan, base, link = c.read("src/lan.rs"), c.read("libs/base/src/lan.rs"), c.read(DIRECT_LINK)
+    why = [n.strip().splitlines()[0] for n in (rebrand.T25_NICS, rebrand.T25_PONG, rebrand.T25_STORE, rebrand.T25_LOCAL)
+           if n not in lan]
+    is_lan = fn_body(base, "pub fn is_lan(ip: IpAddr) -> bool {") or ""
+    if "is_allowed(ip) && !crate::direct_link::is_tailscale(ip)" not in is_lan:
+        why.append("is_lan lets through more than private LAN (ADR 0003)")
+    if ".filter(|a| is_lan(a.ip))" not in (fn_body(base, "pub fn lenient(") or ""):
+        why.append("an address from a pong is not checked before it is kept")
+    if "crate::lan::is_lan(ip) && !mine && !dial.contains(&addr)" not in (fn_body(link, "fn widen(") or ""):
+        why.append("a candidate address is dialled without the private-LAN check")
+    if "crate::lan::is_lan(a.ip)" not in (fn_body(link, "pub fn set_addresses(") or ""):
+        why.append("Known stores an address without the private-LAN check")
+    dial = fn_body(link, "async fn dial(") or ""
+    if "judge(strict, addr, handshake(stream, addr, known, HANDSHAKE_TIMEOUT_MS).await)" not in dial:
+        why.append("a dial skips the encrypted, pinned handshake")
+    race_body = fn_body(link, "pub async fn race<") or ""
+    if "std::iter::once(plan.direct).chain(plan.others).chain(tailscale)" not in race_body:
+        why.append("race no longer tries every address before Tailscale")
+    if "(t.lan != at && t.tailscale != at)" not in (fn_body(link, "pub fn pin_ok(") or "") or "t.addrs" in (fn_body(link, "pub fn pin_ok(") or ""):
+        why.append("a listed address became a pin: a spoofed pong could lock a Target out")
+    badge = c.read("flutter/lib/desktop/kit/session_toolbar.dart")
+    for word in ("'Local · wired'", "'Local · Wi-Fi'", "'LocalWired' => LinkState.localWired,", "'LocalWiFi' => LinkState.localWiFi,"):
+        if word not in badge:
+            why.append(f"badge: {word}")
+    c.fact(FASTEST_LAN, not why, "; ".join(why))
+
+
 # A word for this machine (KitWords, or a literal Mac) right after a word that points at the other end.
 OTHER_END_MAC = re.compile(r"\b(?:that|other|another|both|from one|a|an|these)\s+"
                            r"(?:\$\{KitWords\.(?:one|many)\}|\$one|\$many|Macs?\b)", re.I)
@@ -1077,6 +1111,84 @@ def target_word_checks(c):
         why.append("the kit lost oneEntryPerMachine")
     c.fact("Used before lists each machine once, newest address, nothing deleted from disk (t26)",
            not why, "; ".join(why))
+
+
+TRANSFER_HOME = "Home's Transfer files opens a transfer-only connection, on every row and the address box (t29)"
+TRANSFER_ASK = "a transfer-only connection gets Allow like any other, and the ask says transfer files (t29)"
+TRANSFER_NO_CAPTURE = "a transfer-only connection starts no screen capture or encoder on the Target (t29)"
+
+
+def transfer_checks(c):
+    """v1.7 t29: File Transfer alone from Home. It dials through _start like everything else, so the
+    connect box facts above cover it; these are what's new about it."""
+    home_kit = c.read("flutter/lib/desktop/kit/mac_home.dart")
+    method = fn_body(c.read(rebrand.HOME), "  Widget buildBoringHome(BuildContext context) {") or ""
+    why = []
+    if "onTransferFiles: (t) => connect(context, t, isFileTransfer: true)," not in method:
+        why.append("buildBoringHome does not open File Transfer alone")
+    if "onConnect: (t) => connect(context, t)," not in method:
+        why.append("a row no longer means control")
+    if "transferFiles = 'Transfer files'" not in home_kit:
+        why.append("the button lost its words")
+    # One for each of On this network and Used before, one for the Address box, with the typed target.
+    if home_kit.count("trailing: _transferButton(") != 2 or "_transferButton(() => _typedTarget(" not in home_kit:
+        why.append("a list or the Address box has no Transfer files")
+    c.fact(TRANSFER_HOME, not why, "; ".join(why))
+
+    trust, approval = c.read("flutter/lib/desktop/kit/trust.dart"), c.read("flutter/lib/desktop/kit/approval.dart")
+    page, model = c.read(rebrand.CM_PAGE), c.read(rebrand.SERVER_MODEL)
+    conn = strip_tests_and_comments(c.read("src/server/connection.rs"))
+    why = []
+    if "wants to transfer files with this ${KitWords.one}." not in trust:
+        why.append("the ask does not say transfer files in this machine's word")
+    for text, need in ((trust, "approvalQuestion(name, files: files)"), (approval, "approvalQuestion(name, files: files)"),
+                       (approval, "approvalQuestion(w.name, files: w.files)"),
+                       (page, "files: client.type_() == ClientType.file,")):
+        if need not in text:
+            why.append(f"lost {need}")
+    if model.count("approvalAsk(") != model.count("files: client.type_() == ClientType.file,"):
+        why.append("an ask to the main window does not say what kind it is")
+    # The trust gate runs once the login's kind is known and does not look at the kind.
+    login = conn.find("if self.boring_trust.is_trusted() {")
+    ask = conn.find("if self.boring_trust.must_ask() {")
+    kind = conn.find("self.file_transfer = Some((ft.dir, ft.show_hidden));")
+    if not 0 <= kind < login < ask:
+        why.append("the trust gate does not run on every kind of login")
+    if re.search(r"file_transfer[^\n]*\n[^\n]*boring_trust|boring_trust[^\n]*file_transfer", conn):
+        why.append("the trust gate treats a transfer differently")
+    c.fact(TRANSFER_ASK, not why, "; ".join(why))
+
+    logon = fn_body(conn, "    async fn send_logon_response_and_keep_alive(&mut self) -> bool {") or ""
+    only_info = "if self.file_transfer.is_some() || self.terminal {\n            res.set_peer_info(pi);\n        } else if"
+    why = []
+    if only_info not in logon or "sub_service = true" not in logon \
+            or logon.index("sub_service = true") < logon.index(only_info):
+        why.append("the login may reach sub_service before the file-transfer branch")
+    if "if let Some((dir, show_hidden)) = self.file_transfer.clone() {" not in logon or "} else if sub_service {" not in logon \
+            or logon.index("} else if sub_service {") < logon.index("self.file_transfer.clone()"):
+        why.append("a transfer's login may subscribe the monitor services")
+    if "self.file_transfer.is_none()" not in (fn_body(conn, "    fn is_remote(&self) -> bool {") or ""):
+        why.append("is_remote counts a transfer")
+    sub = fn_body(conn, "    fn try_sub_monitor_services(&mut self) {") or ""
+    if "let is_remote = self.is_remote();" not in sub or "if is_remote && !self.services_subed {" not in sub:
+        why.append("try_sub_monitor_services is not only for a remote connection")
+    for call in ("try_add_monitor_service(", "add_monitor_connection("):
+        if conn.count(call) != 1 or call not in sub:
+            why.append(f"{call} is reached outside try_sub_monitor_services")
+    scoped = fn_body(conn, "    fn is_file_transfer_scoped_message(msg: &Message) -> bool {") or ""
+    misc = fn_body(conn, "    fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {") or ""
+    if set(re.findall(r"message::Union::(\w+)", scoped)) != {"FileAction", "FileResponse", "Misc"}:
+        why.append("a transfer may send messages other than files")
+    # PluginRequest is the file proof (t30), and only with our id: it can't reach a display.
+    if set(re.findall(r"misc::Union::(\w+)", misc)) != {"SelectedSid", "PluginRequest"} \
+            or "p.id == base::file_verify::WIRE_ID" not in misc:
+        why.append("a transfer may send a Misc that can pick a display")
+    if "if let Some(message) = self.authorized_scope_violation(&msg) {" not in conn:
+        why.append("the scope gate no longer runs on messages")
+    svc = c.read("src/server/service.rs")
+    if svc.count("if sp.has_subscribes() {") != 2:
+        why.append("a service runs with no subscriber")
+    c.fact(TRANSFER_NO_CAPTURE, not why, "; ".join(why))
 
 
 def rust_hook_checks(c):
@@ -1243,7 +1355,7 @@ def home_checks(c):
            "            // v1.7 review: a hand pick replaces High Efficiency, so the badge goes back to Local.\n" \
            "            linkType.setStreamType(streamTypeAfterQualityPick(linkType.stream_type.value));"
     why = [] if pick in bar else ["toolbar's quality pick does not drop High Efficiency"]
-    if not st or f"streamType == '{st.group(1)}' ? 'Local' : streamType;" not in c.read(T07_KIT):
+    if not st or f"'{st.group(1)}' => 'Local'," not in c.read(T07_KIT):
         why.append("session_toolbar.dart does not map Rust's High Efficiency stream type back to Local")
     c.fact("a hand-picked quality ends High Efficiency: badge back to Local (v1.7 t05 follow-up)",
            not why, "; ".join(why))
@@ -1719,6 +1831,7 @@ def run_checks(root):
     rust_hook_checks(c)  # v1.7 t02-t05
     support_checks(c)  # v1.7 t20
     lan_both_ways_checks(c)  # v1.7 t21
+    fastest_lan_checks(c)  # v1.7 t25
     target_word_checks(c)  # v1.7 t26
     home_checks(c)  # v1.7 review: Home, Settings, copy
     transfer_speed_checks(c)  # v1.7 t27
@@ -1728,6 +1841,11 @@ def run_checks(root):
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")
     ft_missing = [n for n in ft_needles if n not in c.read(ft)]
     c.fact("v1.7 File Transfer kit wired into the file manager", not ft_missing, "; ".join(ft_missing))
+    c.fact("File Transfer theme carries the extensions upstream's location bar reads (v1.7 t28)",
+           "data: boringKitTheme," in c.read(ft) and "Kit.theme()" not in c.read(ft))
+    c.fact("UI errors reach the app log (v1.7 t28)",
+           "logUiErrors((text) => bind.mainLogUiError(text: text));" in c.read("flutter/lib/main.dart")
+           and "pub fn main_log_ui_error(text: String)" in c.read("src/flutter_ffi.rs"))
 
     hits, index = [], []
     for base in ("src", "libs", "flutter/lib"):
@@ -1779,6 +1897,7 @@ def run_checks(root):
     msi_checks(c, workflows)
     branding_checks(c)
     connect_checks(c)
+    transfer_checks(c)  # v1.7 t29
     look_checks(c)  # v1.7 review: nothing left in the RustDesk look
 
     # protocol untouched: every .proto in the tree is upstream's, byte for byte
