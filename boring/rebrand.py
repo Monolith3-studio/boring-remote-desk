@@ -2922,6 +2922,472 @@ PATCHES += [
      "drive list on each side (t27)"),
 ]
 
+# --- File transfer proves every file (v1.7 ticket 30) -------------------------------------
+# libs/base/src/file_verify.rs is ours; these wire it in. The sender hashes with BLAKE3 as it reads,
+# the receiver reads the `.download` back off the disk, and only a match gets the real name. Hashes
+# and metadata travel in Misc::plugin_request, an upstream message nothing else uses, after a
+# handshake only a Boring Remote answers: an old peer sees none of it and the job says so.
+BASE_TOML = "libs/base/Cargo.toml"
+CARGO_LOCK = "Cargo.lock"
+FILE_MODEL = "flutter/lib/models/file_model.dart"
+UI_SESSION = "src/ui_session_interface.rs"
+FLUTTER_RS = "src/flutter.rs"
+T30_MOD = "pub mod file_verify; // boring-remote (v1.7 t30): every file proved\n"
+T30_DEP = "blake3 = \"=1.8.2\" # boring-remote (v1.7 t30): file_verify. 1.8.2 is the last on Rust 1.81 without a newer constant_time_eq.\n"
+T30_LOCK_BLAKE3 = (
+    "[[package]]\n"
+    "name = \"blake3\"\n"
+    "version = \"1.8.2\"\n"
+    "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+    "checksum = \"3888aaa89e4b2a40fca9848e400f6a658a5a3978de7be858e209cafa8be9a4a0\"\n"
+    "dependencies = [\n"
+    " \"arrayref\",\n"
+    " \"arrayvec\",\n"
+    " \"cc\",\n"
+    " \"cfg-if 1.0.0\",\n"
+    " \"constant_time_eq 0.3.1\",\n"
+    "]\n\n")
+T30_LOCK_CTE = (
+    "[[package]]\n"
+    "name = \"constant_time_eq\"\n"
+    "version = \"0.3.1\"\n"
+    "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n"
+    "checksum = \"7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6\"\n\n")
+T30_HOOKS = (
+    "// boring-remote (v1.7 t30): the job's end of crate::file_verify, here for the private fields.\n"
+    "impl TransferJob {\n"
+    "    /// Before a read job's next read: what never gets read is listed, and a file that came back\n"
+    "    /// wrong goes again, once the first pass is over. It doesn't ask about overwriting again.\n"
+    "    pub async fn boring_tick(&mut self) {\n"
+    "        if !self.boring.sending() {\n"
+    "            return;\n"
+    "        }\n"
+    "        let DataSource::FilePath(root) = &self.data_source else {\n"
+    "            return;\n"
+    "        };\n"
+    "        let root = root.clone();\n"
+    "        let len = self.files.len() as i32;\n"
+    "        if self.data_stream.is_none() {\n"
+    "            while self.file_num < len {\n"
+    "                let path = Self::join(&root, &self.files[self.file_num as usize].name);\n"
+    "                if !self.boring.refuse(self.file_num, &path) {\n"
+    "                    break;\n"
+    "                }\n"
+    "                self.file_num += 1;\n"
+    "            }\n"
+    "        }\n"
+    "        if self.file_num < len || self.data_stream.is_some() {\n"
+    "            return;\n"
+    "        }\n"
+    "        let Some(n) = self.boring.next_resend() else {\n"
+    "            return;\n"
+    "        };\n"
+    "        let entry = &self.files[n as usize];\n"
+    "        let (path, size) = (Self::join(&root, &entry.name), entry.size);\n"
+    "        match File::open(&path).await {\n"
+    "            Ok(file) => {\n"
+    "                self.boring_ahead.clear();\n"
+    "                self.boring.resend_started();\n"
+    "                self.data_stream = Some(DataStream::FileStream(file));\n"
+    "                self.file_num = n;\n"
+    "                self.file_confirmed = true;\n"
+    "                self.file_is_waiting = false;\n"
+    "                self.finished_size = self.finished_size.saturating_sub(size);\n"
+    "            }\n"
+    "            Err(err) => self.boring.resend_failed(n, &path, &err.to_string()),\n"
+    "        }\n"
+    "    }\n\n"
+    "    #[inline]\n"
+    "    pub fn boring_holds_done(&self) -> bool {\n"
+    "        self.boring.holds_done(self.file_num, self.files.len() as i32)\n"
+    "    }\n\n"
+    "    fn boring_after_read(&mut self, file_num: usize, err: Option<String>) {\n"
+    "        let DataSource::FilePath(root) = &self.data_source else {\n"
+    "            return;\n"
+    "        };\n"
+    "        let Some(entry) = self.files.get(file_num) else {\n"
+    "            return;\n"
+    "        };\n"
+    "        let path = Self::join(root, &entry.name);\n"
+    "        let (n, next, len) = (file_num as i32, self.file_num, self.files.len() as i32);\n"
+    "        self.file_num = match err {\n"
+    "            None => self.boring.sent_eof(n, &path, next, len),\n"
+    "            Some(err) => self.boring.read_failed(n, &path, &err, next, len),\n"
+    "        };\n"
+    "    }\n\n"
+    "    pub async fn write(&mut self, block: FileTransferBlock) -> ResultType<()> {\n"
+    "        let (end_of_file, file_num) = (block.data.is_empty() && !block.compressed, block.file_num);\n"
+    "        let counted = self.boring.rewind(file_num);\n"
+    "        self.finished_size = self.finished_size.saturating_sub(counted);\n"
+    "        let res = self.boring_write(block).await;\n"
+    "        if !self.boring.receiving() {\n"
+    "            return res;\n"
+    "        }\n"
+    "        // A write that failed shows up in the read-back, which is what sends it again.\n"
+    "        if let Err(err) = res {\n"
+    "            self.boring.write_failed(file_num, &err.to_string());\n"
+    "        }\n"
+    "        if end_of_file {\n"
+    "            if let Some(DataStream::FileStream(mut file)) = self.data_stream.take() {\n"
+    "                if let Err(err) = file.flush().await {\n"
+    "                    self.boring.write_failed(file_num, &err.to_string());\n"
+    "                }\n"
+    "            }\n"
+    "            crate::file_verify::file_closed(self, file_num);\n"
+    "        }\n"
+    "        Ok(())\n"
+    "    }\n"
+    "}\n\n")
+T30_READ_GUARD = (
+    "        // boring-remote (v1.7 t30): a file that wouldn't open is listed, and the next call moves on.\n"
+    "        if self.boring.sending() && self.data_stream.is_none() {\n"
+    "            return Ok(None);\n"
+    "        }\n")
+T30_TICK = (
+    "    // boring-remote (v1.7 t30): seals and manifests go out between blocks, in order.\n"
+    "    for job in jobs.iter_mut().filter(|j| !j.is_last_job) {\n"
+    "        job.boring_tick().await;\n"
+    "        for msg in job.boring.take_outgoing() {\n"
+    "            stream.send(&msg).await?;\n"
+    "        }\n"
+    "    }\n")
+T30_IO_ON_WIRE = (
+    "    /// boring-remote (v1.7 t30): a message from the other computer about a job's files.\n"
+    "    fn boring_on_wire(&mut self, content: &[u8]) {\n"
+    "        use base::file_verify::{self as verify, Wire};\n"
+    "        let Some(wire) = Wire::from_json(content) else {\n"
+    "            return;\n"
+    "        };\n"
+    "        if let Wire::Report { id, report } = wire {\n"
+    "            self.boring_reports.insert(id, report);\n"
+    "            return;\n"
+    "        }\n"
+    "        let Some(id) = wire.job_id() else {\n"
+    "            return;\n"
+    "        };\n"
+    "        let sender = self.sender.clone();\n"
+    "        let outbox: verify::Outbox = Arc::new(move |msg| {\n"
+    "            sender.send(Data::Message(msg)).ok();\n"
+    "        });\n"
+    "        if let Some(job) = fs::get_job(id, &mut self.write_jobs) {\n"
+    "            verify::on_wire(job, wire, Some(&outbox));\n"
+    "        } else if let Some(job) = fs::get_job(id, &mut self.read_jobs) {\n"
+    "            verify::on_wire(job, wire, None);\n"
+    "        }\n"
+    "    }\n\n")
+T30_IO_PEER = (
+    "                        // boring-remote (v1.7 t30): only a Boring Remote says this, and only one hears hello.\n"
+    "                        if self.handler.is_file_transfer() && base::file_verify::peer_says_verified(&pi.platform_additions) {\n"
+    "                            self.boring_verify_os = Some(base::file_verify::os_from_platform(&pi.platform));\n"
+    "                            let hello = base::file_verify::Wire::Hello { os: base::file_verify::this_os().to_string() };\n"
+    "                            allow_err!(peer.send(&hello.to_message()).await);\n"
+    "                        }\n")
+T30_IO_MISC = (
+    "                    Some(misc::Union::PluginRequest(p)) if p.id == base::file_verify::WIRE_ID => {\n"
+    "                        self.boring_on_wire(&p.content); // boring-remote (v1.7 t30)\n"
+    "                    }\n")
+T30_IO_REPORT = (
+    "                                fs::JobType::Generic => {\n"
+    "                                    // boring-remote (v1.7 t30): the job says what happened, in plain words. Ours\n"
+    "                                    // if this side received, the other side's if it did.\n"
+    "                                    let report = boring_report.or_else(|| self.boring_reports.remove(&d.id));\n"
+    "                                    self.handler.boring_job_report(\n"
+    "                                        d.id,\n"
+    "                                        base::file_verify::job_words(report.as_ref(), self.boring_verify_os.is_some()),\n"
+    "                                    );\n")
+T30_CONN_ON_WIRE = (
+    "    /// boring-remote (v1.7 t30): a message from the Controller about a job's files. A job read here\n"
+    "    /// handles it here; a CM's job, which is every write and a Windows read, gets it over IPC.\n"
+    "    fn boring_on_wire(&mut self, content: &[u8]) {\n"
+    "        use base::file_verify::{self as verify, Wire};\n"
+    "        let Some(wire) = Wire::from_json(content) else {\n"
+    "            return;\n"
+    "        };\n"
+    "        if let Wire::Hello { os } = wire {\n"
+    "            self.boring_verify_os = Some(os);\n"
+    "            return;\n"
+    "        }\n"
+    "        let Some(id) = wire.job_id() else {\n"
+    "            return;\n"
+    "        };\n"
+    "        if let Some(job) = fs::get_job(id, &mut self.read_jobs) {\n"
+    "            verify::on_wire(job, wire, None);\n"
+    "        } else {\n"
+    "            self.send_fs(ipc::FS::BoringWire(wire.to_json()));\n"
+    "        }\n"
+    "    }\n\n")
+T30_CONN_MISC = (
+    "                    Some(misc::Union::PluginRequest(p)) if p.id == base::file_verify::WIRE_ID => {\n"
+    "                        self.boring_on_wire(&p.content); // boring-remote (v1.7 t30)\n"
+    "                    }\n")
+T30_CONN_SCOPE = (
+    "        // boring-remote (v1.7 t30): the proof of a transfer belongs to the transfer.\n"
+    "        if matches!(misc.union.as_ref(), Some(misc::Union::PluginRequest(p)) if p.id == base::file_verify::WIRE_ID) {\n"
+    "            return true;\n"
+    "        }\n")
+T30_MARKER = (
+    "        // boring-remote (v1.7 t30): this Target proves files (base::file_verify). Upstream never sends the key.\n"
+    "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+    "        platform_additions.insert(base::file_verify::MARKER.into(), json!(true));\n")
+T30_CONN_ENABLE = (
+    "        // boring-remote (v1.7 t30)\n"
+    "        if let Some(os) = self.boring_verify_os.clone() {\n"
+    "            base::file_verify::enable_send(&mut job, &os);\n"
+    "        }\n")
+T30_CONN_CM_ENABLE = (
+    "                                            // boring-remote (v1.7 t30): the CM's read job proves its files too.\n"
+    "                                            if let Some(os) = self.boring_verify_os.clone() {\n"
+    "                                                self.send_fs(ipc::FS::BoringWire(\n"
+    "                                                    base::file_verify::Wire::StartRead { id, os }.to_json(),\n"
+    "                                                ));\n"
+    "                                            }\n")
+T30_CM_WIRE = (
+    "        // boring-remote (v1.7 t30): about a write job here, or a read job on a Windows Target.\n"
+    "        ipc::FS::BoringWire(json) => {\n"
+    "            use base::file_verify::{self as verify, Wire};\n"
+    "            if let Some((wire, id)) =\n"
+    "                Wire::from_json(json.as_bytes()).and_then(|w| w.job_id().map(|id| (w, id)))\n"
+    "            {\n"
+    "                let tx = tx.clone();\n"
+    "                let outbox: verify::Outbox = std::sync::Arc::new(move |msg| send_raw(msg, &tx));\n"
+    "                if let Some(job) = fs::get_job(id, write_jobs) {\n"
+    "                    verify::on_wire(job, wire, Some(&outbox));\n"
+    "                } else if let Some(job) = fs::get_job(id, read_jobs) {\n"
+    "                    verify::on_wire(job, wire, None);\n"
+    "                }\n"
+    "            }\n"
+    "        }\n")
+T30_CM_DONE = (
+    "                // boring-remote (v1.7 t30): the job's words go ahead of Done, on the same path.\n"
+    "                if let Some(report) = base::file_verify::finish(&job) {\n"
+    "                    send_raw(base::file_verify::Wire::Report { id, report }.to_message(), tx);\n"
+    "                }\n")
+T30_CM_ROOM = (
+    "            // boring-remote (v1.7 t30): don't start what can't fit.\n"
+    "            if let Err(e) = base::file_verify::check_room(&job) {\n"
+    "                send_raw(fs::new_error(id, e, file_num), tx);\n"
+    "                return;\n"
+    "            }\n")
+T30_CM_TICK = (
+    "        // boring-remote (v1.7 t30): seals and manifests go out between blocks, in order.\n"
+    "        job.boring_tick().await;\n"
+    "        for msg in job.boring.take_outgoing() {\n"
+    "            send_raw(msg, tx);\n"
+    "        }\n\n")
+T30_TRAIT = (
+    "    /// boring-remote (v1.7 t30): what a finished transfer proved, in plain words.\n"
+    "    fn boring_job_report(&self, _id: i32, _words: String) {}\n")
+T30_FLUTTER = (
+    "    // boring-remote (v1.7 t30)\n"
+    "    fn boring_job_report(&self, id: i32, words: String) {\n"
+    "        self.push_event(\"boring_job_report\", &[(\"id\", &id.to_string()), (\"words\", &words)], &[]);\n"
+    "    }\n\n")
+T30_DART_MODEL = (
+    "      } else if (name == 'boring_job_report') {\n"
+    "        // boring-remote (v1.7 t30)\n"
+    "        parent.target?.fileModel.jobController.boringJobReport(evt);\n")
+T30_DART_JOB = (
+    "  /// boring-remote (v1.7 t30): what the job proved, kept for the transfer list. job_done follows it.\n"
+    "  void boringJobReport(Map<String, dynamic> evt) {\n"
+    "    final jobIndex = getJob(int.tryParse(evt['id']?.toString() ?? '') ?? -1);\n"
+    "    if (jobIndex == -1 || jobTable[jobIndex].type != JobType.transfer) return;\n"
+    "    jobTable[jobIndex].err = evt['words']?.toString() ?? '';\n"
+    "  }\n\n")
+PATCHES += [
+    (BASE_LIB, T27_MOD, T27_MOD + T30_MOD, "base: file_verify module (t30)"),
+    (BASE_TOML, "anyhow = \"1.0\"\n", "anyhow = \"1.0\"\n" + T30_DEP, "base depends on blake3 (t30)"),
+    (CARGO_LOCK, " \"anyhow\",\n \"backtrace\",\n \"bytes\",\n \"filetime\",\n \"hbb_common\",\n",
+     " \"anyhow\",\n \"backtrace\",\n \"blake3\",\n \"bytes\",\n \"filetime\",\n \"hbb_common\",\n", "lock: base uses blake3 (t30)"),
+    (CARGO_LOCK, "[[package]]\nname = \"block\"\nversion = \"0.1.6\"\n",
+     T30_LOCK_BLAKE3 + "[[package]]\nname = \"block\"\nversion = \"0.1.6\"\n", "lock: blake3 (t30)"),
+    (CARGO_LOCK, "[[package]]\nname = \"core-foundation\"\nversion = \"0.7.0\"\n",
+     T30_LOCK_CTE + "[[package]]\nname = \"core-foundation\"\nversion = \"0.7.0\"\n", "lock: blake3's constant_time_eq (t30)"),
+    (CARGO_LOCK, " \"constant_time_eq\",\n", " \"constant_time_eq 0.2.6\",\n", "lock: two constant_time_eq now, so totp-rs says which (t30)"),
+    (FS_RS, "    default_overwrite_strategy: Option<bool>,\n",
+     "    default_overwrite_strategy: Option<bool>,\n"
+     "    // boring-remote (v1.7 t30)\n    #[serde(skip_serializing)]\n"
+     "    pub boring: crate::file_verify::JobVerify,\n",
+     "a job carries its verification (t30)"),
+    (FS_RS, "impl TransferJob {\n    #[allow(clippy::too_many_arguments)]\n    pub fn new_write(\n",
+     T30_HOOKS + "impl TransferJob {\n    #[allow(clippy::too_many_arguments)]\n    pub fn new_write(\n",
+     "the job's hooks (t30)"),
+    (FS_RS, "    pub fn modify_time(&self) {\n        if self.r#type == JobType::Printer {\n",
+     "    pub fn modify_time(&self) {\n"
+     "        // boring-remote (v1.7 t30): when verifying, the name comes only after the read-back.\n"
+     "        if self.r#type == JobType::Printer || self.boring.receiving() {\n",
+     "no real name before the read-back (t30)"),
+    (FS_RS, "    pub async fn write(&mut self, block: FileTransferBlock) -> ResultType<()> {\n        if block.id != self.id {\n",
+     "    async fn boring_write(&mut self, block: FileTransferBlock) -> ResultType<()> {\n        if block.id != self.id {\n",
+     "upstream's write goes behind the hook (t30)"),
+    (FS_RS,
+     "                            self.file_num += 1;\n"
+     "                            self.file_confirmed = false;\n"
+     "                            self.file_is_waiting = false;\n"
+     "                            return Err(err.into());\n",
+     "                            self.file_num += 1;\n"
+     "                            self.file_confirmed = false;\n"
+     "                            self.file_is_waiting = false;\n"
+     "                            // boring-remote (v1.7 t30): listed and tried again, not the end of the job.\n"
+     "                            if self.boring.sending() {\n"
+     "                                let path = Self::join(p, &self.files[file_num].name);\n"
+     "                                let len = self.files.len() as i32;\n"
+     "                                self.file_num = self.boring.read_failed(\n"
+     "                                    file_num as i32,\n"
+     "                                    &path,\n"
+     "                                    &err.to_string(),\n"
+     "                                    self.file_num,\n"
+     "                                    len,\n"
+     "                                );\n"
+     "                                return Ok(true);\n"
+     "                            }\n"
+     "                            return Err(err.into());\n",
+     "a file that won't open doesn't end the job (t30)"),
+    (FS_RS, "        const BUF_SIZE: usize = 128 * 1024;\n", T30_READ_GUARD + "        const BUF_SIZE: usize = 128 * 1024;\n", "a read waits for the next file (t30)"),
+    (FS_RS,
+     "                    self.file_num += 1;\n"
+     "                    self.data_stream = None;\n"
+     "                    self.file_confirmed = false;\n"
+     "                    self.file_is_waiting = false;\n"
+     "                    return Err(err.into());\n",
+     "                    self.file_num += 1;\n"
+     "                    self.data_stream = None;\n"
+     "                    self.file_confirmed = false;\n"
+     "                    self.file_is_waiting = false;\n"
+     "                    // boring-remote (v1.7 t30): listed and tried again, not the end of the job.\n"
+     "                    if self.boring.sending() {\n"
+     "                        self.boring_ahead.clear();\n"
+     "                        self.boring_after_read(file_num, Some(err.to_string()));\n"
+     "                        return Ok(None);\n"
+     "                    }\n"
+     "                    return Err(err.into());\n",
+     "a read error doesn't end the job (t30)"),
+    (FS_RS, "        unsafe { buf.set_len(offset) };\n",
+     "        unsafe { buf.set_len(offset) };\n"
+     "        self.boring.sent_bytes(&buf); // boring-remote (v1.7 t30)\n",
+     "the sender hashes what it read (t30)"),
+    (FS_RS,
+     "            self.file_num += 1;\n"
+     "            self.data_stream = None;\n"
+     "            self.file_confirmed = false;\n"
+     "            self.file_is_waiting = false;\n"
+     "        } else {\n",
+     "            self.file_num += 1;\n"
+     "            self.data_stream = None;\n"
+     "            self.file_confirmed = false;\n"
+     "            self.file_is_waiting = false;\n"
+     "            self.boring_after_read(file_num, None); // boring-remote (v1.7 t30)\n"
+     "        } else {\n",
+     "the seal follows a file's last block (t30)"),
+    (FS_RS, "        if self.job_skipped() {\n            return Some(\"skipped\".to_string());\n",
+     "        // boring-remote (v1.7 t30): when verifying, a skip is in the job's report instead.\n"
+     "        if self.job_skipped() && !self.boring.active() {\n            return Some(\"skipped\".to_string());\n",
+     "a skip goes in the report (t30)"),
+    (FS_RS, "        self.file_num += 1;\n        self.file_skipped = true;\n",
+     "        // boring-remote (v1.7 t30): nothing goes across, so the two ends compare what they have.\n"
+     "        if let (DataSource::FilePath(p), Some(entry)) = (&self.data_source, self.files.get(self.file_num as usize)) {\n"
+     "            let path = Self::join(p, &entry.name);\n"
+     "            self.boring.skipped(self.file_num, &path);\n"
+     "        }\n"
+     "        self.file_num += 1;\n        self.file_skipped = true;\n",
+     "a skip is compared (t30)"),
+    (FS_RS, "            self.boring_ahead.clear(); // boring-remote (v1.7 t27)\n            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {\n",
+     "            self.boring.stream_moved(); // boring-remote (v1.7 t30)\n"
+     "            self.boring_ahead.clear(); // boring-remote (v1.7 t27)\n"
+     "            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {\n",
+     "a resume hashes the whole file (t30)"),
+    (FS_RS, ") -> ResultType<String> {\n    init_jobs(jobs, stream).await?;\n",
+     ") -> ResultType<String> {\n" + T30_TICK + "    init_jobs(jobs, stream).await?;\n", "seals go out from the read loop (t30)"),
+    (FS_RS, "                if job.job_completed() {\n                    job_log = serialize_transfer_job(job, true, false, \"\");\n",
+     "                // boring-remote (v1.7 t30): Done waits for the last verdict.\n"
+     "                if !job.boring_holds_done() && job.job_completed() {\n                    job_log = serialize_transfer_job(job, true, false, \"\");\n",
+     "Done waits for the last verdict (t30)"),
+    (IPC, "pub enum FS {\n    ReadEmptyDirs {\n",
+     "pub enum FS {\n"
+     "    /// boring-remote (v1.7 t30): connection to CM, a base::file_verify::Wire message as JSON.\n"
+     "    BoringWire(String),\n"
+     "    ReadEmptyDirs {\n", "IPC: verification messages (t30)"),
+    (UI_CM, "        ipc::FS::CancelWrite { id } => {\n", T30_CM_WIRE + "        ipc::FS::CancelWrite { id } => {\n", "CM handles verification messages (t30)"),
+    (UI_CM, "            if let Some(job) = fs::remove_job(id, write_jobs) {\n                job.modify_time();\n                send_raw(fs::new_done(id, file_num), tx);\n",
+     "            if let Some(job) = fs::remove_job(id, write_jobs) {\n                job.modify_time();\n" + T30_CM_DONE + "                send_raw(fs::new_done(id, file_num), tx);\n",
+     "CM sends the report (t30)"),
+    (UI_CM, "            job.total_size = total_size;\n            job.conn_id = conn_id;\n            write_jobs.push(job);\n",
+     "            job.total_size = total_size;\n            job.conn_id = conn_id;\n" + T30_CM_ROOM + "            write_jobs.push(job);\n",
+     "CM checks free space first (t30)"),
+    (UI_CM, "        // Initialize data stream if needed (opens file, sends digest for overwrite detection)\n",
+     T30_CM_TICK + "        // Initialize data stream if needed (opens file, sends digest for overwrite detection)\n",
+     "CM's read jobs send their seals (t30)"),
+    (UI_CM, "            Ok(None) => {\n                if job.job_completed() {\n                    finished.push(job.id);\n",
+     "            Ok(None) => {\n"
+     "                // boring-remote (v1.7 t30): Done waits for the last verdict.\n"
+     "                if !job.boring_holds_done() && job.job_completed() {\n                    finished.push(job.id);\n",
+     "CM's Done waits for the last verdict (t30)"),
+    (CONN, "    boring_cm_window: base::file_speed::CmWindow, // boring-remote (v1.7 t27)\n",
+     "    boring_cm_window: base::file_speed::CmWindow, // boring-remote (v1.7 t27)\n"
+     "    boring_verify_os: Option<String>, // boring-remote (v1.7 t30): set once the Controller says hello\n", "verify field (t30)"),
+    (CONN, "            boring_cm_window: Default::default(),\n",
+     "            boring_cm_window: Default::default(),\n            boring_verify_os: None,\n", "verify field default (t30)"),
+    (CONN, T27_MARKER, T30_MARKER + T27_MARKER, "Target says it proves files (t30)"),
+    (CONN, "    fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {\n",
+     "    fn is_file_transfer_scoped_misc(misc: &Misc) -> bool {\n" + T30_CONN_SCOPE, "the proof is in scope for a transfer (t30)"),
+    (CONN, "                    Some(misc::Union::SwitchDisplay(s)) => {\n                        self.handle_switch_display(s).await;\n",
+     T30_CONN_MISC + "                    Some(misc::Union::SwitchDisplay(s)) => {\n                        self.handle_switch_display(s).await;\n",
+     "Target hears the proof (t30)"),
+    (CONN, "    async fn process_new_read_job(&mut self, mut job: fs::TransferJob, path: String) {\n",
+     T30_CONN_ON_WIRE + "    async fn process_new_read_job(&mut self, mut job: fs::TransferJob, path: String) {\n", "Target routes the proof (t30)"),
+    (CONN, "        job.conn_id = self.inner.id();\n        self.read_jobs.push(job);\n",
+     "        job.conn_id = self.inner.id();\n" + T30_CONN_ENABLE + "        self.read_jobs.push(job);\n", "Target's read job proves its files (t30)"),
+    (CONN, "                                                overwrite_detection: od,\n                                            });\n",
+     "                                                overwrite_detection: od,\n                                            });\n" + T30_CONN_CM_ENABLE,
+     "a CM read job proves its files (t30)"),
+    (IO_LOOP, "    boring_full_speed: bool, // boring-remote (v1.7 t27)\n",
+     "    boring_full_speed: bool, // boring-remote (v1.7 t27)\n"
+     "    boring_verify_os: Option<String>, // boring-remote (v1.7 t30): set once the Target says it can\n"
+     "    boring_reports: HashMap<i32, base::file_verify::Report>, // boring-remote (v1.7 t30): reports from the Target\n",
+     "Controller's verify fields (t30)"),
+    (IO_LOOP, "            boring_full_speed: false,\n",
+     "            boring_full_speed: false,\n            boring_verify_os: None,\n            boring_reports: Default::default(),\n",
+     "Controller's verify field defaults (t30)"),
+    (IO_LOOP, T27_IO_PEER, T30_IO_PEER + T27_IO_PEER, "Controller says hello to a Target that proves files (t30)"),
+    (IO_LOOP, "                                // boring-remote (v1.7 t27): send for a slice, not one block per tick,\n",
+     "                                base::file_verify::enable_sends(&mut self.read_jobs, self.boring_verify_os.as_deref()); // boring-remote (v1.7 t30)\n"
+     "                                // boring-remote (v1.7 t27): send for a slice, not one block per tick,\n",
+     "Controller's read jobs prove their files (t30)"),
+    (IO_LOOP, "    fn handle_job_status(&mut self, id: i32, file_num: i32, err: Option<String>) {\n",
+     T30_IO_ON_WIRE + "    fn handle_job_status(&mut self, id: i32, file_num: i32, err: Option<String>) {\n", "Controller routes the proof (t30)"),
+    (IO_LOOP, "                Some(message::Union::Misc(misc)) => match misc.union {\n                    Some(misc::Union::AudioFormat(f)) => {\n",
+     "                Some(message::Union::Misc(misc)) => match misc.union {\n" + T30_IO_MISC + "                    Some(misc::Union::AudioFormat(f)) => {\n",
+     "Controller hears the proof (t30)"),
+    (IO_LOOP, "            Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote)) => {\n",
+     "            Data::SendFiles((id, r#type, path, to, file_num, _, is_remote)) => {\n"
+     "                let include_hidden = true; // boring-remote (v1.7 t30): a copy takes everything, whatever the pane shows\n",
+     "a copy takes hidden files (t30)"),
+    (IO_LOOP, "            Data::AddJob((id, r#type, path, to, file_num, include_hidden, is_remote)) => {\n",
+     "            Data::AddJob((id, r#type, path, to, file_num, _, is_remote)) => {\n"
+     "                let include_hidden = true; // boring-remote (v1.7 t30)\n",
+     "a queued copy takes hidden files (t30)"),
+    (IO_LOOP, "                                if let Err(err) = job.set_files(entries) {\n",
+     "                                // boring-remote (v1.7 t30): don't start what can't fit.\n"
+     "                                if let Err(err) = job.set_files(entries).and_then(|_| {\n"
+     "                                    base::file_verify::check_room(job).map_err(|e| hbb_common::anyhow::anyhow!(e))\n"
+     "                                }) {\n",
+     "Controller checks free space first (t30)"),
+    (IO_LOOP, "                            let mut printer_data = None;\n                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {\n                                job.modify_time();\n",
+     "                            let mut printer_data = None;\n"
+     "                            let mut boring_report = None; // boring-remote (v1.7 t30)\n"
+     "                            if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {\n                                job.modify_time();\n"
+     "                                boring_report = base::file_verify::finish(&job);\n",
+     "Controller finishes a job it received (t30)"),
+    (IO_LOOP, "                                fs::JobType::Generic => {\n                                    self.handle_job_status(d.id, d.file_num, err);\n",
+     T30_IO_REPORT + "                                    self.handle_job_status(d.id, d.file_num, err);\n", "the job says what happened (t30)"),
+    (UI_SESSION, "    fn job_done(&self, id: i32, file_num: i32);\n", "    fn job_done(&self, id: i32, file_num: i32);\n" + T30_TRAIT, "report reaches the UI (t30)"),
+    (FLUTTER_RS, "    // unused in flutter\n    fn clear_all_jobs(&self) {}\n", T30_FLUTTER + "    // unused in flutter\n    fn clear_all_jobs(&self) {}\n", "report reaches Flutter (t30)"),
+    (FFI_MODEL, "      } else if (name == 'job_error') {\n", T30_DART_MODEL + "      } else if (name == 'job_error') {\n", "report event (t30)"),
+    (FILE_MODEL, "  void jobError(Map<String, dynamic> evt) {\n", T30_DART_JOB + "  void jobError(Map<String, dynamic> evt) {\n", "the job keeps its report (t30)"),
+    (FILE_MODEL, "          await fileFetcher.readEmptyDirs(item.path, isLocal, showHidden);\n",
+     "          await fileFetcher.readEmptyDirs(item.path, isLocal, true); // boring-remote (v1.7 t30): old peers too\n",
+     "empty folders include hidden ones (t30)"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),

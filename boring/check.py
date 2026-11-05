@@ -1137,6 +1137,76 @@ def transfer_speed_checks(c):
     c.fact(NO_GAIN_MEDIA, not absent, ", ".join(absent))
 
 
+VERIFY_HOOKS = "every file proved: sender's hash, read-back before the real name, Done after the last verdict, the job's report (v1.7 t30)"
+VERIFY_WORDS = "the job's words are the ticket's, and Verified takes every file passing (v1.7 t30)"
+VERIFY_EVERYTHING = "a folder copy takes hidden files, and a read job lists links, folders and what it couldn't read (v1.7 t30)"
+
+
+def transfer_verify_checks(c):
+    hooks = [
+        (rebrand.BASE_LIB, rebrand.T30_MOD),
+        (rebrand.BASE_TOML, rebrand.T30_DEP),
+        (rebrand.CARGO_LOCK, rebrand.T30_LOCK_BLAKE3),
+        (rebrand.CARGO_LOCK, rebrand.T30_LOCK_CTE),
+        (rebrand.FS_RS, rebrand.T30_HOOKS),
+        (rebrand.FS_RS, rebrand.T30_TICK),
+        (rebrand.FS_RS, "self.boring.sent_bytes(&buf);"),
+        (rebrand.FS_RS, "if self.r#type == JobType::Printer || self.boring.receiving() {"),
+        (rebrand.FS_RS, "if !job.boring_holds_done() && job.job_completed() {"),
+        (rebrand.FS_RS, "self.boring.stream_moved();"),
+        (rebrand.IPC, "BoringWire(String),"),
+        (rebrand.UI_CM, rebrand.T30_CM_WIRE),
+        (rebrand.UI_CM, rebrand.T30_CM_DONE),
+        (rebrand.UI_CM, rebrand.T30_CM_ROOM),
+        (rebrand.UI_CM, rebrand.T30_CM_TICK),
+        (rebrand.UI_CM, "if !job.boring_holds_done() && job.job_completed() {"),
+        (rebrand.CONN, rebrand.T30_MARKER),
+        (rebrand.CONN, rebrand.T30_CONN_SCOPE),
+        (rebrand.CONN, rebrand.T30_CONN_MISC),
+        (rebrand.CONN, rebrand.T30_CONN_ON_WIRE),
+        (rebrand.CONN, rebrand.T30_CONN_ENABLE),
+        (rebrand.CONN, rebrand.T30_CONN_CM_ENABLE),
+        (rebrand.IO_LOOP, rebrand.T30_IO_PEER),
+        (rebrand.IO_LOOP, rebrand.T30_IO_MISC),
+        (rebrand.IO_LOOP, rebrand.T30_IO_ON_WIRE),
+        (rebrand.IO_LOOP, rebrand.T30_IO_REPORT),
+        (rebrand.IO_LOOP, "base::file_verify::enable_sends(&mut self.read_jobs"),
+        (rebrand.IO_LOOP, "base::file_verify::check_room(job)"),
+        (rebrand.UI_SESSION, rebrand.T30_TRAIT),
+        (rebrand.FLUTTER_RS, rebrand.T30_FLUTTER),
+        (rebrand.FFI_MODEL, rebrand.T30_DART_MODEL),
+        (rebrand.FILE_MODEL, rebrand.T30_DART_JOB),
+    ]
+    missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
+    c.fact(VERIFY_HOOKS, not missing, "; ".join(missing))
+    verify = c.read("libs/base/src/file_verify.rs").split("#[cfg(test)]\nmod tests {")[0]
+    kit = c.read("flutter/lib/desktop/kit/file_transfer.dart")
+    why = []
+    if '"Not verified: the other computer needs the latest Boring Remote"' not in verify:
+        why.append("the old peer's words changed")
+    if "pub fn all_passed(&self) -> bool {\n        self.failed.is_empty() && self.skipped.is_empty() && self.verified == self.files\n" not in verify:
+        why.append("all_passed no longer takes every file")
+    if verify.count('"Verified: ') != 2 or "let mut out = if self.all_passed() {" not in verify:
+        why.append("Verified can be said outside all_passed")
+    if "report.startsWith('Not verified')" not in kit:
+        why.append("the list doesn't mark Not verified")
+    if "Verified" in kit.replace("notVerified", "").replace("Not verified", "not verified"):
+        why.append("the kit makes up Verified on its own")
+    c.fact(VERIFY_WORDS, not why, "; ".join(why))
+    io_loop = c.read(rebrand.IO_LOOP)
+    every = []
+    if "Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote))" in io_loop:
+        every.append("SendFiles still takes the pane's hidden setting")
+    if "Data::AddJob((id, r#type, path, to, file_num, include_hidden, is_remote))" in io_loop:
+        every.append("AddJob still takes the pane's hidden setting")
+    if "readEmptyDirs(item.path, isLocal, true)" not in c.read(rebrand.FILE_MODEL):
+        every.append("empty folders still follow the pane's hidden setting")
+    for needle in ("fn walk_dir(", "kind.is_symlink()", "couldn't read this folder", "this name isn't valid text", "not a regular file"):
+        if needle not in verify:
+            every.append(f"file_verify.rs: {needle}")
+    c.fact(VERIFY_EVERYTHING, not every, "; ".join(every))
+
+
 T07_KIT = "flutter/lib/desktop/kit/session_toolbar.dart"
 SIMPLE_SETTINGS_KIT = "flutter/lib/desktop/kit/simple_settings.dart"
 
@@ -1652,6 +1722,7 @@ def run_checks(root):
     target_word_checks(c)  # v1.7 t26
     home_checks(c)  # v1.7 review: Home, Settings, copy
     transfer_speed_checks(c)  # v1.7 t27
+    transfer_verify_checks(c)  # v1.7 t30
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")

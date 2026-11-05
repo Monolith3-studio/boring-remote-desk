@@ -21,6 +21,7 @@ class TransferJob {
     this.delete = false,
     this.speed = 0,
     this.averageSpeed,
+    this.report = '',
   });
 
   final int id;
@@ -41,6 +42,13 @@ class TransferJob {
   /// The whole run's average, once it's done. See [TransferClock].
   final double? averageSpeed;
 
+  /// What the finished job proved, word for word from the engine (base::file_verify, v1.7 t30).
+  /// Empty until then.
+  final String report;
+
+  /// Done, and the engine couldn't say every file passed.
+  bool get notVerified => report.startsWith('Not verified');
+
   /// [state] is the engine's JobState name (none, inProgress, done, error, paused);
   /// [err] its error text, where 'cancel' and 'skipped' are not real errors.
   factory TransferJob.fromEngine({
@@ -57,11 +65,13 @@ class TransferJob {
   }) {
     final TransferPhase phase;
     var error = '';
+    var report = '';
     if (state == 'done' && err == 'cancel') {
       phase = TransferPhase.failed;
       error = 'cancel';
     } else if (state == 'done') {
       phase = TransferPhase.done;
+      if (err != 'skipped') report = err;
     } else if (state == 'error') {
       phase = TransferPhase.failed;
       error = err.isEmpty ? 'Unknown error' : err;
@@ -84,6 +94,7 @@ class TransferJob {
       delete: delete,
       speed: speed,
       averageSpeed: averageSpeed,
+      report: report,
     );
   }
 
@@ -95,13 +106,15 @@ class TransferJob {
       case TransferPhase.waiting:
         return 'Waiting';
       case TransferPhase.sending:
+        if (total > 0 && finished >= total) return 'Checking the copy…'; // read back, v1.7 t30
         final percent = '${(fraction * 100).round()}%';
         return speed > 0 ? '$percent · ${kitSpeed(speed)}' : percent;
       case TransferPhase.paused:
         return 'Paused';
       case TransferPhase.done:
         final average = averageSpeed ?? 0;
-        return average > 0 ? 'Done · ${kitSpeed(average)} average' : 'Done';
+        final said = report.isEmpty ? 'Done' : report;
+        return average > 0 ? '$said · ${kitSpeed(average)} average' : said;
       case TransferPhase.failed:
         return error == 'cancel' ? 'Cancelled' : "Didn't send: $error. Drag it across to try again.";
     }
@@ -399,9 +412,9 @@ class TransferList extends StatelessWidget {
   }
 
   Widget _row(BuildContext context, TransferJob j) {
-    final failed = j.phase == TransferPhase.failed;
+    final failed = j.phase == TransferPhase.failed || j.notVerified;
     final icon = switch (j.phase) {
-      TransferPhase.done => Icons.check_circle_outline,
+      TransferPhase.done => j.notVerified ? Icons.error_outline : Icons.check_circle_outline,
       TransferPhase.failed => Icons.error_outline,
       _ => j.delete ? Icons.delete_outline : (j.toThisMac ? Icons.arrow_back : Icons.arrow_forward),
     };
@@ -431,9 +444,8 @@ class TransferList extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(color: Kit.paper, fontSize: 15)),
                 const SizedBox(height: Kit.s1),
-                Text(j.status,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
+                // Selectable and unclipped: a report names files, and someone may need them all.
+                SelectableText(j.status,
                     style: const TextStyle(color: Kit.muted, fontSize: 13)),
                 if (j.phase == TransferPhase.sending)
                   Padding(

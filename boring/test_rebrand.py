@@ -813,6 +813,76 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.FILE_MGR, "          TransferDrives(load: _boringLoadDrives, onOpen: controller.openDirectory), // boring-remote (v1.7 t27)\n", "")
         self.assert_check_fails(check.TRANSFER_HOOKS)
 
+    # --- v1.7 t30: every file proved ---------------------------------------------------
+    def test_verify_hooks_land_and_the_protocol_stays(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        self.assertIn(f"PASS {check.VERIFY_HOOKS}", r.stdout)
+        self.assertIn(f"PASS {check.VERIFY_WORDS}", r.stdout)
+        self.assertIn(f"PASS {check.VERIFY_EVERYTHING}", r.stdout)
+        self.assertIn("PASS protocol files are upstream's", r.stdout)
+        fs = (self.root / rebrand.FS_RS).read_text()
+        self.assertIn("pub boring: crate::file_verify::JobVerify,", fs)
+        self.assertIn("async fn boring_write(&mut self, block: FileTransferBlock)", fs)
+        self.assertIn('blake3 = "=1.8.2"', (self.root / rebrand.BASE_TOML).read_text())
+
+    def test_a_second_rebrand_changes_nothing_after_t30(self):
+        self.rebrand()
+        files = (rebrand.CARGO_LOCK, rebrand.BASE_TOML, rebrand.FS_RS, rebrand.CONN, rebrand.IO_LOOP, rebrand.UI_CM,
+                 rebrand.IPC, rebrand.UI_SESSION, rebrand.FLUTTER_RS, rebrand.FFI_MODEL, rebrand.FILE_MODEL)
+        first = {rel: (self.root / rel).read_bytes() for rel in files}
+        self.rebrand()
+        for rel in files:
+            self.assertEqual(first[rel], (self.root / rel).read_bytes(), rel)
+
+    def test_the_lock_names_both_constant_time_eqs(self):
+        self.rebrand()
+        lock = (self.root / rebrand.CARGO_LOCK).read_text()
+        self.assertIn(' "constant_time_eq 0.2.6",\n', lock)
+        self.assertIn(' "constant_time_eq 0.3.1",\n', lock)
+        self.assertNotIn(' "constant_time_eq",\n', lock)
+
+    def test_real_name_before_the_read_back_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.FS_RS, "if self.r#type == JobType::Printer || self.boring.receiving() {",
+                  "if self.r#type == JobType::Printer {")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_done_before_the_last_verdict_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.FS_RS, "if !job.boring_holds_done() && job.job_completed() {\n                    job_log",
+                  "if job.job_completed() {\n                    job_log")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_target_that_never_says_it_can_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CONN, "platform_additions.insert(base::file_verify::MARKER.into(), json!(true));\n", "\n")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_proof_out_of_scope_on_the_target_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.CONN, rebrand.T30_CONN_SCOPE, "")
+        self.assert_check_fails(check.VERIFY_HOOKS)
+
+    def test_pane_setting_dropping_hidden_files_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.IO_LOOP, "Data::SendFiles((id, r#type, path, to, file_num, _, is_remote)) => {",
+                  "Data::SendFiles((id, r#type, path, to, file_num, include_hidden, is_remote)) => {")
+        self.assert_check_fails(check.VERIFY_EVERYTHING)
+
+    def test_a_softer_verified_fails_check(self):
+        self.rebrand()
+        rel = "libs/base/src/file_verify.rs"
+        self.edit(rel, "self.failed.is_empty() && self.skipped.is_empty() && self.verified == self.files\n",
+                  "self.failed.is_empty()\n")
+        self.assert_check_fails(check.VERIFY_WORDS)
+
+    def test_changing_the_old_peer_words_fails_check(self):
+        self.rebrand()
+        rel = "libs/base/src/file_verify.rs"
+        self.edit(rel, "Not verified: the other computer needs the latest Boring Remote", "Sent")
+        self.assert_check_fails(check.VERIFY_WORDS)
+
     def test_windows_setup_falling_back_to_scutil_fails_check(self):  # v1.7 t12 follow-up
         self.rebrand()
         self.edit(rebrand.HOME, "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n"

@@ -5,7 +5,11 @@
 //!
 //!   make:  transfer_bench make <incompressible|compressible> <gib> <path>
 //!   run:   transfer_bench run <file> <dest dir> [--mode tick|pump] [--direction up|down] [--link-mib N]
+//!          [--verify] [--keep]    (a patched tree: every file proved, as v1.7 ships. --keep leaves the
+//!          copy for a tool outside the app to hash, and prints the job's words)
 //!   cost:  transfer_bench cost   (one core's speed at each per-block step, on this machine)
+//!   readback: transfer_bench readback <file>   (a patched tree: the read-back against a read the
+//!          system answers from memory, on a file it has just read)
 //!   peers: transfer_bench peer-send <path> <port> [--mode tick|pump]   then
 //!          transfer_bench peer-recv <dest> <port>
 //!          Two processes, so a raw checkout's build (upstream's engine, as a 1.6.x peer has) can
@@ -150,6 +154,7 @@ async fn run_sender(
     mut job: fs::TransferJob,
     direction: Direction,
     log_sink: mpsc::UnboundedSender<String>,
+    verify: bool,
 ) -> ResultType<SenderReport> {
     let start = Instant::now();
     let mut timer = Throttled::new(Duration::from_millis(1));
@@ -160,10 +165,19 @@ async fn run_sender(
     let mut log_gate = file_speed::Every::default();
     job.is_remote = direction == Direction::Down;
     let mut jobs = vec![job];
+    enable_verify(&mut jobs, verify);
     loop {
         tokio::select! {
             res = stream.next() => {
-                let Some(Ok(bytes)) = res else { hbb_common::bail!("receiver went away") };
+                // boring-remote (v1.7 t30): once Done has gone the receiver may close before the next
+                // tick. Only a close before Done is an error. Under load this race was aborting the
+                // bench, in this loop and in the echo below (ticket 27's open question, see ticket 30).
+                let Some(Ok(bytes)) = res else {
+                    if jobs.is_empty() {
+                        break;
+                    }
+                    hbb_common::bail!("receiver went away")
+                };
                 let msg = Message::parse_from_bytes(&bytes)?;
                 match msg.union {
                     Some(message::Union::TestDelay(t)) if t.from_client => {
@@ -176,6 +190,7 @@ async fn run_sender(
                             }
                         }
                     }
+                    Some(message::Union::Misc(m)) => sender_wire(&mut jobs, m),
                     _ => {}
                 }
             }
@@ -200,13 +215,77 @@ async fn run_sender(
             _ = probe.tick() => lag.hit(),
             _ = echo_timer.tick() => {
                 // from_client = true means: please send this back.
-                stream.send(&test_delay(now_micros(start), true)).await?;
+                let sent = stream.send(&test_delay(now_micros(start), true)).await;
+                if jobs.is_empty() {
+                    break; // the same race, on the way out
+                }
+                sent?;
             }
         }
     }
     let mut echo = Lag::default();
     echo.samples = echoes;
     Ok(SenderReport { lag, echo })
+}
+
+#[cfg(boring_stream_run)]
+fn enable_verify(jobs: &mut [fs::TransferJob], verify: bool) {
+    if verify {
+        base::file_verify::enable_sends(jobs, Some(base::file_verify::this_os()));
+    }
+}
+#[cfg(not(boring_stream_run))]
+fn enable_verify(_jobs: &mut [fs::TransferJob], _verify: bool) {}
+
+#[cfg(boring_stream_run)]
+fn sender_wire(jobs: &mut Vec<fs::TransferJob>, m: Misc) {
+    use base::file_verify::{on_wire, Wire};
+    if let Some(misc::Union::PluginRequest(p)) = m.union {
+        if let Some(job) = jobs.first_mut() {
+            if let Some(wire) = Wire::from_json(&p.content) {
+                on_wire(job, wire, None);
+            }
+        }
+    }
+}
+#[cfg(not(boring_stream_run))]
+fn sender_wire(_jobs: &mut Vec<fs::TransferJob>, _m: Misc) {}
+
+/// Takes a Misc to a job on a receiver, and hands back what the job says on its way out.
+#[cfg(boring_stream_run)]
+fn receiver_wire(job: &mut fs::TransferJob, content: &[u8], out: &mpsc::UnboundedSender<Message>) {
+    use base::file_verify::{on_wire, Outbox, Wire};
+    let out = out.clone();
+    let outbox: Outbox = Arc::new(move |m| {
+        out.send(m).ok();
+    });
+    if let Some(wire) = Wire::from_json(content) {
+        on_wire(job, wire, Some(&outbox));
+    }
+}
+#[cfg(not(boring_stream_run))]
+fn receiver_wire(_job: &mut fs::TransferJob, _content: &[u8], _out: &mpsc::UnboundedSender<Message>) {}
+
+#[cfg(boring_stream_run)]
+fn job_words(job: &fs::TransferJob, verify: bool) -> String {
+    let report = base::file_verify::finish(job);
+    base::file_verify::job_words(report.as_ref(), verify)
+}
+#[cfg(not(boring_stream_run))]
+fn job_words(_job: &fs::TransferJob, _verify: bool) -> String {
+    "Not verified: raw tree".to_string()
+}
+
+#[cfg(boring_stream_run)]
+fn plugin_content(m: Misc) -> Option<Vec<u8>> {
+    match m.union {
+        Some(misc::Union::PluginRequest(p)) => Some(p.content.to_vec()),
+        _ => None,
+    }
+}
+#[cfg(not(boring_stream_run))]
+fn plugin_content(_m: Misc) -> Option<Vec<u8>> {
+    None
 }
 
 struct WriteTarget {
@@ -232,16 +311,26 @@ impl WriteTarget {
 }
 
 /// Controller's loop: the block is written in the loop itself.
-async fn run_controller_receiver(mut stream: Stream, mut w: WriteTarget) -> ResultType<Lag> {
+async fn run_controller_receiver(
+    mut stream: Stream,
+    mut w: WriteTarget,
+    verify: bool,
+    words: Arc<std::sync::Mutex<String>>,
+) -> ResultType<Lag> {
     let mut probe = time::interval(Duration::from_millis(5));
     let mut lag = Lag::default();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     loop {
         tokio::select! {
+            Some(m) = out_rx.recv() => stream.send(&m).await?,
             res = stream.next() => {
                 let Some(Ok(bytes)) = res else { hbb_common::bail!("sender went away") };
                 let msg = Message::parse_from_bytes(&bytes)?;
                 match msg.union {
-                    Some(message::Union::TestDelay(t)) => stream.send(&test_delay(t.time, t.from_client)).await?,
+                    Some(message::Union::TestDelay(t)) => {
+                        // The sender may have finished and gone, with blocks and Done still in the socket.
+                        stream.send(&test_delay(t.time, t.from_client)).await.ok();
+                    }
                     Some(message::Union::FileResponse(fr)) => match fr.union {
                         Some(file_response::Union::Digest(d)) => {
                             stream.send(&fs::new_send_confirm(FileTransferSendConfirmRequest {
@@ -260,12 +349,18 @@ async fn run_controller_receiver(mut stream: Stream, mut w: WriteTarget) -> Resu
                         Some(file_response::Union::Block(block)) => w.job.write(block).await?,
                         Some(file_response::Union::Done(_)) => {
                             w.job.modify_time();
+                            *words.lock().unwrap() = job_words(&w.job, verify);
                             drop(w);
                             return Ok(lag);
                         }
                         Some(file_response::Union::Error(e)) => hbb_common::bail!("peer error: {}", e.error),
                         _ => {}
                     },
+                    Some(message::Union::Misc(m)) => {
+                        if let Some(content) = plugin_content(m) {
+                            receiver_wire(&mut w.job, &content, &out_tx);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -277,6 +372,7 @@ async fn run_controller_receiver(mut stream: Stream, mut w: WriteTarget) -> Resu
 enum ToCm {
     Block { file_num: i32, data: Bytes, compressed: bool },
     Digest(FileTransferDigest),
+    Wire(Vec<u8>),
     Done,
 }
 
@@ -288,7 +384,10 @@ async fn run_target_receiver(
     mut stream: Stream,
     w: WriteTarget,
     peak_queue: Arc<AtomicU64>,
+    verify: bool,
+    words: Arc<std::sync::Mutex<String>>,
 ) -> ResultType<Lag> {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let (ipc_a, ipc_b) = local_socket_pair().await?;
     let (tx_to_cm, mut rx_to_cm) = mpsc::unbounded_channel::<ToCm>();
     let (tx_ack, mut rx_ack) = mpsc::unbounded_channel::<usize>();
@@ -311,6 +410,10 @@ async fn run_target_receiver(
                     ToCm::Digest(d) => {
                         let head = format!(r#"{{"t":"Digest","c":{{"id":{},"file_num":{},"size":{},"modified":{}}}}}"#, d.id, d.file_num, d.file_size, d.last_modified);
                         ipc.send(Bytes::from(head)).await?;
+                    }
+                    ToCm::Wire(content) => {
+                        ipc.send(Bytes::from_static(br#"{"t":"Wire"}"#)).await?;
+                        ipc.send(Bytes::from(content)).await?;
                     }
                     ToCm::Done => ipc.send(Bytes::from_static(br#"{"t":"Done"}"#)).await?,
                 }
@@ -361,8 +464,13 @@ async fn run_target_receiver(
                         ..Default::default()
                     }).await;
                 }
+                Some("Wire") => {
+                    let Some(Ok(content)) = ipc.next().await else { break };
+                    receiver_wire(&mut job, &content, &out_tx);
+                }
                 Some("Done") => {
                     job.modify_time();
+                    *words.lock().unwrap() = job_words(&job, verify);
                     break;
                 }
                 _ => {}
@@ -378,11 +486,15 @@ async fn run_target_receiver(
     let mut finished = false;
     while !finished {
         tokio::select! {
+            Some(m) = out_rx.recv() => stream.send(&m).await?,
             res = stream.next(), if mode == Mode::Tick || window.has_room() => {
                 let Some(Ok(bytes)) = res else { hbb_common::bail!("sender went away") };
                 let msg = Message::parse_from_bytes(&bytes)?;
                 match msg.union {
-                    Some(message::Union::TestDelay(t)) => stream.send(&test_delay(t.time, t.from_client)).await?,
+                    Some(message::Union::TestDelay(t)) => {
+                        // The sender may have finished and gone, with blocks and Done still in the socket.
+                        stream.send(&test_delay(t.time, t.from_client)).await.ok();
+                    }
                     Some(message::Union::FileResponse(fr)) => match fr.union {
                         Some(file_response::Union::Digest(d)) => {
                             let r = FileTransferSendConfirmRequest {
@@ -410,6 +522,11 @@ async fn run_target_receiver(
                         Some(file_response::Union::Error(e)) => hbb_common::bail!("peer error: {}", e.error),
                         _ => {}
                     },
+                    Some(message::Union::Misc(m)) => {
+                        if let Some(content) = plugin_content(m) {
+                            tx_to_cm.send(ToCm::Wire(content)).ok();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -572,7 +689,12 @@ async fn run(args: &[String]) -> ResultType<()> {
         Some("down") => Direction::Down,
         _ => Direction::Up,
     };
+    let verify = args.iter().any(|a| a == "--verify");
+    let keep = args.iter().any(|a| a == "--keep");
     std::fs::create_dir_all(&dest_dir)?;
+    // Beside the copy, not in the app's log folder.
+    #[cfg(boring_stream_run)]
+    base::file_verify::set_log_path(dest_dir.join("verify.log"));
     let name = source.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
     let dest = dest_dir.join(&name);
     std::fs::remove_file(&dest).ok();
@@ -612,13 +734,15 @@ async fn run(args: &[String]) -> ResultType<()> {
 
     let started = Instant::now();
     let peak = peak_queue.clone();
+    let words = Arc::new(std::sync::Mutex::new(String::new()));
+    let words2 = words.clone();
     let receiver = rt_recv.spawn(async move {
         match direction {
-            Direction::Up => run_target_receiver(mode, recv_stream, target, peak).await,
-            Direction::Down => run_controller_receiver(recv_stream, target).await,
+            Direction::Up => run_target_receiver(mode, recv_stream, target, peak, verify, words2).await,
+            Direction::Down => run_controller_receiver(recv_stream, target, verify, words2).await,
         }
     });
-    let sender = tokio::spawn(run_sender(mode, send_stream, job, direction, log_tx));
+    let sender = tokio::spawn(run_sender(mode, send_stream, job, direction, log_tx, verify));
     let received = receiver.await;
     let elapsed = started.elapsed().as_secs_f64();
     let sent = sender.await;
@@ -639,9 +763,14 @@ async fn run(args: &[String]) -> ResultType<()> {
         "  CM logs sent: {logs}; peak queue to the CM: {:.1} MiB",
         peak_queue.load(Ordering::Relaxed) as f64 / MIB
     );
+    println!("  job says: {}", words.lock().unwrap());
     let ok = same_bytes(&source, &dest)?;
     println!("  bytes match: {ok}");
-    std::fs::remove_file(&dest).ok();
+    if keep {
+        println!("  kept: {}", dest.display());
+    } else {
+        std::fs::remove_file(&dest).ok();
+    }
     if !ok {
         hbb_common::bail!("copy differs from source");
     }
@@ -677,7 +806,8 @@ async fn peer_send(args: &[String]) -> ResultType<()> {
         .send(&fs::new_receive(1, String::new(), 0, job.files().clone(), job.total_size()))
         .await?;
     let (log_tx, _log_rx) = mpsc::unbounded_channel();
-    run_sender(mode, stream, job, Direction::Up, log_tx).await?;
+    let verify = args.iter().any(|a| a == "--verify");
+    run_sender(mode, stream, job, Direction::Up, log_tx, verify).await?;
     Ok(())
 }
 
@@ -696,7 +826,8 @@ async fn peer_recv(args: &[String]) -> ResultType<()> {
     let Some(file_action::Union::Receive(r)) = action.union else {
         hbb_common::bail!("expected the file list first")
     };
-    run_controller_receiver(stream, WriteTarget::new(PathBuf::from(&args[0]), r.files)?).await?;
+    let words = Arc::new(std::sync::Mutex::new(String::new()));
+    run_controller_receiver(stream, WriteTarget::new(PathBuf::from(&args[0]), r.files)?, false, words).await?;
     // The last write can still be on its thread as Done lands.
     time::sleep(Duration::from_millis(200)).await;
     Ok(())
@@ -748,6 +879,44 @@ fn cost() {
     step("memcpy", &mut || {
         std::hint::black_box(block.clone());
     });
+    #[cfg(boring_stream_run)]
+    {
+        let noise: Vec<u8> = (0..block.len()).map(|i| (i.wrapping_mul(2654435761)) as u8).collect();
+        step("blake3", &mut || {
+            std::hint::black_box(blake3::hash(&noise));
+        });
+    }
+}
+
+#[cfg(boring_stream_run)]
+fn read_back_speed(path: &Path) -> ResultType<()> {
+    let plain = |label: &str| -> ResultType<()> {
+        let t = Instant::now();
+        let mut f = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            std::hint::black_box(&buf[..n]);
+        }
+        println!("{label}: {:.0} MiB/s", total as f64 / MIB / t.elapsed().as_secs_f64());
+        Ok(())
+    };
+    plain("plain read, may be from disk")?;
+    plain("plain read again, from memory")?;
+    let t = Instant::now();
+    let (size, hash) = base::file_verify::hash_from_disk(path, &std::sync::atomic::AtomicBool::new(false))?;
+    println!("read-back with hash: {:.0} MiB/s ({size} bytes, blake3 {hash})", size as f64 / MIB / t.elapsed().as_secs_f64());
+    plain("plain read after it, from disk if the read-back dropped the cache")?;
+    Ok(())
+}
+#[cfg(not(boring_stream_run))]
+fn read_back_speed(_path: &Path) -> ResultType<()> {
+    hbb_common::bail!("readback needs a patched tree")
 }
 
 #[tokio::main]
@@ -762,6 +931,7 @@ async fn main() -> ResultType<()> {
             cost();
             Ok(())
         }
+        Some("readback") if args.len() == 2 => read_back_speed(Path::new(&args[1])),
         _ => {
             eprintln!("usage: see the top of libs/base/examples/transfer_bench.rs");
             std::process::exit(2);

@@ -53,6 +53,60 @@ void main() {
     });
   });
 
+  group('what a finished job proved (t30)', () {
+    const verified = 'Verified: 12 files, 4.3 GB';
+    const partial = 'Not verified: 1 of 12 files failed: A001.MOV (the copy doesn\'t match the original). 11 proved, 4.0 GB';
+    const oldPeer = 'Not verified: the other computer needs the latest Boring Remote';
+
+    test('says the engine\'s words, with the average after them', () {
+      expect(job('done', err: verified, averageSpeed: 97e6).status, 'Verified: 12 files, 4.3 GB · 97 MB/s average');
+      expect(job('done', err: verified).status, verified);
+      expect(job('done', err: oldPeer).status, oldPeer);
+      expect(job('done', err: partial).status, partial);
+    });
+
+    test('Not verified is marked, Verified is not', () {
+      expect(job('done', err: verified).notVerified, isFalse);
+      expect(job('done', err: partial).notVerified, isTrue);
+      expect(job('done', err: oldPeer).notVerified, isTrue);
+    });
+
+    test('a job with no report never claims anything', () {
+      expect(job('done').status, 'Done');
+      expect(job('done').status, isNot(contains('Verified')));
+      expect(job('done', err: 'skipped').status, 'Done');
+    });
+
+    test('cancelled and failed jobs keep their own words', () {
+      expect(job('done', err: 'cancel').status, 'Cancelled');
+      expect(job('error', err: 'Not enough room: this needs 4.3 GB and 1.0 GB is free').status,
+          "Didn't send: Not enough room: this needs 4.3 GB and 1.0 GB is free. Drag it across to try again.");
+    });
+
+    test('at 100% and still going, it is checking the copy', () {
+      expect(job('inProgress', finished: 1000, speed: 5e6).status, 'Checking the copy…');
+      expect(job('inProgress', finished: 999).status, '100%');
+    });
+
+    test('a delete job ignores any report', () {
+      expect(job('done', delete: true, err: oldPeer).status, 'Deleted from this Mac');
+    });
+
+    testWidgets('a Not verified row carries the warning icon and shows every word', (t) async {
+      await t.pumpWidget(MaterialApp(
+          home: Scaffold(
+              body: TransferList(
+                  jobs: [job('done', err: partial), job('done', err: verified)],
+                  onCancel: (_) {},
+                  onResume: (_) {},
+                  onRemove: (_) {}))));
+      expect(find.byIcon(Icons.error_outline), findsOneWidget);
+      expect(find.byIcon(Icons.check_circle_outline), findsOneWidget);
+      expect(find.text(partial), findsOneWidget);
+      expect(find.text(verified), findsOneWidget);
+    });
+  });
+
   group('TransferClock averages one run', () {
     final t0 = DateTime(2026, 11, 4, 12);
     DateTime at(int seconds) => t0.add(Duration(seconds: seconds));
