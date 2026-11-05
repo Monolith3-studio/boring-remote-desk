@@ -84,8 +84,11 @@ class LegalDialog extends StatelessWidget {
             child: const Text(LegalWords.readLicense)),
         OutlinedButton(
             onPressed: () => openUrl(LegalWords.sourceUrl), child: const Text(LegalWords.getSource)),
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text(LegalWords.close)),
       ]),
+      const SizedBox(height: Kit.s2),
+      Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text(LegalWords.close))),
     ]);
   }
 }
