@@ -444,6 +444,8 @@ class Settings(unittest.TestCase):
 
 
 EXPORT = DMG / "export-signing-secret.sh"
+# macOS writes PKCS#12 with RC2-40, which OpenSSL 3+ (Homebrew's) can't open without its legacy provider.
+SYSTEM_OPENSSL = "/usr/bin/openssl"
 
 
 @unittest.skipUnless(ON_MAC, "needs macOS")
@@ -476,15 +478,15 @@ class ExportSecret(unittest.TestCase):
         subprocess.run(["security", "delete-keychain", cls.kc])
         shutil.rmtree(cls.tmp, True)
 
-    def export(self, *args, pin=None):
+    def export(self, *args, pin=None, path_first=None):
         d = pathlib.Path(tempfile.mkdtemp(dir=self.tmp))
         env = {"BR_EXPORT_KEYCHAIN": str(self.kc), "BR_SIGN_SHA1": pin or self.sha["Boring Remote Code Signing"],
-               "PATH": f"{self.bin}:{os.environ['PATH']}", "GH_LOG": str(d / "gh.log"), "GH_DIR": str(d),
+               "PATH": f"{path_first or self.bin}:{self.bin}:{os.environ['PATH']}", "GH_LOG": str(d / "gh.log"), "GH_DIR": str(d),
                "TMPDIR": str(d) + "/"}
         return run(["bash", str(EXPORT), *args], env=env), d
 
     def p12_certs(self, p12, pw):
-        out = subprocess.run(["openssl", "pkcs12", "-nokeys", "-passin", f"pass:{pw}"], input=p12,
+        out = subprocess.run([SYSTEM_OPENSSL, "pkcs12", "-nokeys", "-passin", f"pass:{pw}"], input=p12,
                              capture_output=True).stdout.decode()
         return [hashlib.sha1(subprocess.run(["openssl", "x509", "-outform", "der"], input=c.encode(),
                                             capture_output=True).stdout).hexdigest().upper()
@@ -501,7 +503,7 @@ class ExportSecret(unittest.TestCase):
         self.assertGreaterEqual(len(pw), 32)
         p12 = __import__("base64").b64decode(b64)
         self.assertEqual(self.p12_certs(p12, pw), [self.sha["Boring Remote Code Signing"]])
-        keys = subprocess.run(["openssl", "pkcs12", "-nocerts", "-nodes", "-passin", f"pass:{pw}"], input=p12,
+        keys = subprocess.run([SYSTEM_OPENSSL, "pkcs12", "-nocerts", "-nodes", "-passin", f"pass:{pw}"], input=p12,
                               capture_output=True).stdout.count(b"BEGIN PRIVATE KEY")
         self.assertEqual(keys, 1)
         for secret in (pw, b64[:40]):
@@ -511,10 +513,20 @@ class ExportSecret(unittest.TestCase):
             if f.is_file() and f.name not in ("MAC_SIGN_P12", "MAC_SIGN_P12_PASSWORD", "gh.log"):
                 self.assertNotIn(p12[:64], f.read_bytes(), f)
 
+    def test_bundle_check_ignores_an_openssl_on_path_without_rc2(self):
+        stub = self.tmp / "no-rc2"
+        stub.mkdir(exist_ok=True)
+        fake = stub / "openssl"
+        fake.write_text('#!/bin/bash\n[ "$1" = pkcs12 ] && { echo "RC2-40-CBC unsupported" >&2; exit 1; }\n'
+                        f'exec {SYSTEM_OPENSSL} "$@"\n')
+        fake.chmod(0o755)
+        r, _ = self.export("--dry-run", path_first=stub)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_round_trips_into_release_mac(self):
         r, d = self.export()
         self.assertEqual(r.returncode, 0, r.stderr)
-        rel = run(["bash", "-c", 'printf "%s" "$MAC_SIGN_P12" | base64 --decode | openssl pkcs12 -nokeys '
+        rel = run(["bash", "-c", 'printf "%s" "$MAC_SIGN_P12" | base64 --decode | /usr/bin/openssl pkcs12 -nokeys '
                    '-passin env:MAC_SIGN_P12_PASSWORD | openssl x509 -noout -subject'],
                   env={"MAC_SIGN_P12": (d / "MAC_SIGN_P12").read_text(),
                        "MAC_SIGN_P12_PASSWORD": (d / "MAC_SIGN_P12_PASSWORD").read_text()})

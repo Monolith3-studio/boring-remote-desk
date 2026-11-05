@@ -18,8 +18,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 DRY=false
 [ "${1:-}" = --dry-run ] && DRY=true
 
+# SecItemExport writes the certificate bag in RC2-40. OpenSSL 3+ (Homebrew's, first on PATH on the
+# release Mac) won't open that without -legacy, and the system LibreSSL has no -legacy flag. Read the
+# bundle with the one that ships with macOS. `security import` (release-mac.sh) takes it either way.
+P12_READER=/usr/bin/openssl
+
 die() { echo "export-signing-secret: $*" >&2; exit 1; }
-for t in openssl swift base64; do command -v "$t" >/dev/null || die "missing $t"; done
+for t in openssl "$P12_READER" swift base64; do command -v "$t" >/dev/null || die "missing $t"; done
 if ! $DRY; then
   command -v gh >/dev/null || die "missing gh"
   gh secret list -R "$REPO" >/dev/null || die "gh cannot read $REPO secrets (gh auth login? admin on the repo?)"
@@ -34,13 +39,13 @@ p12=$(printf '%s' "$pw" | swift "$HERE/export-identity.swift" "$NAME" "$PIN" ${k
 [ -n "$p12" ] || die "export produced nothing; nothing was set"
 
 # Check the bundle before it goes anywhere: one certificate, the pinned one, and one key.
-certs=$(printf '%s' "$p12" | base64 --decode | P12PW=$pw openssl pkcs12 -nokeys -passin env:P12PW 2>/dev/null) \
+certs=$(printf '%s' "$p12" | base64 --decode | P12PW=$pw "$P12_READER" pkcs12 -nokeys -passin env:P12PW 2>/dev/null) \
   || die "exported bundle does not open with its passphrase; nothing was set"
 n=$(printf '%s\n' "$certs" | grep -c 'BEGIN CERTIFICATE' || true)
 [ "$n" = 1 ] || die "exported bundle holds $n certificates, expected 1; nothing was set"
 got=$(printf '%s\n' "$certs" | openssl x509 -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
 [ "$got" = "$PIN" ] || die "exported certificate is $got, expected $PIN; nothing was set"
-keys=$(printf '%s' "$p12" | base64 --decode | P12PW=$pw openssl pkcs12 -nocerts -nodes -passin env:P12PW 2>/dev/null \
+keys=$(printf '%s' "$p12" | base64 --decode | P12PW=$pw "$P12_READER" pkcs12 -nocerts -nodes -passin env:P12PW 2>/dev/null \
   | grep -c 'BEGIN .*PRIVATE KEY' || true)
 [ "$keys" = 1 ] || die "exported bundle holds $keys private keys, expected 1; nothing was set"
 echo "export-signing-secret: bundle checked: 1 certificate ($got), 1 key"
