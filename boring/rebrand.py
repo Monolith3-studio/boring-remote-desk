@@ -2236,7 +2236,8 @@ LOOK_INSTALL_METHOD = (
     "        onInstall: install,\n"
     "        onCancel: () => windowManager.close(),\n"
     "        onTryWithoutInstalling: () => bind.installRunWithoutInstall(),\n"
-    "        onLicence: () => showLegalDialog(context),\n"
+    # this.context: path.dart's top-level context would win over State's otherwise
+    "        onLicence: () => showLegalDialog(this.context),\n"
     "      ));\n\n")
 # Allow keeps the connection window up (review: minimising was not asked for). t04's prompt is
 # folded in its own patch, as t04 and t06 did, so a second rebrand still finds it whole.

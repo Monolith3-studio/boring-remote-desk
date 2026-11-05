@@ -521,8 +521,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_owner_name_in_shipped_text_fails_check(self):
         self.rebrand()
-        for rel, old, new in (("flutter/lib/desktop/kit/kit.dart", "// The app uses", "// Monolith3 uses"),
-                              ("res/msi/Package/License.rtf", "Boring Labs", "Jason")):
+        for rel, old, new in (("flutter/lib/desktop/kit/kit.dart", "// The app uses", f"// {check.OWNER_WORDS[0]} uses"),
+                              ("res/msi/Package/License.rtf", "Boring Labs", check.OWNER_WORDS[1].title())):
             self.edit(rel, old, new)
             self.assert_check_fails(check.NO_OWNER)
             self.edit(rel, new, old)

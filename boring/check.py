@@ -20,6 +20,7 @@ Prints one PASS/FAIL line per fact, then
 and exits 1 if anything failed. Stdlib only.
 """
 import base64
+import codecs
 import hashlib
 import json
 import pathlib
@@ -451,14 +452,16 @@ LEGAL_NOTICES = "Legal dialog has AGPL's notices: RustDesk's copyright, no warra
 LICENCE_BUNDLED = "the license ships inside the app, byte for byte, and Legal reads it from there"
 SOURCE_LINK = "the source link reaches the user: Legal and the installer license name FORK_URL, the install screen opens Legal"
 SOURCE_NOTICE = "the source says it is modified, with a date, and source-tarball.sh can make it (AGPL 5(a), 6)"
-NO_OWNER = "nothing shipped names Monolith3 or Jason"
+NO_OWNER = "nothing shipped names the owner"
 # Text that ships, or that the app is built from. boring/ and tests don't ship.
-OWNER = re.compile(r"monolith3|jason|boringstories", re.I)
+# The words are rot13 because this file is in the public source tarball: it must not name them either.
+OWNER_WORDS = codecs.decode("zbabyvgu3 wnfba obevatfgbevrf", "rot_13").split()
+OWNER = re.compile("|".join(OWNER_WORDS), re.I)
 OWNER_DIRS = ("flutter/lib", "flutter/macos/Runner", "flutter/windows/runner", "flutter/assets", "src", "libs", "res")
 OWNER_FILES = ("Cargo.toml", "flutter/pubspec.yaml", "flutter/macos/Runner.xcodeproj/project.pbxproj")
 OWNER_EXTS = {".dart", ".rs", ".swift", ".cpp", ".cc", ".c", ".h", ".mm", ".m", ".plist", ".xcconfig", ".xib",
               ".rc", ".wxl", ".wxs", ".rtf", ".txt", ".toml", ".yaml", ".json", ".py", ".strings"}
-NOT_THE_OWNER = "Copyright 2012 Jason Champion"  # libs/clipboard/src/windows/wf_cliprdr.c: upstream's header stays
+NOT_THE_OWNER = "libs/clipboard/src/windows/wf_cliprdr.c"  # upstream's copyright header, someone else, stays
 LEGAL_ITEM = "onTap: () => showLegalDialog(context),"
 
 
@@ -468,10 +471,9 @@ def owner_hits(root):
         paths += [p for p in (root / base).rglob("*") if p.suffix in OWNER_EXTS]
     out = []
     for p in paths:
-        if p.is_file() and not p.relative_to(root).as_posix().startswith("flutter/assets/LICENCE"):
-            text = p.read_text(encoding="utf-8", errors="replace").replace(NOT_THE_OWNER, "")
-            if OWNER.search(text):
-                out.append(p.relative_to(root).as_posix())
+        rel = p.relative_to(root).as_posix()
+        if p.is_file() and rel != NOT_THE_OWNER and OWNER.search(p.read_text(encoding="utf-8", errors="replace")):
+            out.append(rel)
     return sorted(out)
 
 
@@ -498,7 +500,7 @@ def legal_checks(c, legal):
                             f"sourceUrl = '{rebrand.FORK_URL}'" in words),
                            ("installer license has no source link", rebrand.FORK_URL in rtf),
                            ("install screen does not open Legal",
-                            "onLicence: () => showLegalDialog(context)," in c.read(rebrand.LOOK_INSTALL))) if not ok]
+                            "onLicence: () => showLegalDialog(this.context)," in c.read(rebrand.LOOK_INSTALL))) if not ok]
     c.fact(SOURCE_LINK, not bad, "; ".join(bad))
     notice = c.read("NOTICE")
     c.fact(SOURCE_NOTICE, "modified version of RustDesk" in notice and "Purslane" in notice
@@ -1713,7 +1715,7 @@ def look_checks(c):
 
     inst = c.read(rebrand.LOOK_INSTALL)
     missing = [n for n in (f"if {gate} return boringInstallScreen();", "Obx(() => InstallScreen(",
-                           "child: boringKit(Scaffold(", "onLicence: () => showLegalDialog(context),")
+                           "child: boringKit(Scaffold(", "onLicence: () => showLegalDialog(this.context),")
                if n not in inst]
     c.fact("Windows install screen in the kit, plain words", not missing, "; ".join(missing))
 
