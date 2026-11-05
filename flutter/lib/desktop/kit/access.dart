@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'kit.dart';
 
-export 'setup.dart' show kScreenRecordingPane, kAccessibilityPane, kInputMonitoringPane;
+export 'setup.dart' show kScreenRecordingPane, kAccessibilityPane, kInputMonitoringPane, kSetupStepOption;
 
 /// The per-user LaunchAgent that serves sessions (`--server`), and the port it listens on.
 const kAgentLabel = 'io.boringlabs.remote.agent';
@@ -44,6 +44,177 @@ Future<bool> restartAgent(RunProcess run, String uid,
   await run('launchctl', ['bootstrap', 'gui/$uid', kAgentPlist]);
   await run('launchctl', ['kickstart', job]); // loaded but not started
   return cameUp();
+}
+
+/// The bundle macOS keeps the switches under, and the only one [clearSwitches] ever names.
+const kBundleId = 'io.boringlabs.remote.agent';
+
+/// The three switches Setup asks for, in the names tccutil uses.
+const kSwitchServices = ['Accessibility', 'ScreenCapture', 'ListenEvent'];
+
+/// "Switch is on but still not working?" (v1.7 t31). A grant macOS holds for an older or ad-hoc
+/// build shows on in System Settings and reads false here. Only a reset clears it. Needs no admin.
+/// The arguments are fixed: without a bundle id tccutil resets every app on the Mac, so the id is a
+/// constant and nothing a person or a caller passes reaches this list. Runs all three even if one
+/// fails. True when all three worked.
+Future<bool> clearSwitches(RunProcess run) async {
+  var ok = true;
+  for (final service in kSwitchServices) {
+    try {
+      final r = await run('/usr/bin/tccutil', ['reset', service, kBundleId]);
+      ok = ok && r.exitCode == 0;
+    } catch (_) {
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+/// The IPC config name `--server` answers about itself, and the argument that makes a brand new
+/// copy of the exe print the same line and exit (rebrand.py, boring_access_line).
+const kServeAccessConfig = 'boring-serve-access';
+const kFreshCheckArg = '--boring-access';
+
+/// What one process can do, as macOS tells that process.
+class MacAccess {
+  /// This process is `--server`. False is the window standing in, so it says nothing about `--server`.
+  final bool server;
+  final bool screen, control, input;
+  final int sessions;
+  const MacAccess({this.server = false, required this.screen, required this.control, required this.input, this.sessions = 0});
+
+  bool get all => screen && control && input;
+
+  /// `server=Y screen=Y control=N input=Y sessions=0`. Null for anything else: no `--server`, or an
+  /// older one that doesn't know the name.
+  static MacAccess? parse(String line) {
+    final f = {
+      for (final kv in line.trim().split(RegExp(r'\s+')).map((w) => w.split('=')))
+        if (kv.length == 2) kv[0]: kv[1],
+    };
+    if (!f.containsKey('screen') || !f.containsKey('control') || !f.containsKey('input')) return null;
+    return MacAccess(
+      server: f['server'] == 'Y',
+      screen: f['screen'] == 'Y',
+      control: f['control'] == 'Y',
+      input: f['input'] == 'Y',
+      sessions: int.tryParse(f['sessions'] ?? '') ?? 0,
+    );
+  }
+}
+
+/// Keeps "Ready" honest about `--server` (v1.7 t31). The window isn't what serves sessions, so:
+/// - `--server` answers for itself over IPC. Every switch on there is the steady state, and costs one
+///   IPC read.
+/// - Anything off there, and a brand new copy of the exe reads the switches. macOS can keep a running
+///   process's Screen Recording answer until it restarts, so neither the window nor `--server` can
+///   be trusted to notice a switch going on. The window's own read is only the last resort. Every
+///   [freshEvery] while someone is in Setup or just clicked Fix, else every [restEvery]: a Mac that
+///   only ever controls others leaves these off for good, and shouldn't pay for it all day.
+/// - A switch on that `--server` still reads as off means `--server` needs a restart, so restart it.
+///   Never during a session, and at most [maxRestarts] times for one gap, so a read that never
+///   clears can't turn into a restart loop on a machine in use.
+class ServeWatch {
+  final Future<MacAccess?> Function() askServer;
+  final Future<MacAccess?> Function() askFresh;
+  final MacAccess Function() askWindow;
+  final Future<bool> Function() restart;
+  final bool Function() mayRestart;
+  final DateTime Function() now;
+  final Duration freshEvery, restEvery, fastFor, restartEvery;
+  final int maxRestarts;
+
+  ServeWatch({
+    required this.askServer,
+    required this.askFresh,
+    required this.askWindow,
+    required this.restart,
+    required this.mayRestart,
+    this.now = DateTime.now,
+    this.freshEvery = const Duration(seconds: 2),
+    this.restEvery = const Duration(seconds: 60),
+    this.fastFor = const Duration(minutes: 2),
+    this.restartEvery = const Duration(seconds: 20),
+    this.maxRestarts = 3,
+  });
+
+  /// `--server`'s last answer, when it was `--server` that answered.
+  MacAccess? _server;
+
+  /// The switches as macOS has them right now.
+  MacAccess? switches;
+
+  DateTime? _freshAt, _restartAt, _fastUntil;
+  int _restarts = 0;
+  Future<void>? _busy;
+
+  /// Every Access row polls at once; they share one read.
+  Future<void> read() => _busy ??= _read().whenComplete(() => _busy = null);
+
+  Future<void> _ask() async {
+    final a = await askServer();
+    _server = a != null && a.server ? a : null;
+  }
+
+  Future<void> _read() async {
+    await _ask();
+    final s = _server;
+    if (s != null && s.all) {
+      switches = s;
+      _restarts = 0;
+      return;
+    }
+    final at = now();
+    final last = _freshAt;
+    final fast = _fastUntil != null && at.isBefore(_fastUntil!);
+    if (switches == null || last == null || at.difference(last) >= (fast ? freshEvery : restEvery)) {
+      _freshAt = at;
+      switches = await askFresh() ?? askWindow();
+    }
+    if (s == null) return;
+    final on = switches!;
+    if (!((on.screen && !s.screen) || (on.control && !s.control) || (on.input && !s.input))) {
+      _restarts = 0;
+      return;
+    }
+    final since = _restartAt;
+    if (s.sessions > 0 || !mayRestart() || _restarts >= maxRestarts) return;
+    if (since != null && now().difference(since) < restartEvery) return;
+    _restarts++;
+    _restartAt = now();
+    await restart();
+    await _ask();
+  }
+
+  /// What `--server` can do, or the switches when there is no `--server` to ask (its own row says so).
+  Future<bool> serves(bool Function(MacAccess) pick) async {
+    await read();
+    final a = _server ?? switches;
+    return a != null && pick(a);
+  }
+
+  /// `--server` itself answered, not the window standing in.
+  Future<bool> answering() async {
+    await read();
+    return _server != null;
+  }
+
+  /// Setup's read of the switches: moves on as soon as one is on, and keeps `--server` caught up.
+  Future<MacAccess?> switchesNow() async {
+    _fastUntil = now().add(fastFor);
+    await read();
+    return switches;
+  }
+
+  /// Start over after the switches were cleared or a Fix was clicked.
+  void forget() {
+    _server = null;
+    switches = null;
+    _freshAt = null;
+    _restartAt = null;
+    _restarts = 0;
+    _fastUntil = now().add(fastFor);
+  }
 }
 
 /// "Open Boring Remote at login" (Mac): a LaunchAgent of the user's own that opens the app.
@@ -91,6 +262,13 @@ class AccessWords {
   static String get listeningWhy => 'So your other computers on this network can reach this one.';
   static String get reach => 'Let computers on this network reach Boring Remote';
   static const reachWhy = 'Windows asks once. Click “Yes”.';
+  // v1.7 t31: Setup and Access, the way out when a switch is on and macOS still says no.
+  static const stuckTitle = 'Switch is on but still not working?';
+  static const stuckBody = 'Your Mac can hold on to an old copy of these switches. This clears all three for '
+      'Boring Remote and leaves every other app alone. You\'ll need to turn them back on.';
+  static const stuckButton = 'Clear them and start over';
+  static const stuckDone = 'Cleared. All three are off now. Turn them back on, one at a time.';
+  static const stuckFailed = "That didn't work. Quit Boring Remote, open it from Applications and try again.";
 }
 
 /// One thing that has to be true before another computer can connect.
@@ -106,6 +284,53 @@ class AccessCheck {
 int? firstMissing(List<bool> ok) {
   final i = ok.indexOf(false);
   return i < 0 ? null : i;
+}
+
+/// "Switch is on but still not working?": what it does, in words, and its one button.
+class SwitchesStuck extends StatefulWidget {
+  /// Clears the switches, asks macOS again, opens System Settings. True when it worked.
+  final Future<bool> Function() clear;
+  final VoidCallback? onCleared;
+  const SwitchesStuck({super.key, required this.clear, this.onCleared});
+
+  @override
+  State<SwitchesStuck> createState() => _SwitchesStuckState();
+}
+
+class _SwitchesStuckState extends State<SwitchesStuck> {
+  bool _busy = false;
+  bool? _worked;
+
+  Future<void> _go() async {
+    setState(() => _busy = true);
+    var ok = false;
+    try {
+      ok = await widget.clear();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _worked = ok;
+    });
+    if (ok) widget.onCleared?.call();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    final worked = _worked;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(AccessWords.stuckTitle, style: t.bodyMedium),
+      const SizedBox(height: Kit.s1),
+      Text(AccessWords.stuckBody, style: t.bodySmall),
+      const SizedBox(height: Kit.s2),
+      OutlinedButton(onPressed: _busy ? null : _go, child: const Text(AccessWords.stuckButton)),
+      if (worked != null) ...[
+        const SizedBox(height: Kit.s2),
+        Text(worked ? AccessWords.stuckDone : AccessWords.stuckFailed),
+      ],
+    ]);
+  }
 }
 
 /// Reads [checks] now, every [pollEvery] while shown, and when the window comes back to the front.
@@ -160,7 +385,10 @@ Widget _summary(BuildContext context, List<AccessCheck> checks, List<bool> ok, F
 class AccessSection extends StatefulWidget {
   final List<AccessCheck> checks;
   final Duration pollEvery;
-  const AccessSection({super.key, required this.checks, this.pollEvery = const Duration(seconds: 3)});
+
+  /// The way out when a switch is on and macOS says no (v1.7 t31); null hides it (Windows).
+  final Future<bool> Function()? clearSwitches;
+  const AccessSection({super.key, required this.checks, this.pollEvery = const Duration(seconds: 3), this.clearSwitches});
 
   @override
   State<AccessSection> createState() => _AccessSectionState();
@@ -191,6 +419,10 @@ class _AccessSectionState extends State<AccessSection> with WidgetsBindingObserv
             subtitle: Text(checks[i].why, style: t.bodySmall),
             trailing: r[i] ? null : OutlinedButton(onPressed: () => fix(checks[i]), child: const Text(AccessWords.fix)),
           ),
+        if (widget.clearSwitches != null) ...[
+          const SizedBox(height: Kit.s3),
+          SwitchesStuck(clear: widget.clearSwitches!, onCleared: read),
+        ],
       ],
     ]);
   }
@@ -224,7 +456,10 @@ class _AccessSummaryState extends State<AccessSummary> with WidgetsBindingObserv
 class AccessStatus extends StatefulWidget {
   final List<AccessCheck> checks;
   final Duration pollEvery;
-  const AccessStatus({super.key, required this.checks, this.pollEvery = const Duration(seconds: 2)});
+
+  /// Offered while something is missing (v1.7 t31); null hides it (Windows).
+  final Future<bool> Function()? clearSwitches;
+  const AccessStatus({super.key, required this.checks, this.pollEvery = const Duration(seconds: 2), this.clearSwitches});
 
   @override
   State<AccessStatus> createState() => _AccessStatusState();
@@ -239,6 +474,14 @@ class _AccessStatusState extends State<AccessStatus> with WidgetsBindingObserver
   @override
   Widget build(BuildContext context) {
     final r = ok;
-    return r == null ? const SizedBox(height: 40) : _summary(context, checks, r, fix);
+    if (r == null) return const SizedBox(height: 40);
+    final stuck = widget.clearSwitches;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _summary(context, checks, r, fix),
+      if (stuck != null && firstMissing(r) != null) ...[
+        const SizedBox(height: Kit.s3),
+        SwitchesStuck(clear: stuck, onCleared: read),
+      ],
+    ]);
   }
 }

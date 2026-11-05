@@ -710,6 +710,56 @@ def setup_checks(c):
            not missing, "; ".join(missing))
 
 
+CLEAR_SWITCHES = "Switch is on but still not working: clears our three switches only, fixed in code (t31)"
+SERVER_ANSWERS = "Ready asks --server over IPC, a new process reads the switches, a switch going on restarts the agent (t31)"
+
+
+def switch_recovery_checks(c):
+    """v1.7 ticket 31. tccutil with no bundle id resets every app on the Mac, so the argument list is
+    pinned here and nothing else in the app may run it."""
+    home, settings, setup, access = (c.read(rebrand.HOME), c.read(rebrand.SETTINGS), c.read(SETUP_DART),
+                                     c.read("flutter/lib/desktop/kit/access.dart"))
+    bad = [n for n, ok in [
+        ("bundle id is ours", f"const kBundleId = '{AGENT}';" in access),
+        ("the three services", "const kSwitchServices = ['Accessibility', 'ScreenCapture', 'ListenEvent'];" in access),
+        ("fixed arguments", "run('/usr/bin/tccutil', ['reset', service, kBundleId]);" in access),
+        ("one call site", access.count("tccutil'") == 1),
+        ("takes no bundle or service from a caller", "Future<bool> clearSwitches(RunProcess run) async {" in access),
+        ("nothing else runs tccutil", not any("tccutil" in c.read(rel) for rel in (rebrand.HOME, rebrand.SETTINGS, SETUP_DART))),
+        ("Setup offers it", "clearSwitches: isMacOS ? boringClearSwitches : null," in home
+         and "clear: clear, onCleared: _cleared)" in setup),
+        ("Access offers it", "access: AccessSection(checks: boringAccessChecks(), clearSwitches: isMacOS ? boringClearSwitches : null)," in settings
+         and "SwitchesStuck(clear: widget.clearSwitches!, onCleared: read)" in access),
+        ("clears, restarts --server, asks again, opens the pane",
+         all(n in home for n in ("final ok = await clearSwitches(Process.run);", "boringServeWatch.forget();",
+                                 "if (up && !await restartAgent(Process.run, await _boringUidNow()))",
+                                 "launchUrl(Uri.parse(kScreenRecordingPane));"))),
+    ] if not ok]
+    c.fact(CLEAR_SWITCHES, not bad, "; ".join(bad))
+
+    ipc, mac, core = c.read("src/ipc.rs"), c.read("src/platform/macos.rs"), c.read("src/core_main.rs")
+    bad = [n for n, ok in [
+        ("--server answers over IPC", 'name == "boring-serve-access"' in ipc
+         and "value = Some(crate::platform::macos::boring_access_line());" in ipc),
+        ("from its own process", all(n in mac for n in ("pub fn boring_access_line() -> String {", "yn(crate::is_server())",
+                                                         "yn(is_can_screen_recording(false))", "yn(is_process_trusted(false))",
+                                                         "yn(is_can_input_monitoring(false))"))),
+        ("a new process prints the same line", 'args[0] == "--boring-access"' in core
+         and 'println!("{}", crate::platform::macos::boring_access_line());' in core),
+        ("names agree", "const kServeAccessConfig = 'boring-serve-access';" in access
+         and "const kFreshCheckArg = '--boring-access';" in access),
+        ("Dart asks them", "bind.cmGetConfig(name: kServeAccessConfig)" in home
+         and "Process.run(Platform.resolvedExecutable, const [kFreshCheckArg])" in home),
+        ("the switch rows read --server", all(f"boringServeWatch.serves((a) => a.{w})" in home for w in ("screen", "control", "input"))),
+        ("the running row needs --server answering", "await boringServeWatch.answering();" in home),
+        ("a switch going on restarts the agent", "restart: () async => restartAgent(Process.run, await _boringUidNow())," in home),
+        ("never during a session", "if (s.sessions > 0 || !mayRestart() || _restarts >= maxRestarts) return;" in access),
+        ("Setup reads it", "switchesNow: boringServeWatch.switchesNow," in home),
+        ("Setup comes back after Quit & Reopen", "bind.mainGetLocalOption(key: kSetupStepOption).isNotEmpty) _boringSetup = true;" in home),
+    ] if not ok]
+    c.fact(SERVER_ANSWERS, not bad, "; ".join(bad))
+
+
 def windows_checks(c):
     """v1.7 ticket 12 (ADRs 0006, 0007): the v1.7 UI on Windows, Setup's reach step, the
     installer's app rule, and a Windows update path off the same signed version file."""
@@ -1462,7 +1512,7 @@ def bundle_checks(c):
     home, settings, access = c.read(rebrand.HOME), c.read(rebrand.SETTINGS), c.read("flutter/lib/desktop/kit/access.dart")
     bad = [n for n, ok in [
         ("Home's not-ready line", "AccessSummary(checks: boringAccessChecks())," in home),
-        ("Settings' Access section", "access: AccessSection(checks: boringAccessChecks())," in settings),
+        ("Settings' Access section", "access: AccessSection(checks: boringAccessChecks()," in settings),
         ("remote access is its own switch", "remoteAccess: bind.mainIsInstalledDaemon(prompt: false) &&" in settings
          and "await mainSetBoolOption(kOptionStopService, !on);" in settings
          and settings.count("kOptionStopService") == 2 and "openAtLoginPlist(" in settings),
@@ -1833,6 +1883,7 @@ def run_checks(root):
     simple_settings_checks(c)  # v1.7 t09
     trust_checks(c, cfg)  # v1.7 t04
     setup_checks(c)  # v1.7 t06
+    switch_recovery_checks(c)  # v1.7 t31
     windows_checks(c)  # v1.7 t12
     high_efficiency_checks(c)  # v1.7 t05
     rust_hook_checks(c)  # v1.7 t02-t05

@@ -90,18 +90,19 @@ const setupCopy = <String, String>{
   'name.title@windows': 'Name this computer',
   // Screen 2 (Mac)
   'allow.title': 'Let Boring Remote see and control this Mac',
-  'allow.body': 'Click each button. System Settings opens. Turn on the switch next to “Boring Remote”.',
+  'allow.body': 'Click the button. System Settings opens. Turn on the switch next to “Boring Remote”.',
+  'allow.progress': 'Switch {n} of {total}',
   'allow.screen': 'Let Boring Remote see this screen',
   'allow.screen.button': 'Open Screen Recording',
   'allow.control': 'Let Boring Remote use the mouse and keyboard',
   'allow.control.button': 'Open Accessibility',
   'allow.on': 'On',
-  'allow.picture': 'Turn this on:',
   'allow.box': 'If a box pops up first, click “Open System Settings”.',
   'allow.password': "Your Mac may ask for your password or fingerprint. That's normal.",
   'allow.quit': 'If your Mac asks to quit Boring Remote, click “Quit & Reopen”. Setup comes back to this screen.',
   'allow.missing': 'No “Boring Remote” in the list? Click the + under the list, then pick Boring Remote in Applications.',
-  'allow.seen': "You'll see a green check next to each one once it's on.",
+  'allow.waiting': "Waiting for that switch. This moves on by itself once it's on.",
+  'allow.all': 'All the switches are on.',
   'allow.skip.why': "If you skip, people who connect won't see this Mac's screen or be able to click anything. "
       'You can finish this later in Settings.',
   // Screen 2 (Windows, ticket 12)
@@ -161,6 +162,17 @@ List<_Screen> _screensFor(SetupPlatform p) => [
       _Screen.password,
     ];
 
+/// One switch in System Settings, and what Setup says about it.
+class _MacSwitch {
+  final String name, what, button, pane;
+  final bool on;
+
+  /// macOS shows “Quit & Reopen” after this one.
+  final bool asksToQuit;
+  const _MacSwitch(
+      {required this.name, required this.what, required this.button, required this.pane, required this.on, this.asksToQuit = false});
+}
+
 /// Setup (v1.7): first launch walks three screens, one thing to do on each.
 /// Bridge-free; the home page passes data and callbacks.
 class SetupFlow extends StatefulWidget {
@@ -183,6 +195,17 @@ class SetupFlow extends StatefulWidget {
   final bool Function()? canMonitorInput;
   final void Function(String url) openPane;
   final Duration pollEvery;
+
+  /// A better read than the three above when there is one (kit/access.dart, ServeWatch): what macOS
+  /// says now, not what this process was told when it started. Null keeps the three above.
+  final Future<MacAccess?> Function()? switchesNow;
+
+  /// "Switch is on but still not working?": clears the switches, asks again, opens System Settings.
+  /// Null hides it.
+  final Future<bool> Function()? clearSwitches;
+
+  /// How long the last green check stays up before Setup moves on by itself.
+  final Duration moveOnAfter;
 
   /// Windows: polled while screen 2 shows (the rule is there); [allowReach] asks Windows to add it.
   final Future<bool> Function() canBeReached;
@@ -221,6 +244,9 @@ class SetupFlow extends StatefulWidget {
     required this.onStep,
     required this.onDone,
     this.canMonitorInput,
+    this.switchesNow,
+    this.clearSwitches,
+    this.moveOnAfter = const Duration(milliseconds: 1200),
     this.welcome = true,
     this.ready = true,
     this.readyChecks = const [],
@@ -242,6 +268,9 @@ class _SetupFlowState extends State<SetupFlow> {
   bool _confirmSkip = false;
   bool _saved = false;
   bool _seeScreen = false, _control = false, _input = false;
+  String? _opened; // the pane the person clicked through to, for "Waiting for that switch"
+  bool _sawMissing = false, _reading = false;
+  Timer? _moveOn;
   late bool _welcome = widget.welcome && _step == 0;
   bool _ready = false, _copied = false;
   bool _reached = false, _reachFailed = false;
@@ -264,6 +293,7 @@ class _SetupFlowState extends State<SetupFlow> {
   @override
   void dispose() {
     _poll?.cancel();
+    _moveOn?.cancel();
     _name.dispose();
     _password.dispose();
     super.dispose();
@@ -271,9 +301,12 @@ class _SetupFlowState extends State<SetupFlow> {
 
   void _enter() {
     _poll?.cancel();
+    _moveOn?.cancel();
+    _moveOn = null;
     if (_screen == _Screen.allow) {
       _read();
-      _poll = Timer.periodic(widget.pollEvery, (_) => setState(_read));
+      _afterRead();
+      _poll = Timer.periodic(widget.pollEvery, (_) => _tick());
     }
     if (_screen == _Screen.reach) {
       _readReach();
@@ -304,7 +337,69 @@ class _SetupFlowState extends State<SetupFlow> {
     _input = widget.canMonitorInput?.call() ?? true;
   }
 
+  bool get _allOn => _seeScreen && _control && _input;
+
+  /// Reads only. Nothing here opens a pane or raises a window: the person may be in the middle of
+  /// System Settings, so the next switch waits for them to click.
+  Future<void> _tick() async {
+    if (widget.switchesNow == null) {
+      setState(_read);
+      _afterRead();
+      return;
+    }
+    if (_reading) return;
+    _reading = true;
+    MacAccess? a;
+    try {
+      a = await widget.switchesNow!();
+    } catch (_) {}
+    _reading = false;
+    if (!mounted || _welcome || _screen != _Screen.allow) return;
+    setState(() {
+      if (a == null) {
+        _read();
+      } else {
+        _seeScreen = a.screen;
+        _control = a.control;
+        _input = widget.canMonitorInput == null || a.input;
+      }
+    });
+    _afterRead();
+  }
+
+  /// Moves on by itself, but only after a switch went on while this screen was up. Opened with
+  /// everything already on, it shows that and waits for Continue.
+  void _afterRead() {
+    if (!_allOn) {
+      _sawMissing = true;
+      _moveOn?.cancel();
+      _moveOn = null;
+    } else if (_sawMissing && _moveOn == null) {
+      _moveOn = Timer(widget.moveOnAfter, () {
+        _moveOn = null;
+        if (mounted && _allOn && _screen == _Screen.allow) _advance();
+      });
+    }
+  }
+
+  void _openSwitch(_MacSwitch s) {
+    setState(() => _opened = s.pane);
+    widget.openPane(s.pane);
+  }
+
+  void _cleared() {
+    setState(() {
+      _seeScreen = _control = false;
+      _input = widget.canMonitorInput == null;
+      _opened = kScreenRecordingPane; // the clear already opened the first pane
+    });
+    _afterRead();
+    _tick();
+  }
+
   void _advance() {
+    _moveOn?.cancel();
+    _moveOn = null;
     if (_step == _screens.length - 1) {
       _poll?.cancel();
       if (widget.ready && !_ready) {
@@ -436,7 +531,7 @@ class _SetupFlowState extends State<SetupFlow> {
               Text(_copy('ready.ok')),
             ])
           else
-            AccessStatus(checks: widget.readyChecks),
+            AccessStatus(checks: widget.readyChecks, clearSwitches: widget.clearSwitches),
           const SizedBox(height: Kit.s4),
           Text(_copy('ready.other').replaceFirst('{name}', _shownAs)),
           const SizedBox(height: Kit.s4),
@@ -499,9 +594,6 @@ class _SetupFlowState extends State<SetupFlow> {
         ],
       );
 
-  Widget _allowRow(TextTheme t, {required bool on, required String what, required String button, required String pane}) =>
-      _row(t, on: on, what: what, button: button, onPressed: () => widget.openPane(pane));
-
   Widget _row(TextTheme t, {required bool on, required String what, required String button, required VoidCallback onPressed}) =>
       Container(
         padding: const EdgeInsets.all(Kit.s4),
@@ -522,49 +614,114 @@ class _SetupFlowState extends State<SetupFlow> {
         ]),
       );
 
+  List<_MacSwitch> get _switches => [
+        _MacSwitch(
+            name: AccessWords.screen,
+            what: _copy('allow.screen'),
+            button: _copy('allow.screen.button'),
+            pane: kScreenRecordingPane,
+            on: _seeScreen,
+            asksToQuit: true),
+        _MacSwitch(
+            name: AccessWords.control,
+            what: _copy('allow.control'),
+            button: _copy('allow.control.button'),
+            pane: kAccessibilityPane,
+            on: _control),
+        if (widget.canMonitorInput != null)
+          _MacSwitch(
+              name: AccessWords.input,
+              what: _copy('allow.input'),
+              button: _copy('allow.input.button'),
+              pane: kInputMonitoringPane,
+              on: _input,
+              asksToQuit: true),
+      ];
+
+  /// Where this switch sits among the rest: done, this one, still to come.
+  Widget _progress(TextTheme t, List<_MacSwitch> all, int at) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+              _copy('allow.progress').replaceFirst('{n}', '${at + 1}').replaceFirst('{total}', '${all.length}'),
+              style: t.bodySmall),
+          const SizedBox(height: Kit.s2),
+          Wrap(spacing: Kit.s4, runSpacing: Kit.s1, children: [
+            for (var i = 0; i < all.length; i++)
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(
+                    all[i].on
+                        ? Icons.check_circle
+                        : i == at
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                    size: 16,
+                    color: all[i].on
+                        ? Kit.ok
+                        : i == at
+                            ? Kit.paper
+                            : Kit.muted,
+                    semanticLabel: all[i].on ? _copy('allow.on') : null),
+                const SizedBox(width: Kit.s1),
+                Text(all[i].name, style: t.bodySmall),
+              ]),
+          ]),
+        ],
+      );
+
   Widget _allowScreen(TextTheme t) {
-    final both = _seeScreen && _control && _input;
+    final all = _switches;
+    final at = all.indexWhere((s) => !s.on);
+    final clear = widget.clearSwitches;
+    if (at < 0) {
+      return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.check_circle, color: Kit.ok),
+          const SizedBox(width: Kit.s2),
+          Text(_copy('allow.all')),
+        ]),
+        const SizedBox(height: Kit.s5),
+        _primary(_copy('next'), _advance),
+        if (clear != null) ...[
+          const SizedBox(height: Kit.s6),
+          SwitchesStuck(key: const ValueKey('switches-stuck'), clear: clear, onCleared: _cleared),
+        ],
+      ]);
+    }
+    final s = all[at];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        _progress(t, all, at),
+        const SizedBox(height: Kit.s5),
+        Text(s.what, style: t.titleMedium),
+        const SizedBox(height: Kit.s2),
         Text(_copy('allow.body')),
         const SizedBox(height: Kit.s4),
-        _allowRow(t,
-            on: _seeScreen,
-            what: _copy('allow.screen'),
-            button: _copy('allow.screen.button'),
-            pane: kScreenRecordingPane),
-        const SizedBox(height: Kit.s2),
-        _allowRow(t,
-            on: _control,
-            what: _copy('allow.control'),
-            button: _copy('allow.control.button'),
-            pane: kAccessibilityPane),
-        if (widget.canMonitorInput != null) ...[
+        Wrap(spacing: Kit.s4, runSpacing: Kit.s2, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          FilledButton(onPressed: () => _openSwitch(s), child: Text(s.button)),
+          const _SwitchPicture(),
+        ]),
+        if (_opened == s.pane) ...[
           const SizedBox(height: Kit.s2),
-          _allowRow(t,
-              on: _input,
-              what: _copy('allow.input'),
-              button: _copy('allow.input.button'),
-              pane: kInputMonitoringPane),
+          Text(_copy('allow.waiting'), style: t.bodySmall),
         ],
         const SizedBox(height: Kit.s4),
-        Text(_copy('allow.picture'), style: t.bodySmall),
-        const SizedBox(height: Kit.s2),
-        const _SwitchPicture(),
-        const SizedBox(height: Kit.s3),
-        Text(_copy('allow.seen'), style: t.bodySmall),
-        const SizedBox(height: Kit.s2),
         Text(_copy('allow.box'), style: t.bodySmall),
         const SizedBox(height: Kit.s2),
         Text(_copy('allow.password'), style: t.bodySmall),
-        const SizedBox(height: Kit.s2),
-        Text(_copy('allow.quit'), style: t.bodySmall),
+        if (s.asksToQuit) ...[
+          const SizedBox(height: Kit.s2),
+          Text(_copy('allow.quit'), style: t.bodySmall),
+        ],
         const SizedBox(height: Kit.s2),
         Text(_copy('allow.missing'), style: t.bodySmall),
-        const SizedBox(height: Kit.s5),
-        _primary(_copy('next'), both ? _advance : null),
-        if (!both) ...[const SizedBox(height: Kit.s2), _skip(t, _copy('allow.skip.why'))],
+        if (clear != null) ...[
+          const SizedBox(height: Kit.s5),
+          SwitchesStuck(key: const ValueKey('switches-stuck'), clear: clear, onCleared: _cleared),
+        ],
+        const SizedBox(height: Kit.s4),
+        _skip(t, _copy('allow.skip.why')),
       ],
     );
   }

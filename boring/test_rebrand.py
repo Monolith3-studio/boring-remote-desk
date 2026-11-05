@@ -403,6 +403,56 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.HOME, "        readyChecks: boringAccessChecks(),\n", "")
         self.assert_check_fails("Setup wired: first launch, Settings, this Mac's name, System Settings panes (v1.7 t06)")
 
+    def test_clear_switches_without_our_bundle_id_fails_check(self):
+        # tccutil with no bundle id resets every app on the Mac.
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/access.dart", "['reset', service, kBundleId]", "['reset', service]")
+        self.assert_check_fails(check.CLEAR_SWITCHES)
+
+    def test_clear_switches_on_another_bundle_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/access.dart", "const kBundleId = 'io.boringlabs.remote.agent';",
+                  "const kBundleId = 'com.example.other';")
+        self.assert_check_fails(check.CLEAR_SWITCHES)
+
+    def test_clear_switches_resetting_everything_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/access.dart", "const kSwitchServices = ['Accessibility', 'ScreenCapture', 'ListenEvent'];",
+                  "const kSwitchServices = ['All'];")
+        self.assert_check_fails(check.CLEAR_SWITCHES)
+
+    def test_tccutil_anywhere_else_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "  final ok = await clearSwitches(Process.run);\n",
+                  "  final ok = await clearSwitches(Process.run);\n  await Process.run('tccutil', ['reset', 'All']);\n")
+        self.assert_check_fails(check.CLEAR_SWITCHES)
+
+    def test_access_without_the_way_out_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, ", clearSwitches: isMacOS ? boringClearSwitches : null), // v1.7 t17, t31", "), // v1.7 t17, t31")
+        self.assert_check_fails(check.CLEAR_SWITCHES)
+
+    def test_ready_reading_the_window_again_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "read: () => boringServeWatch.serves((a) => a.control),", "read: () async => bind.mainIsProcessTrusted(prompt: false),")
+        self.assert_check_fails(check.SERVER_ANSWERS)
+
+    def test_server_not_answering_for_itself_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", 'name == "boring-serve-access"', 'name == "boring-serve-acces"')
+        self.assert_check_fails(check.SERVER_ANSWERS)
+
+    def test_no_new_process_read_fails_check(self):
+        self.rebrand()
+        self.edit("src/core_main.rs", 'args[0] == "--boring-access"', 'args[0] == "--boring-acces"')
+        self.assert_check_fails(check.SERVER_ANSWERS)
+
+    def test_auto_restart_during_a_session_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/kit/access.dart", "if (s.sessions > 0 || !mayRestart() || _restarts >= maxRestarts) return;",
+                  "if (!mayRestart() || _restarts >= maxRestarts) return;")
+        self.assert_check_fails(check.SERVER_ANSWERS)
+
     def test_lan_discovery_locked_off_fails_check(self):
         self.rebrand()
         self.edit(rebrand.HBB, '("direct-server", "Y")',

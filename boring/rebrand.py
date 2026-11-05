@@ -1486,7 +1486,7 @@ SIMPLE_SETTINGS_METHOD = (
     "              debugPrint('Settings: open at login: $e');\n"
     "            }\n"
     "          },\n"
-    "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n"
+    "          access: AccessSection(checks: boringAccessChecks(), clearSwitches: isMacOS ? boringClearSwitches : null), // v1.7 t17, t31\n"
     "          // v1.7 t04: whoever is waiting right now, Allow / Don't allow (kit/approval.dart)\n"
     "          waiting: WaitingApprovals(\n"
     "            waiting: ApprovalDesk.waitingNow,\n"
@@ -1923,6 +1923,8 @@ T06_SETUP_PAGE = (
     "        canSeeScreen: () => bind.mainIsCanScreenRecording(prompt: false),\n"
     "        canMonitorInput: () => bind.mainIsCanInputMonitoring(prompt: false), // v1.7 t21: the third switch\n"
     "        canControl: () => bind.mainIsProcessTrusted(prompt: false),\n"
+    "        switchesNow: boringServeWatch.switchesNow, // v1.7 t31: reads macOS now, and keeps --server caught up\n"
+    "        clearSwitches: isMacOS ? boringClearSwitches : null,\n"
     "        openPane: (url) {\n"
     "          // Asking once puts Boring Remote in the pane's list; then open the pane itself.\n"
     "          if (url == kScreenRecordingPane) bind.mainIsCanScreenRecording(prompt: true);\n"
@@ -1957,7 +1959,7 @@ T06_RUN_AGAIN = (
     "              appBar: AppBar(backgroundColor: Kit.ink, foregroundColor: Kit.paper),\n"
     "              body: boringSetupPage(onDone: () => Navigator.of(ctx).pop()),\n"
     "            ),\n"
-    "          )),\n")
+    "          )).then((_) => bind.mainSetLocalOption(key: kSetupStepOption, value: '')), // t31: left Setup on purpose\n")
 # The import, the first-launch branch and the Settings button land inside t01's and t09's own
 # patches (as t04 did, see _fold_v17), so a second rebrand still finds their text whole and stays a no-op.
 T06_FOLDS = {
@@ -1979,7 +1981,9 @@ PATCHES += [
      "Setup state"),
     (HOME, "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n",
      "    if (isMacOS) bind.mainLoadRecentPeers(); // Mac Home lists recents\n"
-     "    if (isMacOS) _boringSetup = setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption));\n",
+     "    if (isMacOS) _boringSetup = setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption));\n"
+     "    // v1.7 t31: macOS's Quit & Reopen killed Setup partway, also when Settings opened it again.\n"
+     "    if (isMacOS && bind.mainGetLocalOption(key: kSetupStepOption).isNotEmpty) _boringSetup = true;\n",
      "Setup on first launch only"),
 ]
 
@@ -2413,6 +2417,34 @@ PATCHES += [
 T17_ACCESS_CHECKS = (
     "// boring-remote: v1.7 t17. What has to be true before another computer can connect.\n"
     "Future<String>? _boringUid;\n"
+    "Future<String> _boringUidNow() => _boringUid ??= Process.run('id', ['-u']).then((r) => '${r.stdout}'.trim());\n"
+    "// v1.7 t31: Ready means what --server can do. It answers for itself over IPC; a new copy of the exe\n"
+    "// reads the switches, since macOS can keep a running process's answer until it restarts.\n"
+    "final boringServeWatch = ServeWatch(\n"
+    "    askServer: () => bind.cmGetConfig(name: kServeAccessConfig).then<MacAccess?>(MacAccess.parse).catchError((_) => null),\n"
+    "    askFresh: () => Process.run(Platform.resolvedExecutable, const [kFreshCheckArg])\n"
+    "        .then<MacAccess?>((r) => r.exitCode == 0 ? MacAccess.parse('${r.stdout}') : null)\n"
+    "        .catchError((_) => null),\n"
+    "    askWindow: () => MacAccess(\n"
+    "        screen: bind.mainIsCanScreenRecording(prompt: false),\n"
+    "        control: bind.mainIsProcessTrusted(prompt: false),\n"
+    "        input: bind.mainIsCanInputMonitoring(prompt: false)),\n"
+    "    restart: () async => restartAgent(Process.run, await _boringUidNow()),\n"
+    "    mayRestart: () => !mainGetBoolOptionSync(kOptionStopService));\n"
+    "// \"Switch is on but still not working?\": clears ours (kit/access.dart), restarts --server so it holds no\n"
+    "// old answer, asks macOS again and opens the first pane. Only ever from a click.\n"
+    "Future<bool> boringClearSwitches() async {\n"
+    "  // Only --server itself: with the window standing in, starting --server makes it close the window.\n"
+    "  final up = await boringServeWatch.answering();\n"
+    "  final ok = await clearSwitches(Process.run);\n"
+    "  boringServeWatch.forget();\n"
+    "  if (ok) {\n"
+    "    bind.mainIsCanScreenRecording(prompt: true);\n"
+    "    launchUrl(Uri.parse(kScreenRecordingPane));\n"
+    "  }\n"
+    "  if (up && !await restartAgent(Process.run, await _boringUidNow())) debugPrint('Access: --server still down');\n"
+    "  return ok;\n"
+    "}\n"
     "List<AccessCheck> boringAccessChecks() {\n"
     "  Future<bool> listening() => Socket.connect('127.0.0.1', kDirectLinkPort, timeout: const Duration(seconds: 1))\n"
     "      .then((s) {\n"
@@ -2447,21 +2479,26 @@ T17_ACCESS_CHECKS = (
     "      AccessCheck(label: AccessWords.listening, why: AccessWords.listeningWhy, read: listening, fix: turnOn),\n"
     "    ];\n"
     "  }\n"
-    "  Future<String> uid() => _boringUid ??= Process.run('id', ['-u']).then((r) => '${r.stdout}'.trim());\n"
-    "  Future<bool> running() async => Process.run('launchctl', ['print', 'gui/${await uid()}/$kAgentLabel'])\n"
-    "      .then((r) => r.exitCode == 0 && agentRunning('${r.stdout}'))\n"
-    "      .catchError((_) => false);\n"
+    "  Future<String> uid() => _boringUidNow();\n"
+    "  Future<bool> running() async =>\n"
+    "      await Process.run('launchctl', ['print', 'gui/${await uid()}/$kAgentLabel'])\n"
+    "          .then((r) => r.exitCode == 0 && agentRunning('${r.stdout}'))\n"
+    "          .catchError((_) => false) &&\n"
+    "      await boringServeWatch.answering(); // t31: up and answering for itself\n"
     "  // kickstart, and bootout + bootstrap when launchd holds the job at spawn failed (kit/access.dart).\n"
     "  Future<void> startAgent() async {\n"
     "    await turnOn();\n"
     "    if (!await restartAgent(Process.run, await uid())) debugPrint('Access: --server still down');\n"
     "  }\n"
-    "  void pane(String url) => launchUrl(Uri.parse(url));\n"
+    "  void pane(String url) {\n"
+    "    boringServeWatch.forget(); // t31: a Fix click gets --server another try\n"
+    "    launchUrl(Uri.parse(url));\n"
+    "  }\n"
     "  return [\n"
     "    AccessCheck(\n"
     "        label: AccessWords.screen,\n"
     "        why: AccessWords.screenWhy,\n"
-    "        read: () async => bind.mainIsCanScreenRecording(prompt: false),\n"
+    "        read: () => boringServeWatch.serves((a) => a.screen), // t31: --server's own answer\n"
     "        fix: () async {\n"
     "          bind.mainIsCanScreenRecording(prompt: true); // CGRequestScreenCaptureAccess: macOS asks, and lists us\n"
     "          pane(kScreenRecordingPane);\n"
@@ -2469,7 +2506,7 @@ T17_ACCESS_CHECKS = (
     "    AccessCheck(\n"
     "        label: AccessWords.control,\n"
     "        why: AccessWords.controlWhy,\n"
-    "        read: () async => bind.mainIsProcessTrusted(prompt: false),\n"
+    "        read: () => boringServeWatch.serves((a) => a.control),\n"
     "        fix: () async {\n"
     "          bind.mainIsProcessTrusted(prompt: true);\n"
     "          pane(kAccessibilityPane);\n"
@@ -2477,7 +2514,7 @@ T17_ACCESS_CHECKS = (
     "    AccessCheck(\n"
     "        label: AccessWords.input,\n"
     "        why: AccessWords.inputWhy,\n"
-    "        read: () async => bind.mainIsCanInputMonitoring(prompt: false),\n"
+    "        read: () => boringServeWatch.serves((a) => a.input),\n"
     "        fix: () async {\n"
     "          bind.mainIsCanInputMonitoring(prompt: true);\n"
     "          pane(kInputMonitoringPane);\n"
@@ -2488,6 +2525,54 @@ T17_ACCESS_CHECKS = (
     "  ];\n"
     "}\n\n")
 T17_ACCESS_IMPORT = "import 'package:flutter_hbb/desktop/kit/access.dart';\n"
+# v1.7 t31: --server says what it can do, in its own process, over the IPC config call the window
+# already uses (bind.cmGetConfig). A new copy of the exe prints the same line and exits before any
+# window or log opens: macOS can keep a running process's Screen Recording answer until it restarts.
+T31_ACCESS_LINE = (
+    "/// boring-remote (v1.7 t31): what this process can do, as macOS tells it. kit/access.dart reads\n"
+    "/// this line (MacAccess.parse). Remote sessions, so an automatic restart never drops one.\n"
+    "pub fn boring_access_line() -> String {\n"
+    "    let yn = |on: bool| if on { \"Y\" } else { \"N\" };\n"
+    "    let sessions = crate::server::AUTHED_CONNS\n"
+    "        .lock()\n"
+    "        .unwrap()\n"
+    "        .iter()\n"
+    "        .filter(|x| x.conn_type == crate::server::AuthConnType::Remote)\n"
+    "        .count();\n"
+    "    format!(\n"
+    "        \"server={} screen={} control={} input={} sessions={}\",\n"
+    "        yn(crate::is_server()),\n"
+    "        yn(is_can_screen_recording(false)),\n"
+    "        yn(is_process_trusted(false)),\n"
+    "        yn(is_can_input_monitoring(false)),\n"
+    "        sessions\n"
+    "    )\n"
+    "}\n\n")
+T31_IPC = (
+    '                } else if name == "boring-serve-access" {\n'
+    "                    // boring-remote (v1.7 t31): Ready asks --server, not the window.\n"
+    '                    #[cfg(target_os = "macos")]\n'
+    "                    {\n"
+    "                        value = Some(crate::platform::macos::boring_access_line());\n"
+    "                    }\n"
+    '                    #[cfg(not(target_os = "macos"))]\n'
+    "                    {\n"
+    "                        value = None;\n"
+    "                    }\n")
+T31_FRESH = (
+    '        } else if args[0] == "--boring-access" {\n'
+    "            // boring-remote (v1.7 t31): a new process's read of the switches, for Setup and Access.\n"
+    '            #[cfg(target_os = "macos")]\n'
+    '            println!("{}", crate::platform::macos::boring_access_line());\n'
+    "            return None;\n")
+PATCHES += [
+    ("src/platform/macos.rs", "pub fn is_can_screen_recording(prompt: bool) -> bool {\n",
+     T31_ACCESS_LINE + "pub fn is_can_screen_recording(prompt: bool) -> bool {\n", "what this process can do (t31)"),
+    ("src/ipc.rs", '                } else if name == "trusted-devices" {\n',
+     T31_IPC + '                } else if name == "trusted-devices" {\n', "--server answers for itself (t31)"),
+    ("src/core_main.rs", '        } else if args[0] == "--build-date" {\n',
+     T31_FRESH + '        } else if args[0] == "--build-date" {\n', "a new process reads the switches (t31)"),
+]
 PATCHES += [
     (HOME, "class _DesktopHomePageState extends State<DesktopHomePage>\n",
      T17_ACCESS_CHECKS + "class _DesktopHomePageState extends State<DesktopHomePage>\n", "Access checks (t17)"),
@@ -2572,8 +2657,8 @@ PATCHES += [
 T20_FOLDS = [
     (HOME, "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n",
      T20_NOTICE + "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n"),
-    (SETTINGS, "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n",
-     "          access: AccessSection(checks: boringAccessChecks()), // v1.7 t17\n" + T20_HELP),
+    (SETTINGS, "          access: AccessSection(checks: boringAccessChecks(), clearSwitches: isMacOS ? boringClearSwitches : null), // v1.7 t17, t31\n",
+     "          access: AccessSection(checks: boringAccessChecks(), clearSwitches: isMacOS ? boringClearSwitches : null), // v1.7 t17, t31\n" + T20_HELP),
 ]
 _require(all(sum(r == rel and a in new for r, _, new, _ in PATCHES) == 1 for rel, a, _ in T20_FOLDS),
          "t20's Home notice or Settings Help anchor moved")

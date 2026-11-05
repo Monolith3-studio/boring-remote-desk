@@ -34,6 +34,8 @@ SetupFlow flow({
   bool Function()? canMonitorInput,
   List<AccessCheck> readyChecks = const [],
   Future<void> Function(String)? copyText,
+  Future<MacAccess?> Function()? switchesNow,
+  Future<bool> Function()? clearSwitches,
 }) =>
     SetupFlow(
       platform: platform,
@@ -54,6 +56,8 @@ SetupFlow flow({
       canMonitorInput: canMonitorInput,
       readyChecks: readyChecks,
       copyText: copyText ?? (_) async {},
+      switchesNow: switchesNow,
+      clearSwitches: clearSwitches,
     );
 
 void main() {
@@ -94,44 +98,156 @@ void main() {
     });
   });
 
-  group('screen 2: see and control this Mac', () {
-    testWidgets('buttons open the exact System Settings panes', (tester) async {
-      final opened = <String>[];
-      await tester.pumpWidget(host(flow(startStep: 1, openPane: opened.add)));
+  group('screen 2: one switch at a time', () {
+    const after = Duration(milliseconds: 1200); // SetupFlow.moveOnAfter
+
+    /// Three switches, each turned on by the test.
+    SetupFlow three(Map<String, bool> on, {List<String>? opened, Future<bool> Function()? clear}) => flow(
+        startStep: 1,
+        openPane: opened?.add,
+        canSeeScreen: () => on['screen']!,
+        canControl: () => on['control']!,
+        canMonitorInput: () => on['input']!,
+        clearSwitches: clear);
+
+    testWidgets('shows only the first missing switch, with where it sits among the three', (tester) async {
+      await tester.pumpWidget(host(three({'screen': false, 'control': false, 'input': false})));
       expect(find.text('Step 2 of 3'), findsOneWidget);
+      expect(find.text('Switch 1 of 3'), findsOneWidget);
+      expect(find.text(setupCopy['allow.screen']!), findsOneWidget);
+      expect(find.text(setupCopy['allow.screen.button']!), findsOneWidget);
+      expect(find.text(setupCopy['allow.control.button']!), findsNothing);
+      expect(find.text(setupCopy['allow.input.button']!), findsNothing);
+      for (final name in [AccessWords.screen, AccessWords.control, AccessWords.input]) {
+        expect(find.text(name), findsOneWidget);
+      }
+    });
+
+    testWidgets('the button opens the exact pane for that switch', (tester) async {
+      final opened = <String>[];
+      final on = {'screen': false, 'control': false, 'input': false};
+      await tester.pumpWidget(host(three(on, opened: opened)));
       await tapText(tester, setupCopy['allow.screen.button']!);
+      await tester.pump();
+      expect(opened, ['x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture']);
+      expect(find.text(setupCopy['allow.waiting']!), findsOneWidget);
+      on['screen'] = true;
+      await tester.pump(const Duration(seconds: 1));
       await tapText(tester, setupCopy['allow.control.button']!);
-      expect(opened, [
-        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+      on['control'] = true;
+      await tester.pump(const Duration(seconds: 1));
+      await tapText(tester, setupCopy['allow.input.button']!);
+      expect(opened.skip(1), [
         'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent',
       ]);
     });
 
-    testWidgets('checks turn green live as each switch is turned on', (tester) async {
-      var screen = false, control = false;
-      await tester.pumpWidget(host(flow(startStep: 1, canSeeScreen: () => screen, canControl: () => control)));
-      expect(find.byIcon(Icons.check_circle), findsNothing);
-      FilledButton next() => tester.widget<FilledButton>(find.widgetWithText(FilledButton, setupCopy['next']!));
-      expect(next().onPressed, isNull);
+    testWidgets('moves on by itself and never opens a pane on its own', (tester) async {
+      final opened = <String>[];
+      final steps = <int>[];
+      final on = {'screen': false, 'control': false, 'input': false};
+      await tester.pumpWidget(host(SetupFlow(
+          computerName: Future.value('x'),
+          onName: (_) async {},
+          startStep: 1,
+          canSeeScreen: () => on['screen']!,
+          canControl: () => on['control']!,
+          canMonitorInput: () => on['input']!,
+          openPane: opened.add,
+          canBeReached: () async => false,
+          allowReach: () async {},
+          passwordSet: false,
+          setPassword: (_) async => true,
+          onStep: steps.add,
+          onDone: () {},
+          welcome: false,
+          ready: false)));
 
-      screen = true;
+      on['screen'] = true;
       await tester.pump(const Duration(seconds: 1));
-      expect(find.byIcon(Icons.check_circle), findsOneWidget);
+      expect(find.text('Switch 2 of 3'), findsOneWidget);
+      expect(find.text(setupCopy['allow.control']!), findsOneWidget);
       expect(find.text(setupCopy['allow.screen.button']!), findsNothing);
-      expect(next().onPressed, isNull);
 
-      control = true;
+      on['control'] = true;
       await tester.pump(const Duration(seconds: 1));
-      expect(find.byIcon(Icons.check_circle), findsNWidgets(2));
-      expect(next().onPressed, isNotNull);
+      expect(find.text('Switch 3 of 3'), findsOneWidget);
+      expect(find.text(setupCopy['allow.input']!), findsOneWidget);
+
+      on['input'] = true;
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.text(setupCopy['allow.all']!), findsOneWidget, reason: 'the last check stays up a moment');
+      expect(steps, isEmpty);
+      await tester.pump(after);
+      expect(find.text(setupCopy['password.title']!), findsOneWidget);
+      expect(steps, [2]);
+      expect(opened, isEmpty, reason: 'moving on must not take over System Settings while someone is in it');
+    });
+
+    testWidgets('opened with everything on: says so and waits for Continue', (tester) async {
+      await tester.pumpWidget(host(three({'screen': true, 'control': true, 'input': true})));
+      expect(find.text(setupCopy['allow.all']!), findsOneWidget);
+      await tester.pump(const Duration(seconds: 5));
+      expect(find.text(setupCopy['allow.title']!), findsOneWidget);
       await tapText(tester, setupCopy['next']!);
       await tester.pump();
       expect(find.text(setupCopy['password.title']!), findsOneWidget);
     });
 
-    testWidgets('already allowed shows green straight away', (tester) async {
-      await tester.pumpWidget(host(flow(startStep: 1, canSeeScreen: () => true, canControl: () => true)));
-      expect(find.byIcon(Icons.check_circle), findsNWidgets(2));
+    testWidgets('a switch going back off before Setup moves on keeps it here', (tester) async {
+      final on = {'screen': true, 'control': true, 'input': false};
+      await tester.pumpWidget(host(three(on)));
+      on['input'] = true;
+      await tester.pump(const Duration(seconds: 1));
+      on['input'] = false;
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump(after);
+      expect(find.text(setupCopy['allow.input']!), findsOneWidget);
+    });
+
+    testWidgets('Quit & Reopen is only mentioned for the switches where macOS asks it', (tester) async {
+      final on = {'screen': false, 'control': false, 'input': false};
+      await tester.pumpWidget(host(three(on)));
+      expect(find.text(setupCopy['allow.quit']!), findsOneWidget);
+      on['screen'] = true;
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.text(setupCopy['allow.quit']!), findsNothing);
+      on['control'] = true;
+      await tester.pump(const Duration(seconds: 1));
+      expect(find.text(setupCopy['allow.quit']!), findsOneWidget);
+    });
+
+    testWidgets('the window not noticing Screen Recording does not hold Setup up', (tester) async {
+      // macOS can keep a running process's answer until it restarts: the window still reads off.
+      var fresh = const MacAccess(screen: false, control: false, input: false);
+      await tester.pumpWidget(host(flow(
+          startStep: 1,
+          canSeeScreen: () => false,
+          canControl: () => false,
+          canMonitorInput: () => false,
+          switchesNow: () async => fresh)));
+      expect(find.text(setupCopy['allow.screen']!), findsOneWidget);
+      fresh = const MacAccess(screen: true, control: false, input: false);
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      expect(find.text(setupCopy['allow.control']!), findsOneWidget);
+      fresh = const MacAccess(screen: true, control: true, input: true);
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      await tester.pump(after);
+      expect(find.text(setupCopy['password.title']!), findsOneWidget);
+    });
+
+    testWidgets('no answer from the new read falls back on the window', (tester) async {
+      await tester.pumpWidget(host(flow(
+          startStep: 1,
+          canSeeScreen: () => true,
+          canControl: () => false,
+          switchesNow: () async => null)));
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      expect(find.text(setupCopy['allow.control']!), findsOneWidget);
     });
 
     testWidgets('skipping says what it costs before it skips', (tester) async {
@@ -157,6 +273,68 @@ void main() {
       final after = reads;
       await tester.pump(const Duration(seconds: 5));
       expect(reads, after);
+    });
+
+    group('Switch is on but still not working?', () {
+      testWidgets('hidden without a way to clear, offered with one button and what it costs', (tester) async {
+        await tester.pumpWidget(host(flow(startStep: 1)));
+        expect(find.text(AccessWords.stuckTitle), findsNothing);
+        await tester.pumpWidget(host(flow(startStep: 1, clearSwitches: () async => true)));
+        expect(find.text('Switch is on but still not working?'), findsOneWidget);
+        expect(find.textContaining("You'll need to turn them back on."), findsOneWidget);
+        expect(find.text(AccessWords.stuckButton), findsOneWidget);
+      });
+
+      testWidgets('clearing goes back to the first switch and says they are off', (tester) async {
+        final on = {'screen': true, 'control': false, 'input': false};
+        var cleared = 0;
+        await tester.pumpWidget(host(three(on, clear: () async {
+          cleared++;
+          on.updateAll((_, __) => false);
+          return true;
+        })));
+        expect(find.text(setupCopy['allow.control']!), findsOneWidget);
+        await tapText(tester, AccessWords.stuckButton);
+        await tester.pump();
+        await tester.pump();
+        expect(cleared, 1);
+        expect(find.text(setupCopy['allow.screen']!), findsOneWidget);
+        expect(find.text('Switch 1 of 3'), findsOneWidget);
+        expect(find.text(AccessWords.stuckDone), findsOneWidget);
+        expect(find.text(setupCopy['allow.waiting']!), findsOneWidget, reason: 'the clear already opened the pane');
+      });
+
+      testWidgets('offered with everything on too, and clearing from there goes back to the first switch', (tester) async {
+        final on = {'screen': true, 'control': true, 'input': true};
+        await tester.pumpWidget(host(three(on, clear: () async {
+          on.updateAll((_, __) => false);
+          return true;
+        })));
+        expect(find.text(setupCopy['allow.all']!), findsOneWidget);
+        await tapText(tester, AccessWords.stuckButton);
+        await tester.pump();
+        await tester.pump();
+        expect(find.text(setupCopy['allow.screen']!), findsOneWidget);
+        expect(find.text(AccessWords.stuckDone), findsOneWidget, reason: 'the word stays after the card changes');
+      });
+
+      testWidgets('a clear that failed says what to do and leaves the switch where it was', (tester) async {
+        final on = {'screen': true, 'control': false, 'input': false};
+        await tester.pumpWidget(host(three(on, clear: () async => false)));
+        await tapText(tester, AccessWords.stuckButton);
+        await tester.pump();
+        await tester.pump();
+        expect(find.text(AccessWords.stuckFailed), findsOneWidget);
+        expect(find.text(setupCopy['allow.control']!), findsOneWidget);
+      });
+
+      testWidgets('a clear that throws reads as failed', (tester) async {
+        await tester.pumpWidget(host(flow(startStep: 1, clearSwitches: () async => throw 'no')));
+        await tapText(tester, AccessWords.stuckButton);
+        await tester.pump();
+        await tester.pump();
+        expect(find.text(AccessWords.stuckFailed), findsOneWidget);
+      });
     });
   });
 
@@ -223,7 +401,7 @@ void main() {
       await tester.pumpWidget(host(flow(onStep: steps.add, canSeeScreen: () => true, canControl: () => true)));
       await tester.pump();
       await tapText(tester, setupCopy['next']!);
-      await tester.pump();
+      await tester.pumpAndSettle();
       await tapText(tester, setupCopy['next']!);
       await tester.pump();
       expect(steps, [1, 2]);
@@ -385,6 +563,21 @@ void main() {
     expect(hits, isEmpty);
   });
 
+  test('t31 words: plain, no em dash, no jargon, and they say the switches come back off', () {
+    const stuck = [
+      AccessWords.stuckTitle,
+      AccessWords.stuckBody,
+      AccessWords.stuckButton,
+      AccessWords.stuckDone,
+      AccessWords.stuckFailed,
+    ];
+    final jargon = RegExp(r'\b(permission|permissions|tcc|tccutil|reset|grant|signature|daemon|agent|server)\b', caseSensitive: false);
+    expect(stuck.where(jargon.hasMatch), isEmpty);
+    expect([...stuck, ...setupCopy.values].where((w) => w.contains('\u2014') || w.contains('\u2013')), isEmpty);
+    expect(AccessWords.stuckTitle, 'Switch is on but still not working?');
+    expect(AccessWords.stuckBody, contains("You'll need to turn them back on."));
+  });
+
   // v1.7 ticket 21: opened app to Ready, then the other computer.
   group('first run: welcome, then Ready and the other computer', () {
     testWidgets('a welcome comes first and is not a numbered step', (tester) async {
@@ -402,22 +595,6 @@ void main() {
       await tester.pumpWidget(host(flow(welcome: true, startStep: 2)));
       expect(find.text(setupCopy['welcome.title']!), findsNothing);
       expect(find.text(setupCopy['password.title']!), findsOneWidget);
-    });
-
-    testWidgets('the Mac step has all three switches when Input Monitoring is passed', (tester) async {
-      final opened = <String>[];
-      var input = false;
-      await tester.pumpWidget(host(flow(
-          startStep: 1, openPane: opened.add, canSeeScreen: () => true, canControl: () => true,
-          canMonitorInput: () => input)));
-      FilledButton next() => tester.widget<FilledButton>(find.widgetWithText(FilledButton, setupCopy['next']!));
-      expect(next().onPressed, isNull, reason: 'Continue waits for the third switch');
-      await tapText(tester, setupCopy['allow.input.button']!);
-      expect(opened, [kInputMonitoringPane]);
-      input = true;
-      await tester.pump(const Duration(seconds: 1));
-      expect(find.byIcon(Icons.check_circle), findsNWidgets(3));
-      expect(next().onPressed, isNotNull);
     });
 
     testWidgets('after the last step: Ready, the name it shows up as, and the download link', (tester) async {
@@ -460,6 +637,22 @@ void main() {
       await tester.tap(find.text(AccessWords.fix));
       await tester.pump();
       await tester.pump();
+      expect(find.text(AccessWords.ready), findsOneWidget);
+    });
+
+    testWidgets('Ready offers the way out only while something is missing', (tester) async {
+      var granted = false;
+      final checks = [AccessCheck(label: 'Screen Recording', why: '', read: () async => granted, fix: () async {})];
+      await tester.pumpWidget(host(flow(
+          ready: true, passwordSet: true, startStep: 2, readyChecks: checks, clearSwitches: () async => true)));
+      await tapText(tester, setupCopy['done']!);
+      await tester.pump();
+      await tester.pump();
+      expect(find.text(AccessWords.stuckTitle), findsOneWidget);
+      granted = true;
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pump();
+      expect(find.text(AccessWords.stuckTitle), findsNothing);
       expect(find.text(AccessWords.ready), findsOneWidget);
     });
 
