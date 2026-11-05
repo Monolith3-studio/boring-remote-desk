@@ -2,12 +2,14 @@
 //! lib.rs (nothing upstream is hand-edited), so their tests run from here, raw checkout or not.
 #![allow(dead_code)]
 
-use base::message_proto;
+use base::{fs, message_proto};
 
 #[path = "../src/bundle_move.rs"]
 mod bundle_move;
 #[path = "../src/direct_link.rs"]
 mod direct_link;
+#[path = "../src/file_speed.rs"]
+mod file_speed;
 #[path = "../src/high_efficiency.rs"]
 mod high_efficiency;
 #[path = "../src/lan.rs"]

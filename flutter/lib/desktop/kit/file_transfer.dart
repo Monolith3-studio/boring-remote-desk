@@ -19,6 +19,8 @@ class TransferJob {
     required this.total,
     this.error = '',
     this.delete = false,
+    this.speed = 0,
+    this.averageSpeed,
   });
 
   final int id;
@@ -33,6 +35,12 @@ class TransferJob {
   /// [toThisMac] means the file was on that Mac (the engine's isRemote).
   final bool delete;
 
+  /// What the engine reports while sending, in bytes per second.
+  final double speed;
+
+  /// The whole run's average, once it's done. See [TransferClock].
+  final double? averageSpeed;
+
   /// [state] is the engine's JobState name (none, inProgress, done, error, paused);
   /// [err] its error text, where 'cancel' and 'skipped' are not real errors.
   factory TransferJob.fromEngine({
@@ -44,6 +52,8 @@ class TransferJob {
     required int total,
     String err = '',
     bool delete = false,
+    double speed = 0,
+    double? averageSpeed,
   }) {
     final TransferPhase phase;
     var error = '';
@@ -72,6 +82,8 @@ class TransferJob {
       total: total,
       error: error,
       delete: delete,
+      speed: speed,
+      averageSpeed: averageSpeed,
     );
   }
 
@@ -83,11 +95,13 @@ class TransferJob {
       case TransferPhase.waiting:
         return 'Waiting';
       case TransferPhase.sending:
-        return '${(fraction * 100).round()}%';
+        final percent = '${(fraction * 100).round()}%';
+        return speed > 0 ? '$percent · ${kitSpeed(speed)}' : percent;
       case TransferPhase.paused:
         return 'Paused';
       case TransferPhase.done:
-        return 'Done';
+        final average = averageSpeed ?? 0;
+        return average > 0 ? 'Done · ${kitSpeed(average)} average' : 'Done';
       case TransferPhase.failed:
         return error == 'cancel' ? 'Cancelled' : "Didn't send: $error. Drag it across to try again.";
     }
@@ -103,6 +117,138 @@ class TransferJob {
       default:
         return 'Deleting from $where…';
     }
+  }
+}
+
+/// 108 MB/s, the decimal megabytes the OS's own file windows count in.
+String kitSpeed(double bytesPerSecond) {
+  if (bytesPerSecond >= 1e9) return '${(bytesPerSecond / 1e9).toStringAsFixed(1)} GB/s';
+  if (bytesPerSecond >= 1e6) return '${(bytesPerSecond / 1e6).round()} MB/s';
+  return '${(bytesPerSecond / 1e3).round()} KB/s';
+}
+
+/// Works out a job's average speed from what the list sees of it. It starts timing at the first
+/// bytes, so an overwrite question before them doesn't count, and Resume starts a new run.
+class TransferClock {
+  final _runs = <int, _TransferRun>{};
+
+  /// Call on every look at the job. The average comes back once [state] is 'done'.
+  double? observe(int id, String state, int finished, int total, DateTime now) {
+    final run = _runs[id];
+    if (state == 'inProgress') {
+      if (finished <= 0) return null;
+      if (run == null || run.ended != null) {
+        _runs[id] = _TransferRun(now, finished);
+      }
+      return null;
+    }
+    if (state != 'done') {
+      _runs.remove(id);
+      return null;
+    }
+    if (run == null) return null;
+    run.ended ??= now;
+    final millis = run.ended!.difference(run.started).inMilliseconds;
+    if (millis <= 0 || total <= run.startedAt) return null;
+    return (total - run.startedAt) * 1000 / millis;
+  }
+}
+
+class _TransferRun {
+  _TransferRun(this.started, this.startedAt);
+  final DateTime started;
+  final int startedAt;
+  DateTime? ended;
+}
+
+/// One thing the drive list can open.
+class TransferDrive {
+  const TransferDrive(this.label, this.path);
+  final String label;
+  final String path;
+}
+
+/// Where a computer keeps its list of drives, or null when it has no such place.
+/// [platform] is the engine's name for it (kPeerPlatformWindows, kPeerPlatformMacOS).
+String? transferDriveRoot(String platform) {
+  switch (platform) {
+    case 'Windows':
+      return '/';
+    case 'Mac OS':
+      return '/Volumes';
+  }
+  return null;
+}
+
+/// The engine's listing of [transferDriveRoot] as drives. On a Mac the startup disk is the one
+/// link in /Volumes, and it points at /.
+List<TransferDrive> transferDrivesFrom(
+    String platform, Iterable<({String name, bool directory, bool link})> entries) {
+  final drives = <TransferDrive>[];
+  for (final e in entries) {
+    if (e.name.isEmpty || e.name.startsWith('.') || !e.directory) continue;
+    if (platform == 'Windows') {
+      drives.add(TransferDrive(e.name, '${e.name}\\'));
+    } else {
+      drives.add(TransferDrive(e.name, e.link ? '/' : '/Volumes/${e.name}'));
+    }
+  }
+  return drives;
+}
+
+/// One side's drives, one click each. Each side has its own; [load] is asked again by its button.
+class TransferDrives extends StatefulWidget {
+  const TransferDrives({super.key, required this.load, required this.onOpen});
+
+  final Future<List<TransferDrive>> Function() load;
+  final void Function(String path) onOpen;
+
+  @override
+  State<TransferDrives> createState() => _TransferDrivesState();
+}
+
+class _TransferDrivesState extends State<TransferDrives> {
+  var _drives = const <TransferDrive>[];
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  Future<void> _reload() async {
+    final List<TransferDrive> drives;
+    try {
+      drives = await widget.load();
+    } catch (_) {
+      return; // keeps what it had: typing a path in the location bar still works
+    }
+    if (mounted) setState(() => _drives = drives);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: Kit.s2),
+      child: Wrap(
+        spacing: Kit.s2,
+        runSpacing: Kit.s1,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          for (final d in _drives)
+            TextButton.icon(
+              onPressed: () => widget.onOpen(d.path),
+              icon: const Icon(Icons.storage_outlined, size: 16, color: Kit.muted),
+              label: Text(d.label, style: const TextStyle(color: Kit.paper, fontSize: 13)),
+            ),
+          IconButton(
+            tooltip: 'Look for drives again',
+            onPressed: _reload,
+            icon: const Icon(Icons.refresh, size: 16, color: Kit.muted),
+          ),
+        ],
+      ),
+    );
   }
 }
 

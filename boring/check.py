@@ -1205,6 +1205,48 @@ def rust_hook_checks(c):
            not missing, "; ".join(missing))
 
 
+TRANSFER_HOOKS = "file transfer at full speed wired: the send slice, the CM windows, the Target's marker, speed and drives (v1.7 t27)"
+NO_GAIN_MEDIA = "camera formats are on the no-compression list (v1.7 t27)"
+
+
+def transfer_speed_checks(c):
+    hooks = [
+        (rebrand.BASE_LIB, rebrand.T27_MOD),
+        (rebrand.FS_RS, rebrand.T27_COMPRESS),
+        (rebrand.BASE_BUILD, rebrand.T27_BUILD),
+        (rebrand.HBB_TCP, rebrand.T27_ENC_RUN),
+        (rebrand.HBB_TCP, rebrand.T27_NEXT),
+        (rebrand.HBB_STREAM, rebrand.T27_STREAM_RUN),
+        (rebrand.CONN, rebrand.T27_CONN_ARM),
+        (rebrand.CONN, rebrand.T27_CONN_GUARD),
+        (rebrand.CONN, rebrand.T27_CONN_ACK),
+        (rebrand.CONN, rebrand.T27_CONN_SPEND),
+        (rebrand.CONN, rebrand.T27_MARKER),
+        (rebrand.CONN, rebrand.T27_READ_ACK),
+        (rebrand.IPC, rebrand.T27_IPC),
+        (rebrand.UI_CM, rebrand.T27_CM_TICK),
+        (rebrand.UI_CM, "allow_err!(self.tx.send(Data::FileWriteAck(n)));"),
+        (rebrand.UI_CM, "Data::FileReadAck(bytes) => boring_read_window.refund(bytes),"),
+        (rebrand.IO_LOOP, rebrand.T27_IO_ARM),
+        (rebrand.IO_LOOP, rebrand.T27_IO_PEER),
+        (rebrand.IO_LOOP, rebrand.T27_IO_SPEED),
+        (rebrand.FILE_MGR, "TransferDrives(load: _boringLoadDrives"),
+        (rebrand.FILE_MGR, "speed: j.speed,"),
+        (rebrand.FILE_MGR, "_boringClock.observe("),
+    ]
+    missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
+    # Upstream's one-block-per-tick calls must be gone from the paths a transfer takes at full speed.
+    conn = c.read(rebrand.CONN)
+    if "match fs::handle_read_jobs(" in conn:
+        missing.append(f"{rebrand.CONN}: still one block per tick")
+    if "MILLI5" in c.read(rebrand.UI_CM):
+        missing.append(f"{rebrand.UI_CM}: still a 5 ms tick")
+    c.fact(TRANSFER_HOOKS, not missing, "; ".join(missing))
+    speed = c.read("libs/base/src/file_speed.rs")
+    absent = [e for e in ("mov", "mp4", "mxf", "braw", "r3d", "jpg", "zip") if f'"{e}"' not in speed]
+    c.fact(NO_GAIN_MEDIA, not absent, ", ".join(absent))
+
+
 T07_KIT = "flutter/lib/desktop/kit/session_toolbar.dart"
 SIMPLE_SETTINGS_KIT = "flutter/lib/desktop/kit/simple_settings.dart"
 
@@ -1261,7 +1303,7 @@ def home_checks(c):
     fm = c.read(rebrand.FILE_MGR)
     i = fm.find("  Widget boringTransferList() => Obx(() => TransferList(")
     jobs = fm[i:fm.find("      ));\n", i)] if i >= 0 else ""
-    need = ("            if (j.type != JobType.none)\n", "                  delete: j.type != JobType.transfer),")
+    need = ("            if (j.type != JobType.none)\n", "                  delete: j.type != JobType.transfer,")
     c.fact("File Transfer lists delete jobs too (v1.7 t08 follow-up)", all(n in jobs for n in need),
            "boringTransferList drops delete jobs")
 
@@ -1720,6 +1762,7 @@ def run_checks(root):
     fastest_lan_checks(c)  # v1.7 t25
     target_word_checks(c)  # v1.7 t26
     home_checks(c)  # v1.7 review: Home, Settings, copy
+    transfer_speed_checks(c)  # v1.7 t27
     ft = rebrand.FILE_MGR  # v1.7 t08
     ft_needles = ("TransferPane(", "TransferDraggable(", "boringTransferList()",
                   "_boringSend(model.remoteController)", "_boringSend(model.localController)")
