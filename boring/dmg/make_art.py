@@ -60,7 +60,7 @@ def background(fonts, scale):
     d.polygon(flask(d, (W - ew) / 2, 22, 12), fill=INK)
     text(d, ((W - ew) / 2 + 17, 21), "BORING LABS", label, MUTED, kern=1.2)
     centred(d, 40, "Boring Remote", face(fonts, "neue-corp-ultrabold.otf", 36), PAPER)
-    centred(d, 92, "Drive your other computers over your tailnet.", face(fonts, BODY, 16), MUTED)
+    centred(d, 92, "Every machine in the room, from any one of them.", face(fonts, BODY, 16), MUTED)
 
     # Drag arrow between the icons.
     y = APP_XY[1]
