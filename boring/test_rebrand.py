@@ -960,6 +960,19 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", rebrand.T04_ALWAYS_ASK_KICK, "")
         self.assert_check_fails(ALWAYS_ASK)
 
+    def test_a_tunnel_kept_after_switch_on_fails_check(self):  # review L1 re-check
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.T04_ALWAYS_ASK_TUNNEL, "")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_salt_turned_over_in_two_writes_fails_check(self):  # review Low: a crash between = no password
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs",
+                  "    match Config::set_permanent_password_storage_for_sync(&new_storage, &fresh) {",
+                  "    let _ = Config::set_permanent_password_storage_for_sync(\"\", &fresh);\n"
+                  "    match Config::set_permanent_password_storage_for_sync(&new_storage, &fresh) {")
+        self.assert_check_fails(ALWAYS_ASK_SALT)
+
     def test_always_ask_on_without_turning_the_salt_over_fails_check(self):  # review H1
         self.rebrand()
         self.edit("libs/base/src/trust.rs", "                    rotate_salt(password)?;\n", "")

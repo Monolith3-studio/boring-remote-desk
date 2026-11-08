@@ -854,6 +854,21 @@ T04_ALWAYS_ASK_KICK = (
     "                        conn.on_close(\"always ask for password\", true).await;\n"
     "                        break;\n"
     "                    }\n")
+# Review re-check: an IP tunnel runs in its own loop (try_port_forward_loop), not the session
+# loop above, so it gets the same check, once a second, and closes.
+T04_ALWAYS_ASK_TUNNEL_TIMER_AT = "            let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();\n            loop {\n"
+T04_ALWAYS_ASK_TUNNEL_TIMER = (
+    "            // boring-remote: a tunnel switched to always ask is closed too (base::trust).\n"
+    "            let mut boring_trust_check = crate::rustdesk_interval(time::interval(Duration::from_secs(1)));\n")
+T04_ALWAYS_ASK_TUNNEL_AT = "                    _ = self.timer.tick() => {\n                        if last_recv_time.elapsed() >= H1 {\n"
+T04_ALWAYS_ASK_TUNNEL = (
+    "                    // boring-remote: switched to always ask after it got in without the Unattended\n"
+    "                    // Password: the tunnel closes, as a session does (base::trust).\n"
+    "                    _ = boring_trust_check.tick() => {\n"
+    "                        if self.boring_trust.lost_trust() {\n"
+    "                            bail!(\"{}\", base::trust::ASKS_EVERY_TIME);\n"
+    "                        }\n"
+    "                    }\n")
 # Review follow-up L2: the Trusted list has one writer, the service. Settings' Remove, Allow and
 # Always ask go over ipc as an edit (base::trust::edit, one locked read-modify-write on the live
 # list) and wait for its answer; a settings window's whole-options write never carries its stale
@@ -1077,6 +1092,11 @@ PATCHES += [
      "always ask: the Controller keeps no password for that Target"),
     (CONN, T04_ALWAYS_ASK_KICK_AT, T04_ALWAYS_ASK_KICK_AT + T04_ALWAYS_ASK_KICK,
      "always ask: a session that got in without the password ends when switched on"),
+    (CONN, T04_ALWAYS_ASK_TUNNEL_TIMER_AT,
+     T04_ALWAYS_ASK_TUNNEL_TIMER_AT.replace("            loop {\n", T04_ALWAYS_ASK_TUNNEL_TIMER + "            loop {\n"),
+     "always ask: a tunnel's own check timer"),
+    (CONN, T04_ALWAYS_ASK_TUNNEL_AT, T04_ALWAYS_ASK_TUNNEL + T04_ALWAYS_ASK_TUNNEL_AT,
+     "always ask: a tunnel that got in without the password closes when switched on"),
     ("src/ipc.rs", T04_EDIT_IPC_AT, T04_EDIT_IPC_AT.replace('                } else if name == "salt"', T04_EDIT_IPC + '                } else if name == "salt"'),
      "Trusted list: Settings' edits, one locked write in the service"),
     ("src/ipc.rs", T04_KEEP_LIST_OLD, T04_KEEP_LIST, "Trusted list: a settings window's stale copy is never stored"),
@@ -3877,6 +3897,8 @@ ONCE = {
     "always ask: no sign-in lets it in without the Unattended Password",
     "always ask: the Controller keeps no password for that Target",
     "always ask: a session that got in without the password ends when switched on",
+    "always ask: a tunnel's own check timer",
+    "always ask: a tunnel that got in without the password closes when switched on",
     "Trusted list: Settings' edits, one locked write in the service",
     "Trusted list: a settings window's stale copy is never stored",
     "Trusted list: Settings waits for the service's answer",

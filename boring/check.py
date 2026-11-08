@@ -1005,10 +1005,16 @@ def always_ask_checks(c, conn, rs, dart):
         ("Settings switches it through the service's edit, as Remove",
          "onAlwaysAsk: (k, on, pw) async => trustEditError(" in settings
          and "trustEdit('always_ask', k, on: on, password: pw)" in settings),
-        ("switched on while it is in without the password: that session ends within a second",
+        ("switched on while it is in without the password: that session or tunnel ends within a second",
          rebrand.T04_ALWAYS_ASK_KICK_AT + rebrand.T04_ALWAYS_ASK_KICK in conn
-         and "!self.password_right && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)"
+         and rebrand.T04_ALWAYS_ASK_TUNNEL + rebrand.T04_ALWAYS_ASK_TUNNEL_AT
+         in (fn_body(conn, "    async fn try_port_forward_loop(") or "")
+         and rebrand.T04_ALWAYS_ASK_TUNNEL_TIMER in conn
+         and "!self.password_right && !self.stays && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)"
          in (fn_body(rs, "    fn lost_trust_in(") or "")),
+        ("a sign-in that stores it switched on keeps that session and sends the marker",
+         "self.stored_as_always_ask(t, name);" in grant and grant.count("self.stored_as_always_ask(t, name);") == 2
+         and "self.always_ask = Some(name.to_owned());" in (fn_body(rs, "    fn stored_as_always_ask(") or "")),
     ] if not ok]
     c.fact(ALWAYS_ASK, not bad, "; ".join(bad))
 
@@ -1017,9 +1023,13 @@ def always_ask_checks(c, conn, rs, dart):
         ("turning it on turns the salt over first, or nothing is saved",
          -1 < edit.find("rotate_salt(password)?;") < edit.find("t.list = planned.list;")
          and "*on && !was" in (fn_body(rs, "fn plan_edit(") or "")),
-        ("only the Unattended Password typed here does it; a failure puts the old salt back",
+        ("only the Unattended Password typed here does it, and the new salt and hash go in one write",
          -1 < rotate.find("return Err(WRONG_PASSWORD);") < rotate.find("Config::get_auto_password(32)")
-         and "Config::set_permanent_password_storage_for_sync(&storage, &salt);" in rotate),
+         and rotate.count("Config::set_permanent_password_storage_for_sync(") == 1
+         and "Config::set_permanent_password_storage_for_sync(&new_storage, &fresh)" in rotate
+         and "Config::set_permanent_password(" not in rotate
+         and "(decode_permanent_password_h1_from_storage(&storage) == Some(h1)).then_some(storage)"
+         in (fn_body(rs, "fn resalted(") or "")),
         ("Settings asks for the password before it turns it on",
          "final password = on ? await _askPassword() : '';" in dart and "String alwaysAskAsk()" in dart),
     ] if not ok]
