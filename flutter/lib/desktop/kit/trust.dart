@@ -19,7 +19,8 @@ class TrustedController {
   final String key;
   final String name;
   final int added; // seconds since 1970
-  const TrustedController({required this.key, required this.name, this.added = 0});
+  final bool alwaysAsk; // "Always ask for password" (trust.rs `always_ask`; absent = off)
+  const TrustedController({required this.key, required this.name, this.added = 0, this.alwaysAsk = false});
 }
 
 List<TrustedController> parseTrusted(String json) {
@@ -33,6 +34,7 @@ List<TrustedController> parseTrusted(String json) {
             key: e['key'] as String,
             name: (e['name'] as String?) ?? '',
             added: (e['added'] as num?)?.toInt() ?? 0,
+            alwaysAsk: e['always_ask'] == true,
           ),
     ];
   } catch (_) {
@@ -56,6 +58,25 @@ String removeTrusted(String json, String key) {
   }
 }
 
+/// The Trusted Controllers JSON with "Always ask for password" on or off for `key` (a removed one
+/// has no switch). On, its token alone no longer gets it in: it needs the Unattended Password every
+/// time. Off is not written, as trust.rs skips it (trust.rs `Trusted::set_always_ask`).
+String setAlwaysAsk(String json, String key, bool on) {
+  try {
+    final list = jsonDecode(json);
+    if (list is! List) return '[]';
+    return jsonEncode([
+      for (final e in list)
+        if (e is Map && e['key'] == key && e['removed'] != true)
+          {for (final f in e.entries) if (f.key != 'always_ask') f.key: f.value, if (on) 'always_ask': true}
+        else
+          e
+    ]);
+  } catch (_) {
+    return '[]';
+  }
+}
+
 /// The removed ones: Settings offers Allow next to each.
 List<TrustedController> parseRemoved(String json) {
   try {
@@ -68,6 +89,7 @@ List<TrustedController> parseRemoved(String json) {
             key: e['key'] as String,
             name: (e['name'] as String?) ?? '',
             added: (e['added'] as num?)?.toInt() ?? 0,
+            alwaysAsk: e['always_ask'] == true,
           ),
     ];
   } catch (_) {
@@ -176,6 +198,10 @@ class TrustedControllersPage extends StatefulWidget {
   final Future<void> Function(String key) onRemove;
   final Future<void> Function(String id) onForget;
 
+  /// "Always ask for password" switched for one ([setAlwaysAsk], over the server option as Remove).
+  /// Null shows no switch.
+  final Future<void> Function(String key, bool on)? onAlwaysAsk;
+
   /// Removed ones, each with Allow ([onAllow] trusts it again, and lets in a live ask from it).
   final List<TrustedController> removed;
   final Future<void> Function(TrustedController c)? onAllow;
@@ -189,6 +215,7 @@ class TrustedControllersPage extends StatefulWidget {
     required this.known,
     required this.onRemove,
     required this.onForget,
+    this.onAlwaysAsk,
     this.removed = const [],
     this.onAllow,
     this.waiting,
@@ -202,6 +229,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
   late final _trusted = [...widget.trusted];
   late final _known = [...widget.known];
   late final _removed = [...widget.removed];
+  late final _alwaysAsk = {for (final c in [...widget.trusted, ...widget.removed]) c.key: c.alwaysAsk};
 
   @override
   Widget build(BuildContext context) {
@@ -216,7 +244,7 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
             style: t.bodySmall),
         const SizedBox(height: Kit.s4),
         if (_trusted.isEmpty) Text('None yet. A computer lands here once you allow it in.'),
-        for (final c in _trusted)
+        for (final c in _trusted) ...[
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: Text(c.name.isNotEmpty ? c.name : 'A computer with no name'),
@@ -228,6 +256,18 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
               child: const Text('Remove'),
             ),
           ),
+          if (widget.onAlwaysAsk != null)
+            SwitchListTile(
+              title: const Text('Always ask for password'),
+              subtitle: Text(alwaysAskWhy(), style: t.bodySmall),
+              value: _alwaysAsk[c.key] ?? false,
+              onChanged: (on) async {
+                await widget.onAlwaysAsk!(c.key, on);
+                if (mounted) setState(() => _alwaysAsk[c.key] = on);
+              },
+              contentPadding: EdgeInsets.zero,
+            ),
+        ],
         if (_removed.isNotEmpty && widget.onAllow != null) ...[
           const SizedBox(height: Kit.s6),
           Text('Removed', style: t.titleMedium),
@@ -286,6 +326,9 @@ class _TrustedControllersPageState extends State<TrustedControllersPage> {
     );
   }
 }
+
+/// The helper line under each "Always ask for password" switch.
+String alwaysAskWhy() => "It needs this ${KitWords.one}'s Unattended Password every time it connects.";
 
 /// The Settings link and page title for who gets in without asking ("Controller" stays internal).
 const kTrustedTitle = 'Trusted list';

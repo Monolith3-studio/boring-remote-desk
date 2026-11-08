@@ -10,6 +10,13 @@
 //! 2. Target → Controller: nothing if that token is Trusted; otherwise a fresh token. The fresh
 //!    one is worth nothing until someone here approves the session or the Unattended Password
 //!    is right ([`Admission::approve`]); only then is it stored (hashed) as Trusted.
+//!
+//! "Always ask for password" (a switch per Trusted Controller in Settings, off by default):
+//! that Controller's token stops being enough. It gets in by this Mac's Unattended Password and
+//! nothing else, every connect: not a click here, not a one-time code, not a recent session,
+//! whatever the approve mode (connection.rs, rebrand T04_ALWAYS_ASK and its gate). It stays
+//! Trusted and keeps its token, so switching off gives back the silent way in. Only Settings on
+//! this Mac changes the switch; nothing a Controller sends does.
 
 use crate::message_proto::{message, Message, PublicKey};
 use hbb_common::{
@@ -82,6 +89,10 @@ pub struct TrustedController {
     pub added: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub removed: bool,
+    /// "Always ask for password". Absent (every 1.7.0 entry) is off, and off is never written, so
+    /// a list with none switched on is byte for byte what 1.7.0 wrote and reads.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub always_ask: bool,
 }
 
 /// The Target's Trusted Controllers (Settings → Advanced → Trusted Controllers lists and removes).
@@ -130,8 +141,25 @@ impl Trusted {
 
     fn add(&mut self, key: &[u8], name: &str) {
         let key = hex(key);
+        // A Controller that dropped its token (Forget, a reinstall) comes back as a stranger. If
+        // it uses the name of one switched to always ask, it is stored switched on too. A name is
+        // self-reported, so it never lets anyone in (ADR 0005); here it can only take away.
+        let always_ask = !name.is_empty() && self.0.iter().any(|t| t.always_ask && t.name == name);
         self.0.retain(|t| t.key != key);
-        self.0.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false });
+        self.0.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false, always_ask });
+    }
+
+    /// Settings' "Always ask for password" for the listed Controller with `key` (a removed one has
+    /// no switch). flutter/lib/desktop/kit/trust.dart `setAlwaysAsk` does the same to the option
+    /// JSON, over ipc to the service, as Remove does.
+    pub fn set_always_ask(&mut self, key: &str, on: bool) -> bool {
+        match self.0.iter_mut().find(|t| t.key == key && !t.removed) {
+            Some(t) => {
+                t.always_ask = on;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Removing an entry revokes its token: the next connect from that Controller is asked on
@@ -147,7 +175,8 @@ impl Trusted {
         }
     }
 
-    /// Allow on this Mac for a removed Controller: its token is Trusted again.
+    /// Allow on this Mac for a removed Controller: its token is Trusted again (still always ask,
+    /// if it was).
     fn reinstate(&mut self, key: &str, name: &str) -> bool {
         match self.0.iter_mut().find(|t| t.key == key) {
             Some(t) => {
@@ -172,13 +201,32 @@ pub enum SignIn {
     ThisSessionOnly,
 }
 
-/// What the Target learned in the exchange: already Trusted, removed from Trusted Controllers
-/// (its key), or the hash of the token it just issued, waiting for approval.
+/// What the Target learned in the exchange: already Trusted, Trusted but always asked for the
+/// password (its name), removed from Trusted Controllers (its key), or the hash of the token it
+/// just issued, waiting for approval.
 #[derive(Debug, Clone, Default)]
 pub struct Admission {
     trusted: Option<String>,
     pending: Option<Vec<u8>>,
     removed: Option<String>,
+    always_ask: Option<String>,
+    /// Set by connection.rs only, once this session's Unattended Password checked out.
+    password_right: bool,
+}
+
+/// The `platform_additions` key a Target adds to its `PeerInfo` when it let in an always-ask
+/// Controller (connection.rs, rebrand T04_ALWAYS_ASK_MARK). A Boring Remote Controller then keeps
+/// no password for it (client.rs, T04_ALWAYS_ASK_FORGET), so the next connect asks. Any other
+/// Controller ignores the key; the protocol is unchanged. Telling it is a courtesy, not the lock:
+/// the lock is the Target asking every time.
+pub const ALWAYS_ASK_MARKER: &str = "boring_always_ask";
+
+/// Whether the Target's `platform_additions` JSON says it always asks this Controller.
+pub fn asks_every_time(platform_additions: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(platform_additions)
+        .ok()
+        .and_then(|v| v.get(ALWAYS_ASK_MARKER).and_then(|m| m.as_bool()))
+        .unwrap_or(false)
 }
 
 /// Hex characters of a Trusted Controllers key the ask carries (64 bits).
@@ -203,7 +251,7 @@ impl Admission {
     /// when no exchange ran).
     pub fn ask_info(&self, ip: &str) -> AskInfo {
         let prefix = |k: &str| k.get(..KEY_PREFIX_LEN).unwrap_or(k).to_owned();
-        let (trust, key) = if self.trusted.is_some() {
+        let (trust, key) = if self.trusted.is_some() || self.always_ask.is_some() {
             ("trusted", String::new())
         } else if let Some(k) = &self.removed {
             ("removed", prefix(k))
@@ -224,11 +272,33 @@ impl Admission {
         self.removed.is_some()
     }
 
+    /// Presented a token this Mac trusts, switched to always ask: it gets in by the Unattended
+    /// Password and nothing else (src/server/connection.rs, rebrand T04_ALWAYS_ASK).
+    pub fn always_ask(&self) -> bool {
+        self.always_ask.is_some()
+    }
+
+    /// connection.rs: this session gave this Mac's Unattended Password (not a one-time code).
+    pub fn unattended_password_right(&mut self) {
+        self.password_right = true;
+    }
+
+    /// The last word before any sign-in lets this session in (rebrand T04_ALWAYS_ASK_GATE): no for
+    /// an always-ask Controller that has not given the Unattended Password, whatever got it this
+    /// far (a click, switch sides, a sign-in path upstream adds later). Yes for everyone else.
+    pub fn may_let_in(&self) -> bool {
+        self.always_ask.is_none() || self.password_right
+    }
+
     /// The session got in. If someone clicked Allow here or the Unattended Password was right,
     /// the token just issued becomes Trusted under `name`; any other sign-in leaves it worthless.
     pub fn approve(&mut self, how: SignIn, name: &str) {
         if self.trusted.is_some() {
             hbb_common::log::info!("Direct Link: Trusted Controller {:?} came straight in", name);
+            return;
+        }
+        if self.always_ask.is_some() {
+            hbb_common::log::info!("Direct Link: Trusted Controller {:?} gave the Unattended Password (always ask)", name);
             return;
         }
         let was_removed = self.removed.is_some();
@@ -247,6 +317,11 @@ impl Admission {
     }
 
     fn approve_into(&mut self, t: &mut Trusted, how: SignIn, name: &str) -> bool {
+        // Always ask: its entry stays exactly as Settings left it, and no token is issued, so no
+        // sign-in can make it come in silently again.
+        if self.always_ask.is_some() {
+            return false;
+        }
         // A removed Controller is Trusted again only by Allow here, never by a password.
         if let Some(key) = self.removed.as_ref() {
             if how != SignIn::Allowed {
@@ -294,6 +369,11 @@ pub async fn answer(stream: &mut Stream, trusted: &Trusted, ms: u64) -> ResultTy
     }
     let token = read(stream, ms).await?;
     match trusted.check(&token) {
+        Some(t) if !t.removed && t.always_ask => {
+            // Still Trusted, so no fresh token: it keeps this one, and this one keeps asking.
+            stream.send(&frame(&[])).await?;
+            Ok(Admission { always_ask: Some(t.name.clone()), ..Default::default() })
+        }
         Some(t) if !t.removed => {
             stream.send(&frame(&[])).await?;
             Ok(Admission { trusted: Some(t.name.clone()), ..Default::default() })
@@ -550,6 +630,116 @@ mod tests {
         let c = hbb_common::tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut ctl = Stream::from(c, addr);
         assert!(present(&mut ctl, None, 100).await.is_err());
+    }
+
+    /// What 1.7.0 wrote: no `always_ask` anywhere. It loads as before and saves byte for byte.
+    const TRUST_FILE_1_7_0: &str = r#"[{"key":"aa11","name":"Edit Bay 2","added":1761955200},{"key":"bb22","name":"Stage Left","added":1761955300,"removed":true}]"#;
+
+    #[test]
+    fn a_1_7_0_trust_file_loads_unchanged() {
+        let t = Trusted::parse(TRUST_FILE_1_7_0);
+        assert_eq!(t.list().len(), 1);
+        assert!(t.0.iter().all(|c| !c.always_ask), "off unless switched on");
+        assert_eq!(t.to_json(), TRUST_FILE_1_7_0, "off is not written, so 1.7.0 reads it back as it was");
+    }
+
+    /// Trusted, then "Always ask for password" switched on in Settings.
+    async fn always_ask_controller() -> (Trusted, Vec<u8>, String) {
+        let mut trusted = Trusted::default();
+        let (mut a, issued) = connect(&trusted, None).await;
+        a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2");
+        let key = trusted.list()[0].key.clone();
+        assert!(trusted.set_always_ask(&key, true));
+        (Trusted::parse(&trusted.to_json()), issued.unwrap(), key)
+    }
+
+    #[tokio::test]
+    async fn always_ask_takes_away_the_silent_way_in_and_off_gives_it_back() {
+        let (mut trusted, token, key) = always_ask_controller().await;
+        assert!(trusted.to_json().contains(r#""always_ask":true"#));
+        assert_eq!(trusted.list().len(), 1, "it stays on the Trusted list");
+
+        let (a, reissued) = connect(&trusted, Some(token.clone())).await;
+        assert!(!a.is_trusted(), "its token alone no longer gets it in");
+        assert!(a.always_ask());
+        assert!(!a.must_ask(), "not removed: no ask here, it needs the password");
+        assert_eq!(reissued, None, "no fresh token: it keeps this one, and this one keeps asking");
+        assert_eq!(a.ask_info("192.168.1.20").boring_trust, "trusted", "never shown as a new computer");
+
+        assert!(trusted.set_always_ask(&key, false));
+        let (b, _) = connect(&trusted, Some(token)).await;
+        assert!(b.is_trusted(), "off: in without asking again, as before");
+        assert!(!b.always_ask());
+        assert!(!trusted.to_json().contains("always_ask"), "off is not written");
+    }
+
+    #[tokio::test]
+    async fn only_the_unattended_password_lets_an_always_ask_controller_in() {
+        let (trusted, token, _) = always_ask_controller().await;
+        let (mut a, _) = connect(&trusted, Some(token)).await;
+        assert!(!a.may_let_in(), "a click here, a one-time code or a recent session is not enough");
+        a.unattended_password_right();
+        assert!(a.may_let_in());
+
+        // Not always-ask: may_let_in never stands in the way of the usual sign-ins.
+        assert!(Admission::default().may_let_in());
+        let (b, _) = connect(&Trusted::default(), None).await;
+        assert!(b.may_let_in());
+    }
+
+    #[tokio::test]
+    async fn signing_in_never_changes_an_always_ask_entry_or_issues_a_token() {
+        let (trusted, token, _) = always_ask_controller().await;
+        let before = trusted.to_json();
+        for how in [SignIn::UnattendedPassword, SignIn::Allowed, SignIn::ThisSessionOnly] {
+            let mut t = trusted.clone();
+            let (mut a, reissued) = connect(&t, Some(token.clone())).await;
+            a.unattended_password_right();
+            assert!(!a.approve_into(&mut t, how, "Renamed"), "{:?}", how);
+            assert_eq!(t.to_json(), before, "{:?}: nothing stored, nothing switched off", how);
+            assert_eq!(reissued, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_its_token_and_coming_back_by_name_stays_always_ask() {
+        // Forget on the Controller, or a reinstall: it comes back with no token, as a stranger. A
+        // name is self-reported, so it can only take the silent way in away, never grant it.
+        let (mut trusted, _, _) = always_ask_controller().await;
+        let (mut back, _) = connect(&trusted, None).await;
+        assert!(!back.always_ask() && !back.is_trusted());
+        assert!(back.approve_into(&mut trusted, SignIn::UnattendedPassword, "Edit Bay 2"));
+        assert_eq!(trusted.list().len(), 2);
+        assert!(trusted.list().iter().all(|c| c.always_ask), "the new entry is switched on too");
+
+        let (mut other, _) = connect(&trusted, None).await;
+        assert!(other.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left"));
+        assert!(!trusted.list().iter().find(|c| c.name == "Stage Left").unwrap().always_ask);
+        let (mut nameless, _) = connect(&trusted, None).await;
+        assert!(nameless.approve_into(&mut trusted, SignIn::Allowed, ""));
+        assert!(!trusted.list().iter().find(|c| c.name.is_empty()).unwrap().always_ask);
+    }
+
+    #[tokio::test]
+    async fn remove_then_allow_keeps_always_ask() {
+        let (mut trusted, token, key) = always_ask_controller().await;
+        assert!(trusted.remove(&key));
+        assert!(!trusted.set_always_ask(&key, false), "a removed one has no switch");
+        let (mut back, _) = connect(&trusted, Some(token.clone())).await;
+        assert!(back.must_ask() && !back.always_ask(), "removed wins: it waits for Allow here");
+        assert!(back.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2"));
+        let (again, _) = connect(&trusted, Some(token)).await;
+        assert!(again.always_ask(), "Allow trusts it again, still asking for the password");
+        assert!(!trusted.set_always_ask("not-a-key", true));
+    }
+
+    #[test]
+    fn the_target_tells_the_controller_not_to_keep_its_password() {
+        assert!(asks_every_time(r#"{"boring_remote":"1.7.1","boring_always_ask":true}"#));
+        for no in ["", "junk", "{}", r#"{"boring_always_ask":false}"#, r#"{"boring_always_ask":"true"}"#,
+                   r#"{"boring_remote":"1.7.0","is_installed":true}"#] {
+            assert!(!asks_every_time(no), "{}", no);
+        }
     }
 
     #[test]

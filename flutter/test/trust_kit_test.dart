@@ -23,6 +23,22 @@ void main() {
     expect(parseTrusted('not json'), isEmpty);
   });
 
+  test('Always ask for password: read, switched on and off in the Rust format', () {
+    expect(parseTrusted(trustedJson).map((c) => c.alwaysAsk), [false, false], reason: '1.7.0 lists are off');
+    final on = setAlwaysAsk(trustedJson, 'aa11', true);
+    expect(on, contains('"key":"aa11","name":"Edit Bay 2","added":1761955200,"always_ask":true}'));
+    expect(parseTrusted(on).map((c) => c.alwaysAsk), [true, false]);
+    // Off is not written, as trust.rs skips it: the list goes back to exactly what 1.7.0 wrote.
+    expect(setAlwaysAsk(on, 'aa11', false), trustedJson);
+    // Remove and Allow keep it.
+    expect(parseRemoved(removeTrusted(on, 'aa11')).single.alwaysAsk, isTrue);
+    expect(parseTrusted(reinstateTrusted(removeTrusted(on, 'aa11'), 'aa11', now: 1)).first.alwaysAsk, isTrue);
+    // A removed one has no switch (trust.rs set_always_ask); bad JSON is no list, as for Remove.
+    final removed = removeTrusted(trustedJson, 'aa11');
+    expect(setAlwaysAsk(removed, 'aa11', true), removed);
+    expect(setAlwaysAsk('not json', 'aa11', true), '[]');
+  });
+
   // v1.7 t26: Home keys a recent by the key pinned for its Target ID or last address.
   // boring-remote (v1.7 t25): every address it advertised is the same machine on Home.
   test('identities: each stored address of a Target is that Target', () {
@@ -67,6 +83,34 @@ void main() {
     expect(removed, ['aa11']);
     expect(find.text('Edit Bay 2'), findsNothing);
     expect(find.text('Stage Left'), findsOneWidget);
+  });
+
+  testWidgets('each Trusted computer has Always ask for password, off unless set', (tester) async {
+    final set = <String>[];
+    await tester.pumpWidget(host(TrustedControllersPage(
+      trusted: parseTrusted(setAlwaysAsk(trustedJson, 'bb22', true)),
+      known: const [],
+      onRemove: (_) async {},
+      onForget: (_) async {},
+      onAlwaysAsk: (k, on) async => set.add('$k $on'),
+    )));
+    expect(find.text('Always ask for password'), findsNWidgets(2));
+    expect(find.text(alwaysAskWhy()), findsNWidgets(2));
+    expect(alwaysAskWhy(), "It needs this Mac's Unattended Password every time it connects.");
+    bool value(int i) => tester.widget<SwitchListTile>(find.byType(SwitchListTile).at(i)).value;
+    expect([value(0), value(1)], [false, true]);
+    await tester.tap(find.text('Always ask for password').first);
+    await tester.pumpAndSettle();
+    expect(set, ['aa11 true']);
+    expect(value(0), isTrue);
+    await tester.tap(find.text('Always ask for password').last);
+    await tester.pumpAndSettle();
+    expect(set, ['aa11 true', 'bb22 false']);
+    expect(value(1), isFalse);
+    // No onAlwaysAsk, nowhere to save it: no switch.
+    await tester.pumpWidget(host(TrustedControllersPage(
+        trusted: parseTrusted(trustedJson), known: const [], onRemove: (_) async {}, onForget: (_) async {})));
+    expect(find.text('Always ask for password'), findsNothing, reason: 'no switch without somewhere to save it');
   });
 
   testWidgets("forgets a reinstalled Mac's key so it can pair again", (tester) async {
