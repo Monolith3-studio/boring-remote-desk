@@ -214,6 +214,13 @@ pub struct Admission {
     password_right: bool,
 }
 
+/// What an always-ask Controller is told when something other than the Unattended Password
+/// tried to let it in (connection.rs, rebrand T04_ALWAYS_ASK_GATE).
+pub const ASKS_EVERY_TIME: &str = "This computer asks for its Unattended Password every time.";
+/// What it is told when this Mac has no Unattended Password it could give (none set, or turned
+/// off): it cannot get in until someone here sets one or switches always ask off.
+pub const NO_UNATTENDED_PASSWORD: &str = "This computer asks for its Unattended Password, and none is set on it.";
+
 /// The `platform_additions` key a Target adds to its `PeerInfo` when it let in an always-ask
 /// Controller (connection.rs, rebrand T04_ALWAYS_ASK_MARK). A Boring Remote Controller then keeps
 /// no password for it (client.rs, T04_ALWAYS_ASK_FORGET), so the next connect asks. Any other
