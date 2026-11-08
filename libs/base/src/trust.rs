@@ -21,7 +21,7 @@
 use crate::message_proto::{message, Message, PublicKey};
 use hbb_common::{
     bail,
-    config::{Config, LocalConfig},
+    config::{compute_permanent_password_h1, decode_permanent_password_h1_from_storage, Config, LocalConfig},
     password_security::{decrypt_str_or_original, encrypt_str_or_original},
     protobuf::Message as _,
     serde_json,
@@ -29,12 +29,23 @@ use hbb_common::{
     ResultType, Stream,
 };
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+};
 
 /// Target side (server Config): the Trusted Controllers, as hashes of the tokens issued to them.
 pub const TRUSTED_OPTION: &str = "boring-trusted-controllers";
 /// Controller side (LocalConfig): the token each Target issued this Mac, by Target ID.
 pub const TOKENS_OPTION: &str = "boring-trust-tokens";
+/// Target side: "New computers always ask for password" ("Y" on; unset off, as 1.7.0).
+pub const NEW_ALWAYS_ASK_OPTION: &str = "boring-new-computers-always-ask";
+/// The ipc config name Settings' Remove, Allow and "Always ask for password" go through to the
+/// service (src/ipc.rs, rebrand T04_EDIT_IPC): one locked read-modify-write there ([`edit`]).
+pub const EDIT_CONFIG: &str = "boring-trust-edit";
 
 const TAG: &[u8] = b"boring-trust-1";
 const TOKEN_LEN: usize = 32; // 256 bits
@@ -97,20 +108,33 @@ pub struct TrustedController {
 
 /// The Target's Trusted Controllers (Settings → Advanced → Trusted Controllers lists and removes).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Trusted(Vec<TrustedController>);
+pub struct Trusted {
+    list: Vec<TrustedController>,
+    /// "New computers always ask for password": a Controller stored from now on starts switched on.
+    pub new_always_ask: bool,
+}
 
 impl Trusted {
     /// Unreadable JSON counts as no Trusted Controllers (everyone is asked again), and says so.
     pub fn parse(json: &str) -> Self {
-        Trusted(parse_or_default(json, "Trusted Controllers"))
+        Trusted { list: parse_or_default(json, "Trusted Controllers"), ..Default::default() }
+    }
+
+    /// For writing: unset is an empty list, unreadable is None, so it is never written over
+    /// (a list rebuilt from nothing would drop every entry's switch).
+    pub fn parse_strict(json: &str) -> Option<Self> {
+        if json.trim().is_empty() {
+            return Some(Self::default());
+        }
+        serde_json::from_str(json).ok().map(|list| Trusted { list, ..Default::default() })
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string(&self.0).unwrap_or_default()
+        serde_json::to_string(&self.list).unwrap_or_default()
     }
 
     pub fn load() -> Self {
-        Self::parse(&Config::get_option(TRUSTED_OPTION))
+        Trusted { new_always_ask: Config::get_option(NEW_ALWAYS_ASK_OPTION) == "Y", ..Self::parse(&Config::get_option(TRUSTED_OPTION)) }
     }
 
     pub fn save(&self) {
@@ -119,7 +143,7 @@ impl Trusted {
 
     /// The Trusted Controllers Settings lists: removed ones are not.
     pub fn list(&self) -> Vec<&TrustedController> {
-        self.0.iter().filter(|t| !t.removed).collect()
+        self.list.iter().filter(|t| !t.removed).collect()
     }
 
     /// Who holds `token`, if anyone, removed or not (the caller looks at `removed`). Only a
@@ -130,7 +154,7 @@ impl Trusted {
         }
         let d = digest(token);
         let mut hit = None;
-        for t in &self.0 {
+        for t in &self.list {
             let ok = unhex(&t.key).map_or(false, |k| k.len() == d.len() && memcmp(&k, &d));
             if ok && hit.is_none() {
                 hit = Some(t);
@@ -143,17 +167,18 @@ impl Trusted {
         let key = hex(key);
         // A Controller that dropped its token (Forget, a reinstall) comes back as a stranger. If
         // it uses the name of one switched to always ask, it is stored switched on too. A name is
-        // self-reported, so it never lets anyone in (ADR 0005); here it can only take away.
-        let always_ask = !name.is_empty() && self.0.iter().any(|t| t.always_ask && t.name == name);
-        self.0.retain(|t| t.key != key);
-        self.0.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false, always_ask });
+        // self-reported, so it never lets anyone in (ADR 0005); here it can only take away. With
+        // "New computers always ask for password" on, every new one starts switched on.
+        let always_ask =
+            self.new_always_ask || !name.is_empty() && self.list.iter().any(|t| t.always_ask && t.name == name);
+        self.list.retain(|t| t.key != key);
+        self.list.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false, always_ask });
     }
 
     /// Settings' "Always ask for password" for the listed Controller with `key` (a removed one has
-    /// no switch). flutter/lib/desktop/kit/trust.dart `setAlwaysAsk` does the same to the option
-    /// JSON, over ipc to the service, as Remove does.
+    /// no switch). Settings reaches it through [`edit`], never by writing the option itself.
     pub fn set_always_ask(&mut self, key: &str, on: bool) -> bool {
-        match self.0.iter_mut().find(|t| t.key == key && !t.removed) {
+        match self.list.iter_mut().find(|t| t.key == key && !t.removed) {
             Some(t) => {
                 t.always_ask = on;
                 true
@@ -163,10 +188,10 @@ impl Trusted {
     }
 
     /// Removing an entry revokes its token: the next connect from that Controller is asked on
-    /// this Mac, and only Allow here trusts it again (not the Unattended Password).
-    /// flutter/lib/desktop/kit/trust.dart `removeTrusted` does the same to the option JSON.
+    /// this Mac, and only Allow here trusts it again (not the Unattended Password). Settings'
+    /// Remove reaches it through [`edit`].
     pub fn remove(&mut self, key: &str) -> bool {
-        match self.0.iter_mut().find(|t| t.key == key && !t.removed) {
+        match self.list.iter_mut().find(|t| t.key == key && !t.removed) {
             Some(t) => {
                 t.removed = true;
                 true
@@ -178,7 +203,7 @@ impl Trusted {
     /// Allow on this Mac for a removed Controller: its token is Trusted again (still always ask,
     /// if it was).
     fn reinstate(&mut self, key: &str, name: &str) -> bool {
-        match self.0.iter_mut().find(|t| t.key == key) {
+        match self.list.iter_mut().find(|t| t.key == key) {
             Some(t) => {
                 t.removed = false;
                 t.name = name.to_owned();
@@ -212,7 +237,19 @@ pub struct Admission {
     always_ask: Option<String>,
     /// Set by connection.rs only, once this session's Unattended Password checked out.
     password_right: bool,
+    /// Its Trusted Controllers key, once known (Trusted, or stored at approve): what Settings'
+    /// switch is matched on while the session runs ([`Admission::lost_trust`]).
+    key: Option<String>,
+    /// The [`EDITS`] count this session last looked at.
+    seen_edits: u64,
 }
+
+/// Settings edits saved so far in this process; a live session looks at the list again only
+/// when this moves (connection.rs once a second, rebrand T04_ALWAYS_ASK_KICK).
+static EDITS: AtomicU64 = AtomicU64::new(0);
+/// One read-modify-write of the Trusted list at a time: sign-ins storing a Controller and
+/// Settings' edits, both in the service ([`edit_list`]).
+static EDIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// What an always-ask Controller is told when something other than the Unattended Password
 /// tried to let it in (connection.rs, rebrand T04_ALWAYS_ASK_GATE).
@@ -297,6 +334,23 @@ impl Admission {
         self.always_ask.is_none() || self.password_right
     }
 
+    /// connection.rs, once a second while the session runs (rebrand T04_ALWAYS_ASK_KICK): true
+    /// once Settings switched this Controller to always ask after it got in without the
+    /// Unattended Password, so the session ends now. Reads the list only after an edit.
+    pub fn lost_trust(&mut self) -> bool {
+        let edits = EDITS.load(Ordering::Acquire);
+        if self.key.is_none() || edits == self.seen_edits {
+            return false;
+        }
+        self.seen_edits = edits;
+        self.lost_trust_in(&Trusted::load())
+    }
+
+    fn lost_trust_in(&self, t: &Trusted) -> bool {
+        let Some(key) = self.key.as_deref() else { return false };
+        !self.password_right && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)
+    }
+
     /// The session got in. If someone clicked Allow here or the Unattended Password was right,
     /// the token just issued becomes Trusted under `name`; any other sign-in leaves it worthless.
     pub fn approve(&mut self, how: SignIn, name: &str) {
@@ -309,11 +363,18 @@ impl Admission {
             return;
         }
         let was_removed = self.removed.is_some();
-        let mut t = Trusted::load();
-        let stored = self.approve_into(&mut t, how, name);
-        if stored {
-            t.save();
-        }
+        // Under the edit lock, on the list as it is now; an unreadable list is not written over,
+        // so this one stays out of it (asked again next time) and the log says why.
+        let stored = match edit_list(|t| {
+            let stored = self.approve_into(t, how, name);
+            Ok((stored, stored))
+        }) {
+            Ok(stored) => stored,
+            Err(e) => {
+                hbb_common::log::warn!("Direct Link: {:?} not stored as Trusted: {}", name, e);
+                false
+            }
+        };
         hbb_common::log::info!(
             "Direct Link: {:?} got in by {:?}{}; Trusted now: {}",
             name,
@@ -335,16 +396,174 @@ impl Admission {
                 return false;
             }
             let ok = t.reinstate(key, name);
-            self.removed = None;
+            self.key = self.removed.take();
             return ok;
         }
         match self.pending.take() {
             Some(key) if how != SignIn::ThisSessionOnly => {
                 t.add(&key, name);
+                self.key = Some(hex(&key));
                 true
             }
             _ => false,
         }
+    }
+}
+
+/// What Settings asks the service to change (kit/trust.dart `trustEdit`, over ipc [`EDIT_CONFIG`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Edit {
+    Remove { key: String },
+    Allow { key: String },
+    /// On needs this Mac's Unattended Password, typed by whoever is at this Mac (H1, see [`edit`]).
+    AlwaysAsk {
+        key: String,
+        on: bool,
+        #[serde(default)]
+        password: String,
+    },
+}
+
+// What Settings shows when an edit did not happen. Plain words; nothing was changed in any of them.
+pub const UNREADABLE: &str = "The Trusted list on this computer can't be read, so nothing was changed.";
+pub const NOT_ON_LIST: &str = "That computer isn't on the Trusted list any more.";
+pub const NEED_PASSWORD: &str = "Type this computer's Unattended Password to turn this on.";
+pub const WRONG_PASSWORD: &str = "That isn't this computer's Unattended Password.";
+pub const NO_PASSWORD_SET: &str = "Set an Unattended Password on this computer first.";
+pub const SALT_FAILED: &str = "The Unattended Password couldn't be updated, so nothing was changed.";
+pub const NO_SERVICE: &str = "Boring Remote's background service didn't answer, so nothing was changed.";
+
+/// `edit` applied to the list as stored now (`raw`): the new list, and whether turning always
+/// ask on means the password's salt has to turn over first. Nothing here is saved.
+fn plan_edit(raw: &str, edit: &Edit) -> Result<(Trusted, bool), &'static str> {
+    let mut t = Trusted::parse_strict(raw).ok_or(UNREADABLE)?;
+    let listed = |t: &Trusted, key: &str| t.list.iter().any(|c| c.key == key && !c.removed);
+    let rotate = match edit {
+        Edit::Remove { key } => {
+            if !t.remove(key) {
+                return Err(NOT_ON_LIST);
+            }
+            false
+        }
+        Edit::Allow { key } => {
+            let name = t.list.iter().find(|c| c.key == *key && c.removed).map(|c| c.name.clone());
+            match name {
+                Some(name) => t.reinstate(key, &name),
+                None => return Err(NOT_ON_LIST),
+            };
+            false
+        }
+        Edit::AlwaysAsk { key, on, password } => {
+            if !listed(&t, key) {
+                return Err(NOT_ON_LIST);
+            }
+            let was = t.list.iter().any(|c| c.key == *key && c.always_ask);
+            if *on && !was && password.is_empty() {
+                return Err(NEED_PASSWORD);
+            }
+            t.set_always_ask(key, *on);
+            *on && !was
+        }
+    };
+    Ok((t, rotate))
+}
+
+/// Whether `typed` is the Unattended Password stored as `stored` (its salted hash) under `salt`.
+fn password_is(stored: Option<[u8; 32]>, salt: &str, typed: &str) -> bool {
+    match stored {
+        Some(h1) if !typed.is_empty() => memcmp(&compute_permanent_password_h1(typed, salt), &h1),
+        _ => false,
+    }
+}
+
+/// H1: a Controller that saved the Unattended Password saved its salted hash, and sends that
+/// hash again without anyone typing. This Mac keeps only the same hash, so it cannot tell typed
+/// from saved. Turning always ask on therefore turns the salt over: the person at this Mac
+/// types the password, it is checked, and stored again under a fresh salt. Every hash any
+/// Controller saved (this one's and everyone else's) stops matching, so each has to type it
+/// once more. A failure puts the old salt and hash back.
+fn rotate_salt(password: &str) -> Result<(), &'static str> {
+    if Config::is_disable_change_permanent_password() {
+        return Err(SALT_FAILED);
+    }
+    let (storage, salt) = Config::get_local_permanent_password_storage_and_salt();
+    if storage.is_empty() {
+        return Err(NO_PASSWORD_SET);
+    }
+    if !password_is(decode_permanent_password_h1_from_storage(&storage), &salt, password) {
+        return Err(WRONG_PASSWORD);
+    }
+    let fresh = Config::get_auto_password(32);
+    let stored = Config::set_permanent_password_storage_for_sync("", &fresh).is_ok()
+        && Config::set_permanent_password(password)
+        && {
+            let (s2, salt2) = Config::get_local_permanent_password_storage_and_salt();
+            salt2 == fresh && password_is(decode_permanent_password_h1_from_storage(&s2), &salt2, password)
+        };
+    if !stored {
+        hbb_common::log::error!("always ask: salt not turned over, putting the old one back");
+        let _ = Config::set_permanent_password_storage_for_sync(&storage, &salt);
+        return Err(SALT_FAILED);
+    }
+    Ok(())
+}
+
+/// The one way the Trusted list is changed: under [`EDIT_LOCK`], on the list as the service
+/// holds it now (the only writer: [`keep_live`] stops the settings window's stale copy), never
+/// over an unreadable one. `f` returns its result and whether to save.
+fn edit_list<R>(f: impl FnOnce(&mut Trusted) -> Result<(R, bool), &'static str>) -> Result<R, &'static str> {
+    let _lock = EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let raw = Config::get_option(TRUSTED_OPTION);
+    let mut t = Trusted::parse_strict(&raw).ok_or(UNREADABLE)?;
+    t.new_always_ask = Config::get_option(NEW_ALWAYS_ASK_OPTION) == "Y";
+    let (r, save) = f(&mut t)?;
+    if save {
+        t.save();
+        EDITS.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(r)
+}
+
+/// The service's answer to Settings' edit `request` (JSON [`Edit`]): `{"ok":true}`, or
+/// `{"ok":false,"error":...}` with nothing changed. src/ipc.rs calls it (rebrand T04_EDIT_IPC).
+pub fn edit(request: &str) -> String {
+    let result = match serde_json::from_str::<Edit>(request) {
+        Err(_) => Err(UNREADABLE),
+        Ok(edit) => edit_list(|t| {
+            let (planned, rotate) = plan_edit(&t.to_json(), &edit)?;
+            if rotate {
+                if let Edit::AlwaysAsk { password, .. } = &edit {
+                    rotate_salt(password)?;
+                }
+            }
+            let changed = planned.list != t.list;
+            t.list = planned.list;
+            Ok(((), changed))
+        }),
+    };
+    match result {
+        Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+        Err(e) => {
+            hbb_common::log::warn!("Trusted list edit refused: {}", e);
+            serde_json::json!({ "ok": false, "error": e }).to_string()
+        }
+    }
+}
+
+/// src/ipc.rs, before it stores a whole options map the settings window sent (rebrand
+/// T04_KEEP_LIST): the Trusted list in it is that window's copy, up to a second old, so the
+/// service's own is kept. Only [`edit_list`] changes it.
+pub fn keep_trusted_list(mut options: HashMap<String, String>) -> HashMap<String, String> {
+    keep_live(&mut options, &Config::get_option(TRUSTED_OPTION));
+    options
+}
+
+fn keep_live(options: &mut HashMap<String, String>, live: &str) {
+    if live.is_empty() {
+        options.remove(TRUSTED_OPTION);
+    } else {
+        options.insert(TRUSTED_OPTION.to_owned(), live.to_owned());
     }
 }
 
@@ -379,11 +598,11 @@ pub async fn answer(stream: &mut Stream, trusted: &Trusted, ms: u64) -> ResultTy
         Some(t) if !t.removed && t.always_ask => {
             // Still Trusted, so no fresh token: it keeps this one, and this one keeps asking.
             stream.send(&frame(&[])).await?;
-            Ok(Admission { always_ask: Some(t.name.clone()), ..Default::default() })
+            Ok(Admission { always_ask: Some(t.name.clone()), key: Some(t.key.clone()), ..Default::default() })
         }
         Some(t) if !t.removed => {
             stream.send(&frame(&[])).await?;
-            Ok(Admission { trusted: Some(t.name.clone()), ..Default::default() })
+            Ok(Admission { trusted: Some(t.name.clone()), key: Some(t.key.clone()), ..Default::default() })
         }
         Some(t) => {
             // Removed: no fresh token, so the Controller keeps presenting this one and stays
@@ -646,7 +865,7 @@ mod tests {
     fn a_1_7_0_trust_file_loads_unchanged() {
         let t = Trusted::parse(TRUST_FILE_1_7_0);
         assert_eq!(t.list().len(), 1);
-        assert!(t.0.iter().all(|c| !c.always_ask), "off unless switched on");
+        assert!(t.list.iter().all(|c| !c.always_ask), "off unless switched on");
         assert_eq!(t.to_json(), TRUST_FILE_1_7_0, "off is not written, so 1.7.0 reads it back as it was");
     }
 
@@ -747,6 +966,112 @@ mod tests {
                    r#"{"boring_remote":"1.7.0","is_installed":true}"#] {
             assert!(!asks_every_time(no), "{}", no);
         }
+    }
+
+    #[tokio::test]
+    async fn new_computers_always_ask_when_this_mac_says_so() {
+        // Forget + rename on a Controller, then the password: a new entry. With the host-wide
+        // switch on it starts asking; off (the default) it comes in silently next time, as 1.7.0.
+        let mut trusted = Trusted { new_always_ask: true, ..Default::default() };
+        let (mut a, _) = connect(&trusted, None).await;
+        assert!(a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Renamed Laptop"));
+        assert!(trusted.list()[0].always_ask);
+        let mut trusted = Trusted::default();
+        let (mut b, _) = connect(&trusted, None).await;
+        assert!(b.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2"));
+        assert!(!trusted.list()[0].always_ask);
+    }
+
+    fn always_ask(key: &str, on: bool, password: &str) -> Edit {
+        Edit::AlwaysAsk { key: key.into(), on, password: password.into() }
+    }
+
+    #[test]
+    fn settings_edits_apply_to_the_list_as_it_is_now() {
+        let raw = TRUST_FILE_1_7_0; // aa11 listed, bb22 removed
+        let (t, rotate) = plan_edit(raw, &always_ask("aa11", true, "pw")).unwrap();
+        assert!(rotate, "on: the salt turns over, so every saved password stops working");
+        assert!(t.list()[0].always_ask);
+        let (again, rotate) = plan_edit(&t.to_json(), &always_ask("aa11", true, "pw")).unwrap();
+        assert!(!rotate && again == t, "already on: nothing to do");
+        let (t, rotate) = plan_edit(&t.to_json(), &always_ask("aa11", false, "")).unwrap();
+        assert!(!rotate);
+        assert_eq!(t.to_json(), TRUST_FILE_1_7_0, "off: back to what 1.7.0 wrote");
+        assert_eq!(plan_edit(raw, &always_ask("aa11", true, "")).unwrap_err(), NEED_PASSWORD);
+        assert_eq!(plan_edit(raw, &always_ask("bb22", true, "pw")).unwrap_err(), NOT_ON_LIST, "removed: no switch");
+        assert_eq!(plan_edit(raw, &always_ask("cc33", false, "")).unwrap_err(), NOT_ON_LIST);
+
+        let (t, _) = plan_edit(raw, &Edit::Remove { key: "aa11".into() }).unwrap();
+        assert!(t.list().is_empty());
+        assert!(t.list.iter().find(|c| c.key == "aa11").unwrap().removed, "kept, hidden (A2 step 5)");
+        assert_eq!(plan_edit(raw, &Edit::Remove { key: "bb22".into() }).unwrap_err(), NOT_ON_LIST);
+        let (t, _) = plan_edit(raw, &Edit::Allow { key: "bb22".into() }).unwrap();
+        assert_eq!(t.list().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Edit Bay 2", "Stage Left"]);
+        assert_eq!(plan_edit(raw, &Edit::Allow { key: "aa11".into() }).unwrap_err(), NOT_ON_LIST);
+
+        // What Settings sends (kit/trust.dart trustEdit).
+        let sent = r#"{"op":"always_ask","key":"aa11","on":true,"password":"pw"}"#;
+        assert_eq!(serde_json::from_str::<Edit>(sent).unwrap(), always_ask("aa11", true, "pw"));
+        assert_eq!(serde_json::from_str::<Edit>(r#"{"op":"remove","key":"aa11"}"#).unwrap(), Edit::Remove { key: "aa11".into() });
+    }
+
+    #[test]
+    fn an_unreadable_list_is_never_written_over() {
+        for bad in ["not json", "{}", r#"[{"key":1}]"#] {
+            assert_eq!(Trusted::parse_strict(bad), None, "{}", bad);
+            assert_eq!(plan_edit(bad, &Edit::Remove { key: "aa11".into() }).unwrap_err(), UNREADABLE, "{}", bad);
+            assert_eq!(plan_edit(bad, &always_ask("aa11", false, "")).unwrap_err(), UNREADABLE, "{}", bad);
+        }
+        assert_eq!(Trusted::parse_strict(""), Some(Trusted::default()), "unset is an empty list");
+        assert_eq!(plan_edit("", &Edit::Remove { key: "aa11".into() }).unwrap_err(), NOT_ON_LIST);
+    }
+
+    #[test]
+    fn only_the_unattended_password_itself_turns_always_ask_on() {
+        let stored = compute_permanent_password_h1("Studio-pass-1", "salt-a");
+        assert!(password_is(Some(stored), "salt-a", "Studio-pass-1"));
+        for (h1, salt, typed) in [(Some(stored), "salt-a", "studio-pass-1"), (Some(stored), "salt-b", "Studio-pass-1"),
+                                  (None, "salt-a", "Studio-pass-1"), (Some(stored), "salt-a", "")] {
+            assert!(!password_is(h1, salt, typed), "{} {}", salt, typed);
+        }
+        // What a Controller saves is this same salted hash. A new salt, same password: what it
+        // saved no longer matches, so it has to be typed again (H1).
+        assert_ne!(compute_permanent_password_h1("Studio-pass-1", "salt-b"), stored);
+    }
+
+    #[tokio::test]
+    async fn switching_on_ends_a_session_that_came_in_without_the_password() {
+        let (mut trusted, token, key) = always_ask_controller().await;
+        trusted.set_always_ask(&key, false);
+        let (silent, _) = connect(&trusted, Some(token.clone())).await;
+        assert!(silent.is_trusted() && !silent.lost_trust_in(&trusted));
+        trusted.set_always_ask(&key, true);
+        assert!(silent.lost_trust_in(&trusted), "in silently, then switched on: ended");
+        let (mut asked, _) = connect(&trusted, Some(token)).await;
+        asked.unattended_password_right();
+        assert!(!asked.lost_trust_in(&trusted), "gave the password: stays");
+
+        // A stranger let in and stored, then switched on in Settings while still connected.
+        let mut t = Trusted::default();
+        let (mut s, _) = connect(&t, None).await;
+        assert!(s.approve_into(&mut t, SignIn::Allowed, "Stage Left"));
+        let k = t.list()[0].key.clone();
+        assert!(!s.lost_trust_in(&t));
+        t.set_always_ask(&k, true);
+        assert!(s.lost_trust_in(&t));
+        assert!(!Admission::default().lost_trust_in(&t), "no token: nothing to match");
+    }
+
+    #[test]
+    fn a_whole_options_write_from_the_settings_window_never_carries_the_trusted_list() {
+        let ui = |v: &str| HashMap::from([(TRUSTED_OPTION.to_owned(), v.to_owned()), ("x".to_owned(), "1".to_owned())]);
+        let mut sent = ui("[]");
+        keep_live(&mut sent, TRUST_FILE_1_7_0);
+        assert_eq!(sent[TRUSTED_OPTION], TRUST_FILE_1_7_0, "the window's stale copy is ignored");
+        assert_eq!(sent["x"], "1");
+        let mut sent = ui(TRUST_FILE_1_7_0);
+        keep_live(&mut sent, "");
+        assert!(!sent.contains_key(TRUSTED_OPTION));
     }
 
     #[test]
