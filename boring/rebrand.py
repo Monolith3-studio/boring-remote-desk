@@ -843,6 +843,78 @@ T04_ALWAYS_ASK_FORGET = (
     "            config.password = Default::default();\n"
     "        }\n")
 T04_ALWAYS_ASK_FORGET_AT = "        if let Some((_, b, c)) = self.other_server.as_ref() {\n            if b != PUBLIC_SERVER {\n"
+# Review follow-up L1: a Controller switched to always ask while it is in, without having given
+# the Unattended Password, is let go at the next second (base::trust::Admission::lost_trust).
+T04_ALWAYS_ASK_KICK_AT = "                _ = second_timer.tick() => {\n"
+T04_ALWAYS_ASK_KICK = (
+    "                    // boring-remote: switched to always ask in Settings after it got in without the\n"
+    "                    // Unattended Password: this session ends now (base::trust).\n"
+    "                    if conn.authorized && conn.boring_trust.lost_trust() {\n"
+    "                        conn.send_close_reason_no_retry(base::trust::ASKS_EVERY_TIME).await;\n"
+    "                        conn.on_close(\"always ask for password\", true).await;\n"
+    "                        break;\n"
+    "                    }\n")
+# Review follow-up L2: the Trusted list has one writer, the service. Settings' Remove, Allow and
+# Always ask go over ipc as an edit (base::trust::edit, one locked read-modify-write on the live
+# list) and wait for its answer; a settings window's whole-options write never carries its stale
+# copy of the list (keep_trusted_list).
+T04_EDIT_IPC_AT = ('                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);\n'
+                   '                } else if name == "salt" {\n')
+T04_EDIT_IPC = (
+    "                } else if name == base::trust::EDIT_CONFIG {\n"
+    "                    // boring-remote: Settings' Remove, Allow and \"Always ask for password\", one locked\n"
+    "                    // edit of the Trusted list here in the service; its answer goes back (base::trust).\n"
+    "                    let answer = base::trust::edit(&value);\n"
+    "                    allow_err!(stream.send(&Data::Config((name.clone(), Some(answer)))).await);\n")
+T04_KEEP_LIST_OLD = "                Config::set_options(value);\n                allow_err!(stream.send(&Data::Options(None)).await);\n"
+T04_KEEP_LIST = (
+    "                // boring-remote: the Trusted list in a settings window's whole-options write is its\n"
+    "                // stale copy; the service's own stays (base::trust::keep_trusted_list).\n"
+    "                Config::set_options(base::trust::keep_trusted_list(value));\n"
+    "                allow_err!(stream.send(&Data::Options(None)).await);\n")
+T04_EDIT_ASK_AT = '#[tokio::main(flavor = "current_thread")]\npub async fn set_permanent_password_with_ack('
+T04_EDIT_ASK = (
+    "/// boring-remote: Settings' Trusted list edit, done by the service (base::trust::edit): its\n"
+    "/// answer, or a refusal saying it didn't answer. The edit can carry a password: never logged.\n"
+    "#[tokio::main(flavor = \"current_thread\")]\n"
+    "pub async fn boring_trust_edit(edit: String) -> String {\n"
+    "    match boring_trust_edit_async(edit).await {\n"
+    "        Ok(answer) => {\n"
+    "            // Always ask turned the salt over: the user config's copy follows, as after a\n"
+    "            // password change.\n"
+    "            if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {\n"
+    "                log::warn!(\"Failed to sync permanent password storage from daemon: {err}\");\n"
+    "            }\n"
+    "            answer\n"
+    "        }\n"
+    "        Err(err) => {\n"
+    "            log::warn!(\"Trusted list edit: no answer from the service: {err}\");\n"
+    "            serde_json::json!({ \"ok\": false, \"error\": base::trust::NO_SERVICE }).to_string()\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "async fn boring_trust_edit_async(edit: String) -> ResultType<String> {\n"
+    "    let ms_timeout = 5_000;\n"
+    "    let mut c = connect(ms_timeout, \"\").await?;\n"
+    "    c.send_config(base::trust::EDIT_CONFIG, edit).await?;\n"
+    "    if let Some(Data::Config((name, Some(answer)))) = c.next_timeout(ms_timeout).await? {\n"
+    "        if name == base::trust::EDIT_CONFIG {\n"
+    "            return Ok(answer);\n"
+    "        }\n"
+    "    }\n"
+    "    bail!(\"no answer\")\n"
+    "}\n"
+    "\n")
+T04_EDIT_FFI = (
+    "/// boring-remote: Settings' Remove, Allow and \"Always ask for password\" (base::trust::edit),\n"
+    "/// done by the service; returns its answer. Blocking ipc, so it runs on a bridge worker.\n"
+    "pub fn boring_trust_edit(edit: String) -> String {\n"
+    "    #[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+    "    return crate::ipc::boring_trust_edit(edit);\n"
+    "    #[cfg(any(target_os = \"android\", target_os = \"ios\"))]\n"
+    "    return base::trust::edit(&edit);\n"
+    "}\n\n")
 T04_TRUSTED_SKIP = T04_ALWAYS_ASK + (
     "            // boring-remote (v1.7 t04): only a token this Mac issued skips the ask (ADR 0005).\n"
     "            if self.boring_trust.is_trusted() {\n"
@@ -1003,6 +1075,14 @@ PATCHES += [
      "always ask: no sign-in lets it in without the Unattended Password"),
     ("src/client.rs", T04_ALWAYS_ASK_FORGET_AT, T04_ALWAYS_ASK_FORGET + T04_ALWAYS_ASK_FORGET_AT,
      "always ask: the Controller keeps no password for that Target"),
+    (CONN, T04_ALWAYS_ASK_KICK_AT, T04_ALWAYS_ASK_KICK_AT + T04_ALWAYS_ASK_KICK,
+     "always ask: a session that got in without the password ends when switched on"),
+    ("src/ipc.rs", T04_EDIT_IPC_AT, T04_EDIT_IPC_AT.replace('                } else if name == "salt"', T04_EDIT_IPC + '                } else if name == "salt"'),
+     "Trusted list: Settings' edits, one locked write in the service"),
+    ("src/ipc.rs", T04_KEEP_LIST_OLD, T04_KEEP_LIST, "Trusted list: a settings window's stale copy is never stored"),
+    ("src/ipc.rs", T04_EDIT_ASK_AT, T04_EDIT_ASK + T04_EDIT_ASK_AT, "Trusted list: Settings waits for the service's answer"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     T04_EDIT_FFI + "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n", "Trusted list edit bridge call"),
     (CONN, "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
      T04_TRUSTED_SKIP + "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
      "a Trusted Controller skips the ask"),
@@ -1702,30 +1782,32 @@ T04_SETTINGS_LINK = (
     "                    body: TrustedControllersPage(\n"
     "                      trusted: parseTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption)),\n"
     "                      known: parseKnown(bind.mainGetLocalOption(key: kDirectLinkKnownOption)),\n"
-    "                      onRemove: (k) => bind.mainSetOption(\n"
-    "                          key: kTrustedControllersOption,\n"
-    "                          value: removeTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption), k)),\n"
-    "                      // Always ask for password: the server option, over ipc to the service, as Remove.\n"
-    "                      onAlwaysAsk: (k, on) => bind.mainSetOption(\n"
-    "                          key: kTrustedControllersOption,\n"
-    "                          value: setAlwaysAsk(bind.mainGetOptionSync(key: kTrustedControllersOption), k, on)),\n"
+    "                      // Every change to the list is the service's, one locked edit there (base::trust::edit);\n"
+    "                      // each returns null once saved, else why not.\n"
+    "                      onRemove: (k) async =>\n"
+    "                          trustEditError(await bind.boringTrustEdit(edit: trustEdit('remove', k))),\n"
+    "                      // Always ask for password: on carries the Unattended Password typed here.\n"
+    "                      onAlwaysAsk: (k, on, pw) async => trustEditError(\n"
+    "                          await bind.boringTrustEdit(edit: trustEdit('always_ask', k, on: on, password: pw))),\n"
+    "                      newAlwaysAsk: bind.mainGetOptionSync(key: kNewAlwaysAskOption) == 'Y',\n"
+    "                      onNewAlwaysAsk: (on) => bind.mainSetOption(key: kNewAlwaysAskOption, value: on ? 'Y' : ''),\n"
     "                      onForget: (id) async {\n"
     "                        for (final o in [kDirectLinkKnownOption, kTrustTokensOption]) {\n"
     "                          await bind.mainSetLocalOption(\n"
     "                              key: o, value: forgetId(bind.mainGetLocalOption(key: o), id));\n"
     "                        }\n"
     "                      },\n"
-    "                      // Allow here = Allow on the prompt: Trusted again (the server option, over ipc to\n"
-    "                      // the service, as Remove), and a live ask from it is let in (kit/approval.dart).\n"
+    "                      // Allow here = Allow on the prompt: Trusted again (the service's edit, as Remove),\n"
+    "                      // and a live ask from it is let in (kit/approval.dart).\n"
     "                      removed: parseRemoved(bind.mainGetOptionSync(key: kTrustedControllersOption)),\n"
     "                      onAllow: (c) async {\n"
-    "                        await bind.mainSetOption(\n"
-    "                            key: kTrustedControllersOption,\n"
-    "                            value: reinstateTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption), c.key));\n"
+    "                        final error = trustEditError(await bind.boringTrustEdit(edit: trustEdit('allow', c.key)));\n"
+    "                        if (error != null) return error;\n"
     "                        // Only the ask that presented its token, never one using its name (audit H1).\n"
     "                        for (final id in waitingFrom(c, ApprovalDesk.waitingNow.value)) {\n"
     "                          ApprovalDesk.main?.decide(id, true);\n"
     "                        }\n"
+    "                        return null;\n"
     "                      },\n"
     "                      waiting: WaitingApprovals(\n"
     "                        waiting: ApprovalDesk.waitingNow,\n"
@@ -3786,6 +3868,22 @@ def _patch(text, old, new):
     return text.replace(old, new), text.count(old)
 
 
+# Anchors that must be in their file exactly once (review L5): a second copy would put a trust
+# hook in twice, or somewhere the checks don't look. A count over one is a moved target.
+ONCE = {
+    "a Trusted Controller skips the ask",
+    "Trusted by Allow or the Unattended Password only",
+    "always ask: tell the Controller in PeerInfo",
+    "always ask: no sign-in lets it in without the Unattended Password",
+    "always ask: the Controller keeps no password for that Target",
+    "always ask: a session that got in without the password ends when switched on",
+    "Trusted list: Settings' edits, one locked write in the service",
+    "Trusted list: a settings window's stale copy is never stored",
+    "Trusted list: Settings waits for the service's answer",
+    "Trusted list edit bridge call",
+}
+
+
 def plan(root):
     """Everything a run would do, without touching the tree.
 
@@ -3800,6 +3898,9 @@ def plan(root):
             moved.append(f"{rel}: file missing ({why})")
             continue
         text2, n = _patch(text, old, new)
+        if n > 1 and why in ONCE:
+            moved.append(f"{rel}: patch anchor not unique, {n} copies ({why})")
+            continue
         if n:
             texts[rel] = (text2, crlf)
             changed.append(f"{rel}: {why}")

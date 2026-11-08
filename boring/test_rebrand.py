@@ -51,6 +51,10 @@ ROOT_BUNDLE = check.ROOT_BUNDLE
 SETTINGS_ALLOW = "Settings: Allow next to removed and waiting Controllers, over the service like Remove (t04)"
 ALWAYS_ASK = check.ALWAYS_ASK
 ALWAYS_ASK_FORGET = check.ALWAYS_ASK_FORGET
+ALWAYS_ASK_SALT = check.ALWAYS_ASK_SALT
+TRUST_WRITES = check.TRUST_WRITES
+NEW_ALWAYS_ASK = check.NEW_ALWAYS_ASK
+AUTHORIZED_ONCE = check.AUTHORIZED_ONCE
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 
@@ -110,7 +114,8 @@ class RebrandSeam(unittest.TestCase):
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
                      "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
                      CONNECT_DIRECT, NOT_FOUND_TRANSLATED, CONNECT_ENCRYPTED, TRUST_WIRED, ONE_TIME_CODE,
-                     HE_WIRED, RUST_HOOKS, SUPPORT, ASK_INFO, ROOT_BUNDLE, ALWAYS_ASK, ALWAYS_ASK_FORGET):
+                     HE_WIRED, RUST_HOOKS, SUPPORT, ASK_INFO, ROOT_BUNDLE, ALWAYS_ASK, ALWAYS_ASK_FORGET,
+                     TRUST_WRITES, NEW_ALWAYS_ASK):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -912,7 +917,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_remove_dropping_the_entry_fails_check(self):
         self.rebrand()
-        self.edit("flutter/lib/desktop/kit/trust.dart", "{...e, 'removed': true} else e", "{} else e")
+        self.edit("libs/base/src/trust.rs", "                t.removed = true;\n", "")
         self.assert_check_fails(REMOVED_ASKS)
 
     # --- Always ask for password (per Trusted Controller) ------------------------------
@@ -944,11 +949,60 @@ class RebrandSeam(unittest.TestCase):
         self.edit("libs/base/src/trust.rs", "        if self.always_ask.is_some() {\n            return false;\n        }\n", "")
         self.assert_check_fails(ALWAYS_ASK)
 
-    def test_always_ask_saved_as_a_local_option_fails_check(self):  # the service would never see it
+    def test_always_ask_switched_without_the_typed_password_fails_check(self):
         self.rebrand()
-        self.edit(rebrand.SETTINGS, "onAlwaysAsk: (k, on) => bind.mainSetOption(",
-                  "onAlwaysAsk: (k, on) => bind.mainSetLocalOption(")
+        self.edit(rebrand.SETTINGS, "trustEdit('always_ask', k, on: on, password: pw)",
+                  "trustEdit('always_ask', k, on: on, password: '')")
         self.assert_check_fails(ALWAYS_ASK)
+
+    def test_a_session_kept_after_switch_on_fails_check(self):  # review L1
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.T04_ALWAYS_ASK_KICK, "")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_always_ask_on_without_turning_the_salt_over_fails_check(self):  # review H1
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "                    rotate_salt(password)?;\n", "")
+        self.assert_check_fails(ALWAYS_ASK_SALT)
+
+    def test_settings_writing_the_list_option_itself_fails_check(self):  # review L2
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "                      onForget: (id) async {\n",
+                  "                      onForget: (id) async {\n"
+                  "                        await bind.mainSetOption(key: kTrustedControllersOption, value: '[]');\n")
+        self.assert_check_fails(TRUST_WRITES)
+
+    def test_a_settings_windows_stale_list_stored_fails_check(self):  # review L2
+        self.rebrand()
+        self.edit("src/ipc.rs", rebrand.T04_KEEP_LIST, rebrand.T04_KEEP_LIST_OLD)
+        self.assert_check_fails(TRUST_WRITES)
+
+    def test_an_unreadable_list_written_over_fails_check(self):  # review L2
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "Trusted::parse_strict(&raw).ok_or(UNREADABLE)?", "Trusted::parse(&raw)")
+        self.assert_check_fails(TRUST_WRITES)
+
+    def test_new_computers_switch_ignored_fails_check(self):  # review M1
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "self.new_always_ask ||", "false ||")
+        self.assert_check_fails(NEW_ALWAYS_ASK)
+
+    def test_a_second_place_that_lets_a_session_in_fails_check(self):  # review L5
+        self.rebrand()
+        self.edit("src/server/connection.rs", "        self.authorized = true;\n",
+                  "        self.authorized = true;\n        self.authorized = true;\n")
+        self.assert_check_fails(AUTHORIZED_ONCE)
+
+    def test_a_trust_anchor_found_twice_is_a_moved_target(self):  # review L5
+        before = tree_hashes(self.root)
+        self.edit("src/client.rs", rebrand.T04_ALWAYS_ASK_FORGET_AT,
+                  rebrand.T04_ALWAYS_ASK_FORGET_AT + "            }\n        }\n" + rebrand.T04_ALWAYS_ASK_FORGET_AT)
+        edited = tree_hashes(self.root)
+        r = run(REBRAND, self.root)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("patch anchor not unique, 2 copies (always ask: the Controller keeps no password", r.stderr)
+        self.assertEqual(tree_hashes(self.root), edited, "nothing written")
+        self.assertNotEqual(before, edited)
 
     def test_controller_keeping_the_password_of_a_target_that_always_asks_fails_check(self):
         self.rebrand()

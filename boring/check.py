@@ -930,7 +930,8 @@ def trust_checks(c, cfg):
         ("approve_into re-trusts a removed Controller only on Allow",
          "if how != SignIn::Allowed {" in grant and "t.reinstate(key, name)" in grant),
         ("Remove in Settings keeps the entry, hidden, so the token is still known",
-         "'removed': true" in (fn_body(dart, "String removeTrusted(") or "")),
+         "t.removed = true;" in (fn_body(rs, "    pub fn remove(") or "")
+         and "if !t.remove(key) {" in (fn_body(rs, "fn plan_edit(") or "")),
     ] if not ok]
     c.fact(REMOVED_ASKS, not removed, "; ".join(removed))
     always_ask_checks(c, conn, rs, dart)
@@ -959,6 +960,10 @@ def trust_checks(c, cfg):
 
 ALWAYS_ASK = "an always-ask Trusted Controller gets in by the Unattended Password only, every connect"
 ALWAYS_ASK_FORGET = "a Controller keeps no password for a Target that always asks it"
+ALWAYS_ASK_SALT = "turning always ask on turns the Unattended Password's salt over: no saved copy still works (H1)"
+TRUST_WRITES = "the Trusted list has one writer: the service's locked edit, never over an unreadable list (L2)"
+NEW_ALWAYS_ASK = "New computers always ask for password: off unless set; on, every new Controller starts asking (M1)"
+AUTHORIZED_ONCE = "connection.rs lets a session in at one place only: self.authorized = true once (L5)"
 
 
 def always_ask_checks(c, conn, rs, dart):
@@ -997,13 +1002,61 @@ def always_ask_checks(c, conn, rs, dart):
          grant.lstrip().split("// A removed Controller", 1)[0].count("if self.always_ask.is_some() {\n            return false;\n        }") == 1),
         ("off unless set, and off is never written (1.7.0 lists load unchanged)",
          '#[serde(default, skip_serializing_if = "is_false")]\n    pub always_ask: bool,' in rs),
-        ("Settings switches it over the server option (the service), as Remove",
-         "onAlwaysAsk: (k, on) => bind.mainSetOption(\n                          key: kTrustedControllersOption,\n"
-         "                          value: setAlwaysAsk(" in settings
-         and "mainSetLocalOption(key: kTrustedControllersOption" not in settings
-         and "e['removed'] != true" in (fn_body(dart, "String setAlwaysAsk(") or "")),
+        ("Settings switches it through the service's edit, as Remove",
+         "onAlwaysAsk: (k, on, pw) async => trustEditError(" in settings
+         and "trustEdit('always_ask', k, on: on, password: pw)" in settings),
+        ("switched on while it is in without the password: that session ends within a second",
+         rebrand.T04_ALWAYS_ASK_KICK_AT + rebrand.T04_ALWAYS_ASK_KICK in conn
+         and "!self.password_right && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)"
+         in (fn_body(rs, "    fn lost_trust_in(") or "")),
     ] if not ok]
     c.fact(ALWAYS_ASK, not bad, "; ".join(bad))
+
+    edit, rotate = fn_body(rs, "pub fn edit(request: &str) -> String {") or "", fn_body(rs, "fn rotate_salt(") or ""
+    salt = [n for n, ok in [
+        ("turning it on turns the salt over first, or nothing is saved",
+         -1 < edit.find("rotate_salt(password)?;") < edit.find("t.list = planned.list;")
+         and "*on && !was" in (fn_body(rs, "fn plan_edit(") or "")),
+        ("only the Unattended Password typed here does it; a failure puts the old salt back",
+         -1 < rotate.find("return Err(WRONG_PASSWORD);") < rotate.find("Config::get_auto_password(32)")
+         and "Config::set_permanent_password_storage_for_sync(&storage, &salt);" in rotate),
+        ("Settings asks for the password before it turns it on",
+         "final password = on ? await _askPassword() : '';" in dart and "String alwaysAskAsk()" in dart),
+    ] if not ok]
+    c.fact(ALWAYS_ASK_SALT, not salt, "; ".join(salt))
+
+    lib, ffi, kit_settings = c.read("src/ipc.rs"), c.read("src/flutter_ffi.rs"), settings
+    elist = fn_body(rs, "fn edit_list<R>(") or ""
+    writes = [n for n, ok in [
+        ("Settings' edits go to the service and wait for its answer",
+         rebrand.T04_EDIT_IPC in lib and rebrand.T04_EDIT_ASK in lib and rebrand.T04_EDIT_FFI in ffi),
+        ("a settings window's whole-options write never carries its copy of the list",
+         rebrand.T04_KEEP_LIST in lib and rebrand.T04_KEEP_LIST_OLD not in lib),
+        ("one locked read-modify-write on the live list, never over an unreadable one",
+         "EDIT_LOCK.lock()" in elist and "Trusted::parse_strict(&raw).ok_or(UNREADABLE)?" in elist
+         and rs.count("t.save();") == 1 and "t.save();" in elist
+         and "edit_list(" in (fn_body(rs, "    pub fn approve(") or "") and "edit_list(" in edit),
+        ("Settings never writes the list option itself, and no answer is never taken as saved",
+         not re.search(r"mainSet\w*Option\(\s*key: kTrustedControllersOption", kit_settings)
+         and "return kTrustNoAnswer;" in (fn_body(dart, "String? trustEditError(String answer) {") or "")),
+    ] if not ok]
+    c.fact(TRUST_WRITES, not writes, "; ".join(writes))
+
+    add = fn_body(rs, "    fn add(") or ""
+    r = re.search(r'pub const NEW_ALWAYS_ASK_OPTION: &str = "([^"]+)";', rs)
+    d = re.search(r"const kNewAlwaysAskOption = '([^']+)';", dart)
+    new = [n for n, ok in [
+        ("option names agree in Rust and Dart", r and d and r.group(1) == d.group(1)),
+        ("off unless set: nothing ships it on", r and r.group(1) not in rebrand.DEFAULTS and r.group(1) not in rebrand.LOCKED),
+        ("on: every Controller stored from then on starts asking",
+         "self.new_always_ask ||" in add and "Config::get_option(NEW_ALWAYS_ASK_OPTION) == \"Y\"" in elist),
+        ("Settings shows and saves the switch",
+         "newAlwaysAsk: bind.mainGetOptionSync(key: kNewAlwaysAskOption) == 'Y'," in settings
+         and "onNewAlwaysAsk: (on) => bind.mainSetOption(key: kNewAlwaysAskOption, value: on ? 'Y' : '')," in settings),
+    ] if not ok]
+    c.fact(NEW_ALWAYS_ASK, not new, "; ".join(new))
+    n = conn.count("self.authorized = true;")
+    c.fact(AUTHORIZED_ONCE, n == 1 and "conn.authorized = true" not in conn, f"{n} copies")
 
     peer = fn_body(c.read("src/client.rs"), "    pub fn handle_peer_info(&mut self, pi: &PeerInfo) {") or ""
     forget = [n for n, ok in [
@@ -1058,17 +1111,16 @@ def approval_checks(c):
            not bad, "; ".join(bad))
 
     settings, simple = c.read(rebrand.SETTINGS), c.read("flutter/lib/desktop/kit/simple_settings.dart")
-    reinstate = fn_body(trust, "String reinstateTrusted(String json, String key, {int? now}) {") or ""
+    reinstate = fn_body(c.read(TRUST_RS), "fn plan_edit(") or ""
     grant = fn_body(c.read(TRUST_RS), "    fn reinstate(") or ""
     bad = [n for n, ok in [
         ("Trusted Controllers lists removed ones with Allow", "removed: parseRemoved(" in settings
          and "onAllow: (c) async {" in settings and "child: const Text('Allow')," in trust),
-        ("Allow there writes the server option (ipc to the service), never a local one",
-         "await bind.mainSetOption(\n                            key: kTrustedControllersOption,\n"
-         "                            value: reinstateTrusted(" in settings
-         and "mainSetLocalOption(key: kTrustedControllersOption" not in settings),
-        ("reinstateTrusted does what trust.rs reinstate does", "f.key != 'removed'" in reinstate
-         and "'added': at" in reinstate and "t.removed = false;" in grant and "t.added = now();" in grant),
+        ("Allow there is the service's edit (as Remove), never a write of the option itself",
+         "trustEditError(await bind.boringTrustEdit(edit: trustEdit('allow', c.key)))" in settings
+         and not re.search(r"mainSet\w*Option\(\s*key: kTrustedControllersOption", settings)),
+        ("the service's Allow is trust.rs reinstate", "Some(name) => t.reinstate(key, &name)," in reinstate
+         and "t.removed = false;" in grant and "t.added = now();" in grant),
         ("Allow there also lets in a live ask from it, matched by its trust key, never its name (audit H1)",
          "for (final id in waitingFrom(c, ApprovalDesk.waitingNow.value)) {" in settings
          and "w.name" not in (fn_body(settings, "onAllow: (c) async {") or "x")
