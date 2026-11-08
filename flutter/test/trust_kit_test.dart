@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
@@ -12,31 +14,29 @@ const knownJson = '{"123456789":{"pk":"00ff","lan":"192.168.1.20:21118","tailsca
     '"987654321":{"pk":"11ee","lan":"","tailscale":"100.64.0.2:21118"}}';
 
 void main() {
-  test('reads and removes Trusted Controllers in the Rust format', () {
+  test('reads Trusted Controllers in the Rust format', () {
     final list = parseTrusted(trustedJson);
     expect(list.map((c) => c.name), ['Edit Bay 2', 'Stage Left']);
-    expect(parseTrusted(removeTrusted(trustedJson, 'aa11')).map((c) => c.key), ['bb22']);
-    // Removed stays in the JSON, hidden, so the Target still knows that token and asks (A2 step 5).
-    expect(removeTrusted(trustedJson, 'aa11'), contains('"key":"aa11","name":"Edit Bay 2","added":1761955200,"removed":true'));
+    expect(list.map((c) => c.alwaysAsk), [false, false], reason: '1.7.0 lists are off');
+    const later = '[{"key":"aa11","name":"Edit Bay 2","always_ask":true},{"key":"bb22","name":"x","removed":true,"always_ask":true}]';
+    expect(parseTrusted(later).single.alwaysAsk, isTrue);
+    expect(parseRemoved(later).single.alwaysAsk, isTrue, reason: 'Allow brings it back still asking');
     expect(parseTrusted('[{"key":"aa11","name":"x","removed":true}]'), isEmpty);
     expect(parseTrusted(''), isEmpty);
     expect(parseTrusted('not json'), isEmpty);
   });
 
-  test('Always ask for password: read, switched on and off in the Rust format', () {
-    expect(parseTrusted(trustedJson).map((c) => c.alwaysAsk), [false, false], reason: '1.7.0 lists are off');
-    final on = setAlwaysAsk(trustedJson, 'aa11', true);
-    expect(on, contains('"key":"aa11","name":"Edit Bay 2","added":1761955200,"always_ask":true}'));
-    expect(parseTrusted(on).map((c) => c.alwaysAsk), [true, false]);
-    // Off is not written, as trust.rs skips it: the list goes back to exactly what 1.7.0 wrote.
-    expect(setAlwaysAsk(on, 'aa11', false), trustedJson);
-    // Remove and Allow keep it.
-    expect(parseRemoved(removeTrusted(on, 'aa11')).single.alwaysAsk, isTrue);
-    expect(parseTrusted(reinstateTrusted(removeTrusted(on, 'aa11'), 'aa11', now: 1)).first.alwaysAsk, isTrue);
-    // A removed one has no switch (trust.rs set_always_ask); bad JSON is no list, as for Remove.
-    final removed = removeTrusted(trustedJson, 'aa11');
-    expect(setAlwaysAsk(removed, 'aa11', true), removed);
-    expect(setAlwaysAsk('not json', 'aa11', true), '[]');
+  // Every change to the list is the service's (trust.rs `edit`): Settings sends what to do and
+  // shows what came back.
+  test('edits go to the service as trust.rs reads them, and its answer is shown as it is', () {
+    expect(jsonDecode(trustEdit('remove', 'aa11')), {'op': 'remove', 'key': 'aa11'});
+    expect(jsonDecode(trustEdit('always_ask', 'aa11', on: true, password: 'pw')),
+        {'op': 'always_ask', 'key': 'aa11', 'on': true, 'password': 'pw'});
+    expect(trustEditError('{"ok":true}'), isNull);
+    expect(trustEditError('{"ok":false,"error":"That isn\'t this computer\'s Unattended Password."}'),
+        "That isn't this computer's Unattended Password.");
+    expect(trustEditError(''), kTrustNoAnswer, reason: 'no answer is never taken as saved');
+    expect(trustEditError('{"ok":false}'), kTrustNoAnswer);
   });
 
   // v1.7 t26: Home keys a recent by the key pinned for its Target ID or last address.
@@ -72,7 +72,10 @@ void main() {
     await tester.pumpWidget(host(TrustedControllersPage(
       trusted: parseTrusted(trustedJson),
       known: const [],
-      onRemove: (k) async => removed.add(k),
+      onRemove: (k) async {
+        removed.add(k);
+        return null;
+      },
       onForget: (_) async {},
     )));
     expect(find.text('Edit Bay 2'), findsOneWidget);
@@ -85,32 +88,98 @@ void main() {
     expect(find.text('Stage Left'), findsOneWidget);
   });
 
+  Widget page({
+    String json = trustedJson,
+    String? answer,
+    List<String>? sent,
+    bool newAlwaysAsk = false,
+    List<bool>? newSent,
+  }) =>
+      host(TrustedControllersPage(
+        trusted: parseTrusted(json),
+        known: const [],
+        onRemove: (k) async {
+          sent?.add('remove $k');
+          return answer;
+        },
+        onForget: (_) async {},
+        onAlwaysAsk: (k, on, pw) async {
+          sent?.add('$k $on $pw');
+          return answer;
+        },
+        newAlwaysAsk: newAlwaysAsk,
+        onNewAlwaysAsk: (on) async => newSent?.add(on),
+      ));
+
+  bool value(WidgetTester tester, String key) => tester.widget<SwitchListTile>(find.byKey(ValueKey('always-ask-$key'))).value;
+
   testWidgets('each Trusted computer has Always ask for password, off unless set', (tester) async {
-    final set = <String>[];
-    await tester.pumpWidget(host(TrustedControllersPage(
-      trusted: parseTrusted(setAlwaysAsk(trustedJson, 'bb22', true)),
-      known: const [],
-      onRemove: (_) async {},
-      onForget: (_) async {},
-      onAlwaysAsk: (k, on) async => set.add('$k $on'),
-    )));
+    final sent = <String>[];
+    await tester.pumpWidget(page(json: '[{"key":"aa11","name":"Edit Bay 2"},{"key":"bb22","name":"Stage Left","always_ask":true}]', sent: sent));
     expect(find.text('Always ask for password'), findsNWidgets(2));
     expect(find.text(alwaysAskWhy()), findsNWidgets(2));
-    expect(alwaysAskWhy(), "It needs this Mac's Unattended Password every time it connects.");
-    bool value(int i) => tester.widget<SwitchListTile>(find.byType(SwitchListTile).at(i)).value;
-    expect([value(0), value(1)], [false, true]);
-    await tester.tap(find.text('Always ask for password').first);
+    expect(alwaysAskWhy(),
+        "It needs this Mac's Unattended Password every time it connects. Turning it on makes every computer that saved the password type it again.");
+    expect([value(tester, 'aa11'), value(tester, 'bb22')], [false, true]);
+
+    // Off: no password needed, saved at once.
+    await tester.tap(find.byKey(const ValueKey('always-ask-bb22')));
     await tester.pumpAndSettle();
-    expect(set, ['aa11 true']);
-    expect(value(0), isTrue);
-    await tester.tap(find.text('Always ask for password').last);
+    expect(sent, ['bb22 false ']);
+    expect(value(tester, 'bb22'), isFalse);
+
+    // On: the Unattended Password, typed here, first. Cancel changes nothing.
+    await tester.tap(find.byKey(const ValueKey('always-ask-aa11')));
     await tester.pumpAndSettle();
-    expect(set, ['aa11 true', 'bb22 false']);
-    expect(value(1), isFalse);
+    expect(find.text(alwaysAskAsk()), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(sent, ['bb22 false ']);
+    expect(value(tester, 'aa11'), isFalse);
+    await tester.tap(find.byKey(const ValueKey('always-ask-aa11')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'Studio-pass-1');
+    await tester.tap(find.text('Turn on'));
+    await tester.pumpAndSettle();
+    expect(sent, ['bb22 false ', 'aa11 true Studio-pass-1']);
+    expect(value(tester, 'aa11'), isTrue);
+
     // No onAlwaysAsk, nowhere to save it: no switch.
     await tester.pumpWidget(host(TrustedControllersPage(
-        trusted: parseTrusted(trustedJson), known: const [], onRemove: (_) async {}, onForget: (_) async {})));
+        trusted: parseTrusted(trustedJson), known: const [], onRemove: (_) async => null, onForget: (_) async {})));
     expect(find.text('Always ask for password'), findsNothing, reason: 'no switch without somewhere to save it');
+    expect(find.text('New computers always ask for password'), findsNothing);
+  });
+
+  testWidgets('a refused change shows why and leaves the page as saved', (tester) async {
+    const why = "That isn't this computer's Unattended Password.";
+    await tester.pumpWidget(page(answer: why));
+    await tester.tap(find.byKey(const ValueKey('always-ask-aa11')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'wrong');
+    await tester.tap(find.text('Turn on'));
+    await tester.pumpAndSettle();
+    expect(find.text(why), findsOneWidget);
+    expect(value(tester, 'aa11'), isFalse);
+    await tester.tap(find.text('Remove').first);
+    await tester.pumpAndSettle();
+    expect(find.text('Edit Bay 2'), findsOneWidget, reason: 'not removed: still listed');
+  });
+
+  testWidgets('New computers always ask for password: off unless set, saved when switched', (tester) async {
+    final newSent = <bool>[];
+    await tester.pumpWidget(page(newSent: newSent));
+    final sw = find.byKey(const ValueKey('new-always-ask'));
+    expect(find.text('New computers always ask for password'), findsOneWidget);
+    expect(find.text(kNewAlwaysAskWhy), findsOneWidget);
+    expect(tester.widget<SwitchListTile>(sw).value, isFalse);
+    await tester.tap(sw);
+    await tester.pumpAndSettle();
+    expect(newSent, [true]);
+    expect(tester.widget<SwitchListTile>(sw).value, isTrue);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpWidget(page(newAlwaysAsk: true));
+    expect(tester.widget<SwitchListTile>(sw).value, isTrue);
   });
 
   testWidgets("forgets a reinstalled Mac's key so it can pair again", (tester) async {
@@ -118,7 +187,7 @@ void main() {
     await tester.pumpWidget(host(TrustedControllersPage(
       trusted: const [],
       known: parseKnown(knownJson),
-      onRemove: (_) async {},
+      onRemove: (_) async => null,
       onForget: (id) async => forgot.add(id),
     )));
     expect(find.text('None yet. A computer lands here once you allow it in.'), findsOneWidget);
@@ -137,7 +206,7 @@ void main() {
     await tester.pumpWidget(host(TrustedControllersPage(
       trusted: const [],
       known: const [KnownMac(id: '555666777', address: '')],
-      onRemove: (_) async {},
+      onRemove: (_) async => null,
       onForget: (_) async {},
     )));
     expect(find.text('A computer you connected to'), findsOneWidget);
