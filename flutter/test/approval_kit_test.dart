@@ -166,13 +166,10 @@ void main() {
   const trusted = '[{"key":"aa11","name":"Edit Bay 2","added":1761955200},'
       '{"key":"bb22","name":"Sam M Studio","added":1761955300,"removed":true}]';
 
-  test('Allow on a removed Controller does what trust.rs reinstate does', () {
+  // The service does what trust.rs reinstate does (trust.rs settings_edits_apply_to_the_list_as_it_is_now).
+  test('Allow on a removed Controller asks the service to reinstate it', () {
     expect(parseRemoved(trusted).map((c) => c.name), ['Sam M Studio']);
-    final back = reinstateTrusted(trusted, 'bb22', now: 1793660000);
-    expect(parseRemoved(back), isEmpty);
-    expect(parseTrusted(back).map((c) => c.key), ['aa11', 'bb22']);
-    expect((jsonDecode(back) as List)[1], {'key': 'bb22', 'name': 'Sam M Studio', 'added': 1793660000});
-    expect(reinstateTrusted('not json', 'bb22'), '[]');
+    expect(jsonDecode(trustEdit('allow', 'bb22')), {'op': 'allow', 'key': 'bb22'});
   });
 
   testWidgets('Trusted Controllers: removed ones with a big Allow, and who is waiting', (tester) async {
@@ -183,10 +180,13 @@ void main() {
         body: TrustedControllersPage(
           trusted: parseTrusted(trusted),
           known: const [],
-          onRemove: (_) async {},
+          onRemove: (_) async => null,
           onForget: (_) async {},
           removed: parseRemoved(trusted),
-          onAllow: (c) async => allowed.add(c.key),
+          onAllow: (c) async {
+            allowed.add(c.key);
+            return null;
+          },
           waiting: const Text('waiting rows'),
         ),
       ),
