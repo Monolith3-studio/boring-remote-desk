@@ -22,10 +22,10 @@ use crate::message_proto::{message, Message, PublicKey};
 use hbb_common::{
     bail,
     config::{compute_permanent_password_h1, decode_permanent_password_h1_from_storage, Config, LocalConfig},
-    password_security::{decrypt_str_or_original, encrypt_str_or_original},
+    password_security::{decrypt_str_or_original, encrypt_str_or_original, symmetric_crypt},
     protobuf::Message as _,
     serde_json,
-    sodiumoxide::{crypto::hash::sha256, randombytes::randombytes, utils::memcmp},
+    sodiumoxide::{base64, crypto::hash::sha256, randombytes::randombytes, utils::memcmp},
     ResultType, Stream,
 };
 use serde_derive::{Deserialize, Serialize};
@@ -242,6 +242,8 @@ pub struct Admission {
     key: Option<String>,
     /// The [`EDITS`] count this session last looked at.
     seen_edits: u64,
+    /// This sign-in stored it switched on (review M-new): it stays, see [`Admission::approve_into`].
+    stays: bool,
 }
 
 /// Settings edits saved so far in this process; a live session looks at the list again only
@@ -348,7 +350,7 @@ impl Admission {
 
     fn lost_trust_in(&self, t: &Trusted) -> bool {
         let Some(key) = self.key.as_deref() else { return false };
-        !self.password_right && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)
+        !self.password_right && !self.stays && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)
     }
 
     /// The session got in. If someone clicked Allow here or the Unattended Password was right,
@@ -397,15 +399,31 @@ impl Admission {
             }
             let ok = t.reinstate(key, name);
             self.key = self.removed.take();
+            self.stored_as_always_ask(t, name);
             return ok;
         }
         match self.pending.take() {
             Some(key) if how != SignIn::ThisSessionOnly => {
                 t.add(&key, name);
                 self.key = Some(hex(&key));
+                self.stored_as_always_ask(t, name);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Stored switched on by this very sign-in (New computers always ask, the name of one switched
+    /// on, or Allow on a removed one that was on). Someone here let it in, by Allow or the
+    /// password, and the switch went on with it, not after: this session stays (no lost_trust
+    /// kick). Allow by a click here still creates an always-ask entry; it is never silent, since
+    /// the next connect needs the password. And the Controller is told now to keep no password
+    /// (ALWAYS_ASK_MARKER rides this session's PeerInfo, built after this runs).
+    fn stored_as_always_ask(&mut self, t: &Trusted, name: &str) {
+        let key = self.key.as_deref();
+        if t.list.iter().any(|c| Some(c.key.as_str()) == key && !c.removed && c.always_ask) {
+            self.always_ask = Some(name.to_owned());
+            self.stays = true;
         }
     }
 }
@@ -494,19 +512,28 @@ fn rotate_salt(password: &str) -> Result<(), &'static str> {
     if !password_is(decode_permanent_password_h1_from_storage(&storage), &salt, password) {
         return Err(WRONG_PASSWORD);
     }
+    // The new salt and its hash go in one write: a crash before it leaves the old pair, which
+    // still works; after it, the new one. Never a moment with no Unattended Password.
     let fresh = Config::get_auto_password(32);
-    let stored = Config::set_permanent_password_storage_for_sync("", &fresh).is_ok()
-        && Config::set_permanent_password(password)
-        && {
-            let (s2, salt2) = Config::get_local_permanent_password_storage_and_salt();
-            salt2 == fresh && password_is(decode_permanent_password_h1_from_storage(&s2), &salt2, password)
-        };
-    if !stored {
-        hbb_common::log::error!("always ask: salt not turned over, putting the old one back");
-        let _ = Config::set_permanent_password_storage_for_sync(&storage, &salt);
-        return Err(SALT_FAILED);
+    let new_storage = resalted(password, &fresh).ok_or(SALT_FAILED)?;
+    match Config::set_permanent_password_storage_for_sync(&new_storage, &fresh) {
+        Ok(true) => Ok(()),
+        _ => {
+            hbb_common::log::error!("always ask: salt not turned over");
+            Err(SALT_FAILED)
+        }
     }
-    Ok(())
+}
+
+/// The Unattended Password's storage under `salt`, in hbb_common's current form ("01" + the
+/// encrypted "00" + base64 hash), read back through hbb_common's own decoder before it is
+/// trusted: if that form ever changes upstream, this is None and nothing is written.
+fn resalted(password: &str, salt: &str) -> Option<String> {
+    let h1 = compute_permanent_password_h1(password, salt);
+    let hashed = format!("00{}", base64::encode(h1, base64::Variant::Original));
+    let sealed = symmetric_crypt(hashed.as_bytes(), true).ok()?;
+    let storage = format!("01{}", base64::encode(sealed, base64::Variant::Original));
+    (decode_permanent_password_h1_from_storage(&storage) == Some(h1)).then_some(storage)
 }
 
 /// The one way the Trusted list is changed: under [`EDIT_LOCK`], on the list as the service
@@ -1072,6 +1099,48 @@ mod tests {
         let mut sent = ui(TRUST_FILE_1_7_0);
         keep_live(&mut sent, "");
         assert!(!sent.contains_key(TRUSTED_OPTION));
+    }
+
+    /// Review M-new: stored as always ask by this very sign-in (New computers always ask, the
+    /// name of one switched on, or Allow on a removed one that was on). That session stays: it was
+    /// let in here by Allow or the password, and the switch went on with it, not after. It also
+    /// tells the Controller to keep no password, so the next connect has to type it.
+    #[tokio::test]
+    async fn a_session_stored_as_always_ask_stays_and_its_controller_keeps_no_password() {
+        for how in [SignIn::Allowed, SignIn::UnattendedPassword] {
+            let mut t = Trusted { new_always_ask: true, ..Default::default() };
+            let (mut a, _) = connect(&t, None).await;
+            assert!(!a.always_ask(), "{:?}", how);
+            assert!(a.approve_into(&mut t, how, "Renamed Laptop"));
+            assert!(t.list()[0].always_ask);
+            assert!(a.always_ask(), "{:?}: PeerInfo carries the marker", how);
+            assert!(!a.lost_trust_in(&t), "{:?}: not ended a second after it got in", how);
+        }
+        // By name.
+        let (mut t, _, _) = always_ask_controller().await;
+        let (mut back, _) = connect(&t, None).await;
+        assert!(back.approve_into(&mut t, SignIn::UnattendedPassword, "Edit Bay 2"));
+        assert!(back.always_ask() && !back.lost_trust_in(&t));
+        // Allow on a removed one that was on.
+        let (mut t, token, key) = always_ask_controller().await;
+        t.remove(&key);
+        let (mut removed, _) = connect(&t, Some(token)).await;
+        assert!(removed.approve_into(&mut t, SignIn::Allowed, "Edit Bay 2"));
+        assert!(removed.always_ask() && !removed.lost_trust_in(&t));
+        // Stored switched off: nothing changes.
+        let mut t = Trusted::default();
+        let (mut plain, _) = connect(&t, None).await;
+        plain.approve_into(&mut t, SignIn::Allowed, "Stage Left");
+        assert!(!plain.always_ask());
+    }
+
+    #[test]
+    fn the_salt_and_its_hash_are_written_together() {
+        // Review Low: one write of the new pair, built and read back before anything is stored.
+        let storage = resalted("Studio-pass-1", "salt-b").unwrap();
+        assert_eq!(decode_permanent_password_h1_from_storage(&storage),
+                   Some(compute_permanent_password_h1("Studio-pass-1", "salt-b")));
+        assert!(password_is(decode_permanent_password_h1_from_storage(&storage), "salt-b", "Studio-pass-1"));
     }
 
     #[test]
