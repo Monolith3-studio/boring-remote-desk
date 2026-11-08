@@ -933,6 +933,7 @@ def trust_checks(c, cfg):
          "'removed': true" in (fn_body(dart, "String removeTrusted(") or "")),
     ] if not ok]
     c.fact(REMOVED_ASKS, not removed, "; ".join(removed))
+    always_ask_checks(c, conn, rs, dart)
 
     why = [f"rebrand map sets {k}" for d in (rebrand.LOCKED, rebrand.DEFAULTS, rebrand.LOCKED_LOCAL)
            for k in d if PASSWORDISH.search(k)]
@@ -954,6 +955,64 @@ def trust_checks(c, cfg):
     c.fact("no default or blank password ships (ADR 0002)", not why, "; ".join(why[:10]))
     approval_checks(c)
     firewall_upgrade_checks(c)
+
+
+ALWAYS_ASK = "an always-ask Trusted Controller gets in by the Unattended Password only, every connect"
+ALWAYS_ASK_FORGET = "a Controller keeps no password for a Target that always asks it"
+
+
+def always_ask_checks(c, conn, rs, dart):
+    """"Always ask for password" per Trusted Controller (base::trust): its token is no longer enough.
+    It gets in by this Mac's Unattended Password and nothing else (no click, one-time code or recent
+    session), through upstream's attempt limits; a gate before any sign-in completes holds that for
+    every other path; no sign-in changes its entry or issues it a token; only Settings, over the
+    service, switches it."""
+    ask, gate = rebrand.T04_ALWAYS_ASK, rebrand.T04_ALWAYS_ASK_GATE
+    logon = fn_body(conn, "    async fn send_logon_response_and_keep_alive(&mut self) -> bool {") or ""
+    grant, answer = fn_body(rs, "    fn approve_into(") or "", fn_body(rs, "pub async fn answer(") or ""
+    settings = c.read(rebrand.SETTINGS)
+    bad = [n for n, ok in [
+        ("connection.rs sends an always-ask Controller to the password before its token or any ask",
+         ask in conn and ask in rebrand.T04_TRUSTED_SKIP
+         and -1 < conn.find(ask) < conn.find("if self.boring_trust.is_trusted() {")),
+        ("only the Unattended Password counts, never a one-time code or a recent session",
+         "self.validate_password(allow_logon_screen_password)\n"
+         "                    && self.conn_audit_primary_auth == ConnAuditPrimaryAuth::PermanentPassword\n" in ask
+         and "is_recent_session" not in ask and "try_start_cm(lr.my_id, lr.my_name, false)" not in ask),
+        ("wrong passwords go through upstream's attempt limits",
+         "let (failure, res) = self.check_failure(0).await;" in ask
+         and "self.update_failure_with_scope(failure, false, 0, FailureScope::Default);" in ask),
+        ("nothing but that password marks the session as having given it",
+         conn.count("self.boring_trust.unattended_password_right();") == 1
+         and ask.find("ConnAuditPrimaryAuth::PermanentPassword") < ask.find("unattended_password_right()")),
+        ("a gate before any sign-in completes keeps it out otherwise",
+         "if !self.boring_trust.may_let_in() {" in gate and gate in logon
+         and logon.find(gate) < logon.find("self.authorized = true;")
+         and "self.always_ask.is_none() || self.password_right" in (fn_body(rs, "    pub fn may_let_in(") or "")),
+        ("its token is checked as always ask before as Trusted, and no fresh token goes out",
+         -1 < answer.find("Some(t) if !t.removed && t.always_ask =>") < answer.find("Some(t) if !t.removed =>")
+         and "stream.send(&frame(&[])).await?;" in answer.split("Some(t) if !t.removed && t.always_ask =>", 1)[-1]
+         .split("Some(t) if !t.removed =>", 1)[0]),
+        ("no sign-in changes an always-ask entry",
+         grant.lstrip().split("// A removed Controller", 1)[0].count("if self.always_ask.is_some() {\n            return false;\n        }") == 1),
+        ("off unless set, and off is never written (1.7.0 lists load unchanged)",
+         '#[serde(default, skip_serializing_if = "is_false")]\n    pub always_ask: bool,' in rs),
+        ("Settings switches it over the server option (the service), as Remove",
+         "onAlwaysAsk: (k, on) => bind.mainSetOption(\n                          key: kTrustedControllersOption,\n"
+         "                          value: setAlwaysAsk(" in settings
+         and "mainSetLocalOption(key: kTrustedControllersOption" not in settings
+         and "e['removed'] != true" in (fn_body(dart, "String setAlwaysAsk(") or "")),
+    ] if not ok]
+    c.fact(ALWAYS_ASK, not bad, "; ".join(bad))
+
+    peer = fn_body(c.read("src/client.rs"), "    pub fn handle_peer_info(&mut self, pi: &PeerInfo) {") or ""
+    forget = [n for n, ok in [
+        ("the Target says so in PeerInfo", rebrand.T04_ALWAYS_ASK_MARK in conn
+         and 'pub const ALWAYS_ASK_MARKER: &str = "boring_always_ask";' in rs),
+        ("the Controller drops the password it would keep before saving",
+         -1 < peer.find(rebrand.T04_ALWAYS_ASK_FORGET) < peer.find("self.save_config(config);")),
+    ] if not ok]
+    c.fact(ALWAYS_ASK_FORGET, not forget, "; ".join(forget))
 
 
 APPROVAL_RS = "src/boring_approval.rs"

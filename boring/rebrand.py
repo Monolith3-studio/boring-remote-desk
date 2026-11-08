@@ -769,7 +769,81 @@ T03_HANDSHAKE_FN = (
     "        .find(|ip| base::direct_link::is_tailscale(*ip))\n"
     "}\n"
     "\n")
-T04_TRUSTED_SKIP = (
+# "Always ask for password" (base::trust): a Trusted Controller switched on gets in by this Mac's
+# Unattended Password and nothing else, whatever the approve mode. Click-only or Both: no ask is
+# shown, so nobody here can click it in (a Trusted one skipped approve mode before, this only
+# narrows that). A one-time code or a recent session is refused: validate_password tries the
+# one-time code first, so only PermanentPassword counts. Wrong or none goes through upstream's
+# per-address attempt limits and one-time-code rotation, exactly as its own password branch.
+T04_ALWAYS_ASK = (
+    "            // boring-remote: a Trusted Controller switched to \"Always ask for password\" gets in by\n"
+    "            // this Mac's Unattended Password and nothing else, whatever the approve mode: not its\n"
+    "            // token, a click here (no ask is shown), a one-time code or a recent session.\n"
+    "            if self.boring_trust.always_ask() {\n"
+    "                if !(password::permanent_enabled() || allow_logon_screen_password)\n"
+    "                    || !Config::has_permanent_password()\n"
+    "                {\n"
+    "                    self.send_login_error(base::trust::NO_UNATTENDED_PASSWORD).await;\n"
+    "                    sleep(1.).await;\n"
+    "                    return false;\n"
+    "                }\n"
+    "                // None yet: the Controller is already asking its person for it (client.rs handle_hash).\n"
+    "                if lr.password.is_empty() {\n"
+    "                    return true;\n"
+    "                }\n"
+    "                let (failure, res) = self.check_failure(0).await;\n"
+    "                if !res {\n"
+    "                    return true;\n"
+    "                }\n"
+    "                if self.validate_password(allow_logon_screen_password)\n"
+    "                    && self.conn_audit_primary_auth == ConnAuditPrimaryAuth::PermanentPassword\n"
+    "                {\n"
+    "                    self.update_failure_with_scope(failure, true, 0, FailureScope::Default);\n"
+    "                    self.boring_trust.unattended_password_right();\n"
+    "                    if !self.send_logon_response_and_keep_alive().await {\n"
+    "                        return false;\n"
+    "                    }\n"
+    "                    self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n"
+    "                } else {\n"
+    "                    self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+    "                    self.check_update_temporary_password(false);\n"
+    "                    self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)\n"
+    "                        .await;\n"
+    "                }\n"
+    "                return true;\n"
+    "            }\n")
+# The last word before any sign-in lets a session in (Admission::may_let_in): an always-ask one
+# that has not given the Unattended Password stays out, whatever got it there (Authorize from a
+# click, switch sides, a sign-in path upstream adds later).
+T04_ALWAYS_ASK_GATE = (
+    "        // boring-remote: an always-ask Trusted Controller gets in only once its Unattended\n"
+    "        // Password checked out, whatever brought it here (base::trust::Admission::may_let_in).\n"
+    "        if !self.boring_trust.may_let_in() {\n"
+    "            self.send_login_error(base::trust::ASKS_EVERY_TIME).await;\n"
+    "            sleep(1.).await;\n"
+    "            return false;\n"
+    "        }\n")
+T04_ALWAYS_ASK_GATE_AT = ("    async fn send_logon_response_and_keep_alive(&mut self) -> bool {\n"
+                          "        if self.authorized {\n            return true;\n        }\n")
+# Target: tells a Boring Remote Controller it always asks, so it keeps no password for it. Any
+# other Controller ignores the key; nothing in the protocol changes (protocol.sha256 holds).
+T04_ALWAYS_ASK_MARK = (
+    "        // boring-remote: tells a Boring Remote Controller this Mac always asks it for the\n"
+    "        // Unattended Password, so it keeps none (base::trust::ALWAYS_ASK_MARKER).\n"
+    "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+    "        if self.boring_trust.always_ask() {\n"
+    "            platform_additions.insert(base::trust::ALWAYS_ASK_MARKER.into(), json!(true));\n"
+    "        }\n")
+# Controller: no password kept for a Target that always asks, typed with Remember on or saved
+# before the switch; the next connect asks its person again.
+T04_ALWAYS_ASK_FORGET = (
+    "        // boring-remote: the Target always asks this computer for its Unattended Password\n"
+    "        // (base::trust::ALWAYS_ASK_MARKER), so none is kept for it, remembered or not.\n"
+    "        if base::trust::asks_every_time(&pi.platform_additions) {\n"
+    "            config.password = Default::default();\n"
+    "        }\n")
+T04_ALWAYS_ASK_FORGET_AT = "        if let Some((_, b, c)) = self.other_server.as_ref() {\n            if b != PUBLIC_SERVER {\n"
+T04_TRUSTED_SKIP = T04_ALWAYS_ASK + (
     "            // boring-remote (v1.7 t04): only a token this Mac issued skips the ask (ADR 0005).\n"
     "            if self.boring_trust.is_trusted() {\n"
     "                if !self.send_logon_response_and_keep_alive().await {\n"
@@ -921,6 +995,14 @@ PATCHES += [
            "        if !platform_additions.is_empty() {\n",
      T05_MARKER + "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
                   "        if !platform_additions.is_empty() {\n", "Boring Remote marker in PeerInfo"),
+    (CONN, "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+           "        if !platform_additions.is_empty() {\n",
+     T04_ALWAYS_ASK_MARK + "        #[cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))]\n"
+                           "        if !platform_additions.is_empty() {\n", "always ask: tell the Controller in PeerInfo"),
+    (CONN, T04_ALWAYS_ASK_GATE_AT, T04_ALWAYS_ASK_GATE_AT + T04_ALWAYS_ASK_GATE,
+     "always ask: no sign-in lets it in without the Unattended Password"),
+    ("src/client.rs", T04_ALWAYS_ASK_FORGET_AT, T04_ALWAYS_ASK_FORGET + T04_ALWAYS_ASK_FORGET_AT,
+     "always ask: the Controller keeps no password for that Target"),
     (CONN, "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
      T04_TRUSTED_SKIP + "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
      "a Trusted Controller skips the ask"),
@@ -1623,6 +1705,10 @@ T04_SETTINGS_LINK = (
     "                      onRemove: (k) => bind.mainSetOption(\n"
     "                          key: kTrustedControllersOption,\n"
     "                          value: removeTrusted(bind.mainGetOptionSync(key: kTrustedControllersOption), k)),\n"
+    "                      // Always ask for password: the server option, over ipc to the service, as Remove.\n"
+    "                      onAlwaysAsk: (k, on) => bind.mainSetOption(\n"
+    "                          key: kTrustedControllersOption,\n"
+    "                          value: setAlwaysAsk(bind.mainGetOptionSync(key: kTrustedControllersOption), k, on)),\n"
     "                      onForget: (id) async {\n"
     "                        for (final o in [kDirectLinkKnownOption, kTrustTokensOption]) {\n"
     "                          await bind.mainSetLocalOption(\n"

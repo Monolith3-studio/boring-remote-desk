@@ -49,6 +49,8 @@ WIN_NAMES = "Windows service, firewall rule and Apps list say Boring Remote; exe
 ASK_INFO = check.ASK_INFO
 ROOT_BUNDLE = check.ROOT_BUNDLE
 SETTINGS_ALLOW = "Settings: Allow next to removed and waiting Controllers, over the service like Remove (t04)"
+ALWAYS_ASK = check.ALWAYS_ASK
+ALWAYS_ASK_FORGET = check.ALWAYS_ASK_FORGET
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 
@@ -108,7 +110,7 @@ class RebrandSeam(unittest.TestCase):
                      "no upstream RustDesk logo or icon ships", "every logo slot holds Boring Remote art",
                      "Mac menu-bar icon res/mac-tray-dark-x2.png is a template glyph",
                      CONNECT_DIRECT, NOT_FOUND_TRANSLATED, CONNECT_ENCRYPTED, TRUST_WIRED, ONE_TIME_CODE,
-                     HE_WIRED, RUST_HOOKS, SUPPORT, ASK_INFO, ROOT_BUNDLE):
+                     HE_WIRED, RUST_HOOKS, SUPPORT, ASK_INFO, ROOT_BUNDLE, ALWAYS_ASK, ALWAYS_ASK_FORGET):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_check_passes_after_rebrand(self):
@@ -912,6 +914,46 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("flutter/lib/desktop/kit/trust.dart", "{...e, 'removed': true} else e", "{} else e")
         self.assert_check_fails(REMOVED_ASKS)
+
+    # --- Always ask for password (per Trusted Controller) ------------------------------
+    def test_always_ask_let_in_by_its_token_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "            if self.boring_trust.always_ask() {\n                if !(",
+                  "            if false {\n                if !(")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_always_ask_let_in_by_a_one_time_code_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "\n                    && self.conn_audit_primary_auth == ConnAuditPrimaryAuth::PermanentPassword", "")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_always_ask_without_the_wrong_password_limits_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.T04_ALWAYS_ASK,
+                  rebrand.T04_ALWAYS_ASK.replace("self.update_failure_with_scope(failure, false, 0, FailureScope::Default);", ""))
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_always_ask_gate_dropped_fails_check(self):  # a click or switch sides would let it in
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.T04_ALWAYS_ASK_GATE, "")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_always_ask_entry_changed_by_a_sign_in_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "        if self.always_ask.is_some() {\n            return false;\n        }\n", "")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_always_ask_saved_as_a_local_option_fails_check(self):  # the service would never see it
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, "onAlwaysAsk: (k, on) => bind.mainSetOption(",
+                  "onAlwaysAsk: (k, on) => bind.mainSetLocalOption(")
+        self.assert_check_fails(ALWAYS_ASK)
+
+    def test_controller_keeping_the_password_of_a_target_that_always_asks_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.T04_ALWAYS_ASK_FORGET, "")
+        self.assert_check_fails(ALWAYS_ASK_FORGET)
 
     def test_lan_macs_that_left_deleted_from_the_stored_list_fails_check(self):
         self.rebrand()
