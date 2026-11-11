@@ -25,6 +25,7 @@ CONNECT_TAILNET = "names connect Direct IP only to Tailscale addresses, else the
 NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
+HBB = rebrand.HBB
 
 
 def export_clean_tree(dest):
@@ -359,6 +360,102 @@ class RebrandSeam(unittest.TestCase):
         self.assertIn("libs/hbb_common/src/config.rs", r.stderr)
         self.assertIn("rebrand: nothing written", r.stdout)
         self.assertEqual(before, tree_hashes(self.root))  # no patch, copy or workflow removal
+
+    # --- ticket 05: permanent password only ---------------------------------------
+    PERMANENT_ONLY = "one-time password off: only the permanent password is accepted"
+    NO_PASSWORD = "no permanent password refuses the login, before click-to-accept"
+    THROTTLED = "wrong passwords are still throttled before and after every password check"
+    IPC_GUARDED = "a remote session can't change the password, PIN or security options"
+    GENERATOR = "generated password: OS RNG, 16+ characters, no look-alike characters, wired to Set Password"
+
+    def test_password_lock_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.PERMANENT_ONLY, self.NO_PASSWORD, self.THROTTLED, self.IPC_GUARDED, self.GENERATOR,
+                     "a Controller can't change the Target's settings (allow-remote-config-modification locked off)",
+                     "one-time password length pinned", "one-time password label hidden when it is off"):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_password_lock_facts_fail_on_clean_upstream_tree(self):
+        r = run(CHECK, self.root)
+        for fact in (self.PERMANENT_ONLY, self.NO_PASSWORD, self.IPC_GUARDED, self.GENERATOR):
+            self.assertIn(f"FAIL {fact}", r.stdout)
+
+    def test_both_passwords_allowed_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("verification-method", "use-permanent-password")',
+                  '("verification-method", "use-both-passwords")')
+        self.assert_check_fails(self.PERMANENT_ONLY)
+
+    def test_remote_config_modification_allowed_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("allow-remote-config-modification", "N")', '("allow-remote-config-modification", "Y")')
+        self.assert_check_fails("a Controller can't change the Target's settings")
+
+    def test_no_password_gate_removed_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.NO_PASSWORD_GATE, "")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_no_password_gate_after_click_to_accept_fails_check(self):
+        self.rebrand()
+        conn = "src/server/connection.rs"
+        self.edit(conn, rebrand.NO_PASSWORD_GATE, "")
+        self.edit(conn, "            } else if self.is_recent_session(false) {\n",
+                  "            }\n" + rebrand.NO_PASSWORD_GATE + "            if self.is_recent_session(false) {\n")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_refuse_login_ignoring_missing_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "verification_method != PERMANENT_ONLY || !has_permanent_password",
+                  "verification_method != PERMANENT_ONLY")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_throttle_dropped_from_the_password_check_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "                let (failure, res) = self.check_failure(0).await;\n"
+                  "                if !res {\n                    return true;\n                }\n"
+                  "                if !self.validate_password(",
+                  "                let failure = ((0, 0, 0), 0);\n                if !self.validate_password(")
+        self.assert_check_fails(self.THROTTLED)
+
+    def test_failed_password_not_counted_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "                    self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n", "")
+        self.assert_check_fails(self.THROTTLED)
+
+    def test_lockout_message_removed_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", 'self.send_login_error("Too many wrong attempts").await;', "")
+        self.assert_check_fails(self.THROTTLED)
+
+    def test_ipc_password_guard_removed_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", f"if {rebrand.IPC_GUARD} {{", "if false {")
+        self.assert_check_fails(self.IPC_GUARDED)
+
+    def test_ipc_options_guard_removed_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", "&Config::get_options(),", "&value.clone(),")
+        self.assert_check_fails(self.IPC_GUARDED)
+
+    def test_short_generated_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "pub const LEN: usize = 20;", "pub const LEN: usize = 12;")
+        self.assert_check_fails(self.GENERATOR)
+
+    def test_ambiguous_alphabet_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", 'b"ABCDEFGHJK', 'b"0OABCDEFGHJK')
+        self.assert_check_fails(self.GENERATOR)
+
+    def test_non_os_rng_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "generate_with(&mut OsRng)",
+                  "generate_with(&mut hbb_common::rand::thread_rng())")
+        self.assert_check_fails(self.GENERATOR)
 
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",
