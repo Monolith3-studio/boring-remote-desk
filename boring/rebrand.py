@@ -79,6 +79,10 @@ LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows the
     "allow-auto-update": "N",
     "enable-lan-discovery": "N",  # no answering LAN pings with ID, hostname, user, MAC
     "rendezvous-servers": "",     # a server list the config file could otherwise carry
+    # ticket 05: permanent password only; no one-time password, no Controller-side config edits
+    "verification-method": "use-permanent-password",
+    "temporary-password-length": "10",  # moot with the line above; pinned in case it goes
+    "allow-remote-config-modification": "N",
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
     "allow-only-conn-window-open": "N",
@@ -591,6 +595,104 @@ PATCHES += [
      "don't log incoming links"),
     ("flutter/lib/common.dart", '    print("initialLink: $initialLink");\n', "", "don't log the cold-boot link"),
     ("flutter/lib/main.dart", '  debugPrint("launch args: $args");\n', "", "don't log launch args (may be a link)"),
+]
+
+# --- Permanent password only (ticket 05) ------------------------------------------
+# src/password_lock.rs and generated_password.dart are ours; these wire them in.
+# The locks themselves are in LOCKED (verification-method, allow-remote-config-modification).
+NO_PASSWORD_GATE = (
+    "            // boring-remote: no permanent password, no way in (ticket 05). Not click-to-accept.\n"
+    "            if crate::password_lock::refuse_login(\n"
+    "                &Config::get_option(\"verification-method\"),\n"
+    "                Config::has_permanent_password(),\n"
+    "            ) {\n"
+    "                self.send_login_error(crate::password_lock::NO_PASSWORD_ERROR).await;\n"
+    "                return false;\n"
+    "            }\n")
+GENERATE_BUTTON = (
+    "        // boring-remote: Generate (ticket 05) sets a strong password and shows it once.\n"
+    "        final generateButton = dialogButton(\n"
+    "          \"Generate\",\n"
+    "          icon: Icon(Icons.casino_outlined),\n"
+    "          onPressed: () async {\n"
+    "            final pass = await bind.mainGeneratePermanentPassword();\n"
+    "            if (pass.isEmpty) {\n"
+    "              setState(() {\n"
+    "                errMsg0 = '${translate('Prompt')}: ${translate(\"Failed\")}';\n"
+    "              });\n"
+    "              return;\n"
+    "            }\n"
+    "            close();\n"
+    "            notEmptyCallback?.call();\n"
+    "            showGeneratedPasswordOnce(pass);\n"
+    "          },\n"
+    "          isOutline: true,\n"
+    "        );\n")
+IPC_GUARD = ("!crate::password_lock::config_write_allowed(&name, "
+             "crate::password_lock::authed_sessions())")
+PATCHES += [
+    ("src/lib.rs", "mod lang;\n",
+     "mod lang;\nmod password_lock; // boring-remote: permanent password only (ticket 05)\n",
+     "password lock module"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: set a generated permanent password (ticket 05) and return it once for the\n"
+     "/// UI to show. Empty if the daemon refused it. Never logged, never readable again.\n"
+     "pub fn main_generate_permanent_password() -> String {\n"
+     "    crate::password_lock::generate_and_set()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "generate password bridge call"),
+    ("src/server/connection.rs", "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
+     NO_PASSWORD_GATE
+     + "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
+     "no permanent password refuses the login"),
+    ("src/ipc.rs",
+     '                } else if name == "permanent-password" {\n'
+     "                    if Config::is_disable_change_permanent_password() {\n",
+     '                } else if name == "permanent-password" {\n'
+     f"                    if {IPC_GUARD} {{\n"
+     '                        log::warn!("permanent password write refused during a remote session");\n'
+     "                        updated = false;\n"
+     "                    } else if Config::is_disable_change_permanent_password() {\n",
+     "no password change during a remote session"),
+    ("src/ipc.rs",
+     '                } else if name == "salt" {\n                    Config::set_salt(&value);\n',
+     '                } else if name == "salt" {\n'
+     f"                    if {IPC_GUARD} {{\n"
+     "                        return;\n"
+     "                    }\n"
+     "                    Config::set_salt(&value);\n",
+     "no salt change during a remote session"),
+    ("src/ipc.rs",
+     '                } else if name == "unlock-pin" {\n                    Config::set_unlock_pin(&value);\n',
+     '                } else if name == "unlock-pin" {\n'
+     f"                    if {IPC_GUARD} {{\n"
+     '                        log::warn!("unlock PIN write refused during a remote session");\n'
+     "                        return;\n"
+     "                    }\n"
+     "                    Config::set_unlock_pin(&value);\n",
+     "no unlock PIN change during a remote session"),
+    ("src/ipc.rs",
+     "                Config::set_options(value);\n                allow_err!(stream.send(&Data::Options(None)).await);\n",
+     "                // boring-remote: security options stay put during a remote session (ticket 05).\n"
+     "                let value = crate::password_lock::guard_options(\n"
+     "                    value,\n"
+     "                    &Config::get_options(),\n"
+     "                    crate::password_lock::authed_sessions(),\n"
+     "                );\n"
+     "                Config::set_options(value);\n                allow_err!(stream.send(&Data::Options(None)).await);\n",
+     "security options kept during a remote session"),
+    (HOME, 'translate("One-time Password"),',
+     'translate(showOneTime ? "One-time Password" : "Password"),',
+     "no one-time password label when it is off"),
+    (HOME, "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
+     "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n"
+     "import 'package:flutter_hbb/desktop/widgets/generated_password.dart';\n",
+     "generated password import (home)"),
+    (HOME, "        return [\n          cancelButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n        ];\n",
+     GENERATE_BUTTON
+     + "        return [\n          cancelButton,\n          generateButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n        ];\n",
+     "Generate button in Set Password"),
 ]
 
 COPIES = [

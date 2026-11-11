@@ -648,6 +648,62 @@ def workflow_guard(c):
     c.fact("no GitHub Actions workflow (.github/workflows/ is empty)", not found, ", ".join(sorted(found)))
 
 
+THROTTLED_LOGIN = re.compile(
+    r"let \(failure, res\) = self\.check_failure\(0\)\.await;\s*if !res \{\s*return true;\s*\}\s*"
+    r"if !self\.validate_password\([^)]*\) \{\s*"
+    r"self\.update_failure_with_scope\(failure, false, 0, FailureScope::Default\);")
+
+
+def password_lock_checks(c, locked):
+    """Ticket 05: permanent password only, refused without one, throttled, fixed during a session."""
+    c.fact("one-time password off: only the permanent password is accepted",
+           locked.get("verification-method") == "use-permanent-password", locked.get("verification-method"))
+    c.fact("one-time password length pinned", locked.get("temporary-password-length") == "10",
+           locked.get("temporary-password-length"))
+    c.fact("a Controller can't change the Target's settings (allow-remote-config-modification locked off)",
+           locked.get("allow-remote-config-modification") == "N", locked.get("allow-remote-config-modification"))
+
+    conn = c.read("src/server/connection.rs")
+    lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
+    gate = conn.find("if crate::password_lock::refuse_login(")
+    click = conn.find("if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)")
+    refuse = fn_body(lock, "pub fn refuse_login(verification_method: &str, has_permanent_password: bool) -> bool {")
+    c.fact("no permanent password refuses the login, before click-to-accept",
+           0 <= gate < click and "Config::has_permanent_password()" in conn[gate:click]
+           and "return false;" in conn[gate:click] and refuse is not None
+           and "!has_permanent_password" in refuse and "PERMANENT_ONLY" in refuse,
+           f"gate at {gate}, click branch at {click}, refuse_login {refuse!r}")
+
+    throttle = fn_body(conn, "async fn check_failure_with_scope(") or ""
+    ok = (THROTTLED_LOGIN.search(conn) is not None and conn.count("self.validate_password(") == 1
+          and '"Too many wrong attempts"' in throttle and '"Please try 1 minute later"' in throttle
+          and "self.check_failure_with_scope(i, FailureScope::Default)"
+          in (fn_body(conn, "async fn check_failure(&mut self, i: usize)") or ""))
+    c.fact("wrong passwords are still throttled before and after every password check", ok)
+
+    ipc = c.read("src/ipc.rs")
+    options = re.search(r"let value = crate::password_lock::guard_options\(\s*value,\s*&Config::get_options\(\),"
+                        r"\s*crate::password_lock::authed_sessions\(\),\s*\);\s*Config::set_options\(value\);", ipc)
+    guard = fn_body(lock, "pub fn config_write_allowed(name: &str, remote_sessions: usize) -> bool {") or ""
+    c.fact("a remote session can't change the password, PIN or security options",
+           ipc.count(rebrand.IPC_GUARD) == 3 and options is not None and "remote_sessions == 0" in guard
+           and all(f'"{k}"' in lock for k in ("permanent-password", "salt", "unlock-pin", "approve-mode",
+                                               "verification-method", "allow-remote-config-modification")),
+           f"{ipc.count(rebrand.IPC_GUARD)} config guards, options guard {options is not None}")
+
+    alphabet = re.search(r'pub const ALPHABET: &\[u8\] = b"([^"]*)";', lock)
+    length = re.search(r"pub const LEN: usize = (\d+);", lock)
+    gen = fn_body(lock, "pub fn generate() -> String {") or ""
+    hooks = [("src/lib.rs", "mod password_lock;"), ("src/flutter_ffi.rs", "pub fn main_generate_permanent_password()"),
+             (rebrand.HOME, "showGeneratedPasswordOnce(pass)")]
+    missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
+    c.fact("generated password: OS RNG, 16+ characters, no look-alike characters, wired to Set Password",
+           alphabet and length and int(length.group(1)) >= 16 and not set("0O1lI") & set(alphabet.group(1))
+           and "OsRng" in gen and not missing, "; ".join(missing))
+    c.fact("one-time password label hidden when it is off",
+           'translate(showOneTime ? "One-time Password" : "Password"),' in c.read(rebrand.HOME))
+
+
 def run_checks(root):
     c = Check(root)
     workflow_guard(c)
@@ -711,6 +767,7 @@ def run_checks(root):
            and 'Config::get_option("allow-only-conn-window-open") == "Y"' in conn)
     c.fact("allow-only-conn-window-open available in settings",
            "'allow-only-conn-window-open'" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
+    password_lock_checks(c, locked)
 
     # sync, NAT test, updater
     for rel, sig, what in (
