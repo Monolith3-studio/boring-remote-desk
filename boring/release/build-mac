@@ -1,0 +1,255 @@
+#!/bin/bash
+# Local Mac release on the Studio (spec slice 7). GitHub never builds: this replaces the deleted
+# boring-build.yml macOS jobs and writes the same files under the same names.
+#
+#   boring/release/build-mac [--dry-run] [--adhoc] [--from-app <BoringRemote.app>] <vX.Y.Z> [<out dir>]
+#
+# <vX.Y.Z> is a git tag whose Cargo.toml version equals it. <out dir> defaults to dmg-out/ in the repo.
+# Steps, as CI ran them, in a fresh worktree of the tag (rebrand patches are never committed):
+#   1 tests, rebrand, check, second rebrand run is a no-op   2 flutter_rust_bridge codegen (bridge pins)
+#   3 Flutter SDK patch, vcpkg deps                           4 build.py (unsigned, MIN_MACOS_VERSION)
+#   5 smoke test + install-update.sh + ad-hoc seal + BoringRemote-<v>-macos-arm64-unsigned.zip
+#   6 DMG suite, sign, dmgbuild, mount and verify (boring/dmg/release-mac.sh), sha256
+#   7 Update package BoringRemote-<v>-macos-arm64.app.tar.xz   8 the-boring-remote-version.json (unsigned)
+# Then, by hand: boring/release/sign-release <out dir>. Nothing is uploaded or published here.
+#
+# Signing: the "Boring Remote Code Signing" identity in your login keychain (pinned SHA-1 below), used
+# in place; macOS may ask once to allow codesign. Not there (or --adhoc): ad-hoc signed,
+# BoringRemote-<v>-macos-arm64-adhoc.dmg, a loud warning, and no version file (an ad-hoc build is
+# never a release). A p12 or passphrase in the environment is ignored and never read.
+#
+# --dry-run    checks the arguments, the tag and the toolchain, prints the plan; runs nothing, writes nothing.
+# --from-app   skip steps 1-5: package a copy of an already built app (the copy is what gets signed).
+# Toolchain: pins in boring/release/pins.env. FLUTTER / BRIDGE_FLUTTER = flutter binaries at
+# FLUTTER_VERSION / BRIDGE_FLUTTER_VERSION; VCPKG_ROOT = vcpkg at VCPKG_COMMIT_ID; rustup with
+# MAC_RUST_VERSION and BRIDGE_RUST_VERSION; flutter_rust_bridge_codegen + cargo-expand; NASM 2.x; llvm.
+set -euo pipefail
+set +x
+unset MAC_SIGN_P12 MAC_SIGN_P12_PASSWORD  # never read a p12 or its passphrase from the environment
+
+usage() { echo "usage: build-mac [--dry-run] [--adhoc] [--from-app <BoringRemote.app>] <vX.Y.Z> [<out dir>]" >&2; exit 2; }
+die() { echo "build-mac: $*" >&2; exit 1; }
+
+DRY=false ADHOC=false FROM_APP=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dry-run) DRY=true ;;
+    --adhoc) ADHOC=true ;;
+    --from-app) [ $# -ge 2 ] || usage; FROM_APP=$2; shift ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+TAG=$1
+[[ $TAG =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "build-mac: tag '$TAG' is not vX.Y.Z" >&2; exit 2; }
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=${BR_REPO:-$(cd "$HERE/../.." && pwd)}  # BR_REPO: test suite only
+OUT=${2:-$REPO/dmg-out}
+case $OUT in /*) ;; *) OUT=$PWD/$OUT ;; esac
+PIN=${BR_SIGN_SHA1:-B82B9E874D0CA6CD653F1EA8D4A6367F39CAE0C6}  # override is for the test suite only
+# shellcheck source=pins.env
+. "$HERE/pins.env"
+
+git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null || die "no tag $TAG in $REPO (git fetch --tags?)"
+VER=$(git -C "$REPO" show "$TAG:Cargo.toml" | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -1)
+[ "$VER" = "${TAG#v}" ] || die "Cargo.toml at $TAG says $VER; the tag must equal it"
+[ -z "$FROM_APP" ] || [ -d "$FROM_APP" ] || die "no app at $FROM_APP"
+
+if $ADHOC; then
+  MODE=adhoc
+elif security find-identity -p codesigning 2>/dev/null | grep -q " $PIN \"Boring Remote Code Signing\""; then
+  MODE=keychain
+else
+  MODE=adhoc
+fi
+
+BASE=BoringRemote-$VER-macos-arm64
+if [ $MODE = keychain ]; then DMG=$BASE.dmg; else DMG=$BASE-adhoc.dmg; fi
+PKG=$BASE.app.tar.xz
+ZIP=$BASE-unsigned.zip
+VF=the-boring-remote-version.json
+WORK=${BR_WORK:-${TMPDIR:-/tmp}/boring-release-$VER}
+WORK=${WORK%/}
+SRC=$WORK/src
+
+# --- toolchain -------------------------------------------------------------------------------
+FLUTTER=${FLUTTER:-$(command -v flutter || echo "$HOME/flutter-$FLUTTER_VERSION/bin/flutter")}
+BRIDGE_FLUTTER=${BRIDGE_FLUTTER:-$HOME/flutter-$BRIDGE_FLUTTER_VERSION/bin/flutter}
+sdk_version() {  # read, never run: the SDK root's version file
+  local root; root=$(dirname "$(dirname "$1")")
+  if [ -f "$root/version" ]; then cat "$root/version"
+  else sed -n 's/.*"frameworkVersion": *"\([^"]*\)".*/\1/p' "$root/bin/cache/flutter.version.json" 2>/dev/null; fi
+}
+problems=()
+need() { "$@" >/dev/null 2>&1 || problems+=("$WHAT"); }
+preflight() {
+  [ "$(uname -sm)" = "Darwin arm64" ] || problems+=("not an arm64 Mac")
+  WHAT="dmgbuild venv needs python3"; need command -v python3
+  [ -n "$FROM_APP" ] && return 0
+  [ "$(sdk_version "$FLUTTER")" = "$FLUTTER_VERSION" ] || problems+=("flutter $FLUTTER_VERSION at FLUTTER ($FLUTTER)")
+  [ "$(sdk_version "$BRIDGE_FLUTTER")" = "$BRIDGE_FLUTTER_VERSION" ] \
+    || problems+=("bridge flutter $BRIDGE_FLUTTER_VERSION at BRIDGE_FLUTTER ($BRIDGE_FLUTTER)")
+  for tc in "$MAC_RUST_VERSION" "$BRIDGE_RUST_VERSION"; do
+    rustup toolchain list 2>/dev/null | grep -q "^$tc-" || problems+=("rustup toolchain $tc")
+  done
+  flutter_rust_bridge_codegen --version 2>/dev/null | grep -q "$FLUTTER_RUST_BRIDGE_VERSION" \
+    || problems+=("flutter_rust_bridge_codegen $FLUTTER_RUST_BRIDGE_VERSION")
+  WHAT="cargo-expand $CARGO_EXPAND_VERSION"; need command -v cargo-expand
+  nasm --version 2>/dev/null | grep -q "version 2\." || problems+=("NASM 2.x (brew's 3.x is rejected by aom)")
+  WHAT="llvm (brew install llvm)"; need test -d /opt/homebrew/opt/llvm
+  [ -n "${VCPKG_ROOT:-}" ] && [ "$(git -C "$VCPKG_ROOT" rev-parse HEAD 2>/dev/null)" = "$VCPKG_COMMIT_ID" ] \
+    || problems+=("VCPKG_ROOT at vcpkg $VCPKG_COMMIT_ID")
+  local free; free=$(df -g "$(dirname "$WORK")" | awk 'NR==2 {print $4}')
+  [ "${free:-0}" -ge 40 ] || problems+=("40 GiB free for the build (have ${free:-?})")
+}
+
+# --- runner ----------------------------------------------------------------------------------
+show() { local s; s=$(printf '%q ' "$@"); s=${s//"$(printf '%q' "$PATH")"/\$PATH}; echo "${s% }"; }
+run() { echo "+ $(show "$@")"; $DRY || "$@"; }
+in_src() { echo "+ (cd $SRC && $(show "$@"))"; $DRY || (cd "$SRC" && "$@"); }
+
+fresh_worktree() {
+  if [ -e "$SRC" ]; then run git -C "$REPO" worktree remove --force "$SRC"; fi
+  run git -C "$REPO" worktree add --detach "$SRC" "$TAG"
+  run git -C "$SRC" submodule update --init --recursive
+}
+
+rebrand_and_check() {
+  in_src bash run-tests.sh
+  in_src python3 boring/rebrand.py
+  in_src python3 boring/check.py
+  in_src bash -c 'python3 boring/rebrand.py | grep -qx "rebrand: 0 changed, 0 moved"'
+}
+
+bridge() {
+  local bin; bin=$(dirname "$BRIDGE_FLUTTER")
+  run cp "$SRC/flutter/pubspec.yaml" "$WORK/pubspec.yaml.keep"
+  # Flutter 3.22.3: extended_text 14 needs a newer Dart (same as upstream's bridge job)
+  in_src sed -i '' -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+  in_src env PATH="$bin:$PATH" bash -c 'cd flutter && flutter pub get'
+  in_src env PATH="$bin:$PATH" RUSTUP_TOOLCHAIN="$BRIDGE_RUST_VERSION" flutter_rust_bridge_codegen \
+    --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart \
+    --c-output ./flutter/macos/Runner/bridge_generated.h
+  in_src cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+  run cp "$WORK/pubspec.yaml.keep" "$SRC/flutter/pubspec.yaml"
+}
+
+patch_flutter_sdk() {  # same patch as upstream; skipped when already applied
+  local root; root=$(dirname "$(dirname "$FLUTTER")")
+  local diff="$SRC/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+  echo "+ git -C $root apply $diff (unless already applied)"
+  if ! $DRY && ! git -C "$root" apply --reverse --check "$diff" 2>/dev/null; then git -C "$root" apply "$diff"; fi
+  # https://github.com/flutter/flutter/issues/133533
+  run sed -i '' -e 's/^\( *\)_setFramesEnabledState(false);/\1\/\/_setFramesEnabledState(false);/' \
+    "$root/packages/flutter/lib/src/scheduler/binding.dart"
+}
+
+build_app() {
+  local m=$MIN_MACOS_VERSION
+  in_src sed -i '' -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=$m/" build.py
+  in_src sed -i '' -e "s/platform :osx, '.*'/platform :osx, '$m'/" flutter/macos/Podfile
+  in_src sed -i '' -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"$m\"/" Cargo.toml
+  in_src sed -i '' -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = $m;/" \
+    flutter/macos/Runner.xcodeproj/project.pbxproj
+  in_src env PATH="$(dirname "$FLUTTER"):$PATH" RUSTUP_TOOLCHAIN="$MAC_RUST_VERSION" VCPKG_ROOT="${VCPKG_ROOT:-}" \
+    ./build.py --flutter --unix-file-copy-paste --screencapturekit
+}
+
+seal() {  # install the update script (ADR 0004) and ad-hoc seal; not a release signature
+  run install -m 0755 "$1/src/platform/privileges_scripts/install-update.sh" "$APP/Contents/Resources/boring-install-update.sh"
+  run codesign --force --deep -s - "$APP"
+}
+
+smoke_test() {
+  run test -x "$APP/Contents/MacOS/BoringRemote"
+  run test -x "$APP/Contents/MacOS/service"
+  seal "$SRC"
+  echo "+ PlistBuddy CFBundleIdentifier must be io.boringlabs.remote.agent"
+  $DRY || [ "$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist")" = io.boringlabs.remote.agent ] \
+    || die "bundle id is not io.boringlabs.remote.agent"
+  echo "+ $APP/Contents/MacOS/BoringRemote --version (must print $VER)"
+  $DRY || [ "$("$APP/Contents/MacOS/BoringRemote" --version)" = "$VER" ] || die "--version is not $VER"
+  echo "+ launch BoringRemote, still running after 20s"
+  if ! $DRY; then
+    "$APP/Contents/MacOS/BoringRemote" & local pid=$!
+    sleep 20
+    kill -0 "$pid" || die "BoringRemote exited within 20s"
+    kill "$pid"
+  fi
+  run mkdir -p "$OUT"
+  run ditto -c -k --keepParent "$APP" "$OUT/$ZIP"
+}
+
+dmgbuild_venv() {  # pinned dmgbuild, as CI installed it
+  local v="$WORK/../dmgbuild-$DMGBUILD_VERSION"
+  if [ ! -x "$v/bin/dmgbuild" ]; then
+    run python3 -m venv "$v"
+    run "$v/bin/pip" install --quiet "dmgbuild==$DMGBUILD_VERSION"
+  fi
+  PATH="$v/bin:$PATH"
+}
+
+sign_and_dmg() {
+  if [ $MODE = keychain ]; then
+    in_src env BR_SIGN_KEYCHAIN=1 boring/dmg/release-mac.sh "$APP" "$VER" "$OUT"
+  else
+    in_src env IS_TAG=false boring/dmg/release-mac.sh "$APP" "$VER" "$OUT"
+  fi
+}
+
+# --- plan ------------------------------------------------------------------------------------
+preflight
+echo "build-mac: version $VER (tag $TAG)"
+if [ $MODE = keychain ]; then
+  echo "build-mac: signing: keychain identity \"Boring Remote Code Signing\" ($PIN)"
+else
+  echo "build-mac: WARNING: ad-hoc signed (no \"Boring Remote Code Signing\" identity $PIN in your keychains,"
+  echo "build-mac: WARNING: or --adhoc). TCC grants will not survive an update. Not a release: no version file."
+fi
+echo "build-mac: outputs:"
+for f in "$DMG" "$DMG.sha256" "$PKG"; do echo "  $OUT/$f"; done
+[ $MODE = keychain ] && echo "  $OUT/$VF"
+[ -z "$FROM_APP" ] && echo "  $OUT/$ZIP"
+if [ ${#problems[@]} -gt 0 ]; then
+  printf 'build-mac: toolchain missing: %s\n' "${problems[@]}"
+  $DRY || die "fix the toolchain first (${#problems[@]} problem(s))"
+fi
+$DRY && echo "build-mac: dry run, nothing runs"
+echo "plan:"
+
+if ! $DRY; then mkdir -p "$WORK"; fi
+if [ -n "$FROM_APP" ]; then
+  SRC=$REPO
+  APP=$WORK/BoringRemote.app
+  [ -e "$APP" ] && run rm -rf "$APP"
+  run ditto "$FROM_APP" "$APP"
+  seal "$REPO"
+else
+  fresh_worktree
+  rebrand_and_check
+  bridge
+  patch_flutter_sdk
+  in_src "${VCPKG_ROOT:-\$VCPKG_ROOT}/vcpkg" install --x-install-root="${VCPKG_ROOT:-\$VCPKG_ROOT}/installed"
+  build_app
+  APP=$SRC/flutter/build/macos/Build/Products/Release/BoringRemote.app
+  smoke_test
+fi
+dmgbuild_venv
+# the DMG suite again with the pinned dmgbuild on PATH (throwaway identities in temp keychains)
+in_src python3 -m unittest -v boring/test_dmg.py
+echo "+ git -C $REPO show $TAG:Cargo.toml > $WORK/Cargo.toml   (and boring/min-version: the tag's, not the checkout's)"
+$DRY || git -C "$REPO" show "$TAG:Cargo.toml" > "$WORK/Cargo.toml"
+$DRY || git -C "$REPO" show "$TAG:boring/min-version" > "$WORK/min-version"
+for f in "$DMG" "$DMG.sha256" "$PKG" "$VF"; do $DRY || rm -f "$OUT/$f"; done
+sign_and_dmg
+in_src boring/dmg/make-update-package.sh "$APP" "$VER" "$OUT"
+if [ $MODE = keychain ]; then
+  in_src boring/dmg/write-version-file.sh "$WORK/Cargo.toml" "$TAG" "$OUT/$DMG" "$OUT/$PKG" "$WORK/min-version" "$OUT"
+fi
+if [ -z "$FROM_APP" ] && ! $DRY; then git -C "$REPO" worktree remove --force "$SRC"; fi
+echo "build-mac: done: $OUT"
+[ $MODE = keychain ] && echo "build-mac: then: boring/release/sign-release $OUT   (signs the version file; publish by hand)"
+exit 0

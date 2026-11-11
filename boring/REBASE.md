@@ -1,8 +1,8 @@
 # Rebasing onto upstream RustDesk
 
-The fork is upstream at a release tag plus our commits: `boring/`, `.github/workflows/boring-build.yml`, and the deletion of upstream's workflows and `FUNDING.yml`. The rebrand runs at build time and is never committed. A rebase means moving those commits to a new base. Nothing upstream gets hand-edited.
+The fork is upstream at a release tag plus our commits: `boring/` and the deletion of upstream's workflows and `FUNDING.yml`. There is no GitHub Actions workflow at all (`check.py` fails on any file under `.github/workflows/`); releases build on the Studio with `boring/release/build-mac`. The rebrand runs at build time and is never committed. A rebase means moving those commits to a new base. Nothing upstream gets hand-edited.
 
-`OLD` is the tag we're on now. It's the `version` in `Cargo.toml` and `VERSION` in our workflow. `NEW` is the target.
+`OLD` is the tag we're on now. It's the `version` in `Cargo.toml`. `NEW` is the target.
 
 ## Normal release rebase
 
@@ -13,20 +13,20 @@ git switch -c rebase/NEW open-fork
 git rebase --onto NEW OLD
 ```
 
-The only conflicts you should see are `deleted by us` on upstream workflows upstream changed since `OLD`. Keep them deleted with `git rm <file>` and run `git rebase --continue`. Any other conflict means someone hand-edited an upstream file. Stop and move that change into `boring/rebrand.py`.
+The only conflicts you should see are `deleted by us` on upstream workflows upstream changed since `OLD` (or on `.github/workflows/boring-build.yml`, which we removed). Keep them deleted with `git rm <file>` and run `git rebase --continue`. Any other conflict means someone hand-edited an upstream file. Stop and move that change into `boring/rebrand.py`.
 
 ```
 git submodule update --init libs/hbb_common   # NEW's hbb_common
 python3 boring/pins.py NEW                     # exit 1 = stale pins, 3 = bad ref
-python3 boring/pins.py --fix NEW               # copies upstream's values into boring-build.yml
-git diff .github/workflows/boring-build.yml    # read it, then commit: "ci: pins from upstream NEW"
-python3 -m unittest boring/test_rebrand.py boring/test_pins.py -v
+python3 boring/pins.py --fix NEW               # copies upstream's values into boring/release/pins.env
+git diff boring/release/pins.env               # read it, then commit: "release: pins from upstream NEW"
+bash run-tests.sh
 python3 boring/rebrand.py                      # exit 2 = moved target, see below
 python3 boring/check.py                        # must end "N passed, 0 failed"
 git reset --hard && git -C libs/hbb_common reset --hard   # drop the scripted output (commit your own edits first)
 ```
 
-`pins.py` covers Flutter, the bridge Flutter, Rust (Mac, Windows, bridge), LLVM, the vcpkg commit, flutter_rust_bridge, cargo-expand, the minimum macOS version and the app `VERSION`. `check.py` also fails in CI if `VERSION` doesn't match `Cargo.toml`. If upstream adds a toolchain pin we don't track, add it to `PINS`. To spot new pins, run `git diff OLD NEW -- .github/workflows/flutter-build.yml .github/workflows/bridge.yml`.
+`pins.py` covers Flutter, the bridge Flutter, Rust (Mac, Windows, bridge), LLVM, the vcpkg commit, flutter_rust_bridge, cargo-expand, the minimum macOS version. The app version is `Cargo.toml`'s alone; `build-mac` refuses a tag that differs from it. If upstream adds a toolchain pin we don't track, add it to `PINS`. To spot new pins, run `git diff OLD NEW -- .github/workflows/flutter-build.yml .github/workflows/bridge.yml`.
 
 If `check.py` fails `protocol files are upstream's`, upstream changed a `.proto`. Confirm the change is upstream's and read it (`git diff OLD NEW -- '*.proto'`, and `git -C libs/hbb_common diff <old-sha> <new-sha> -- protos`), then record the new hashes on an LF checkout:
 
@@ -42,7 +42,7 @@ Then look for new code that contacts RustDesk. `check.py` catches the known serv
 git diff OLD NEW -- src libs/hbb_common flutter/lib | grep -E '^\+' | grep -iE 'https?://|rustdesk\.com'
 ```
 
-Push `rebase/NEW`, wait for CI to go green on both macOS and Windows, then move `open-fork` to it. The rebase rewrote history, so this push is a force push of `open-fork`.
+Run `boring/release/build-mac --dry-run NEW` (toolchain and plan), then a real local build on the Studio (Windows: the Windows build machine), then move `open-fork` to `rebase/NEW`. The rebase rewrote history, so this push is a force push of `open-fork`.
 
 ## Security fix fast path
 
@@ -56,7 +56,7 @@ git -C libs/hbb_common fetch origin && git -C libs/hbb_common checkout <hbb-sha>
 git add libs/hbb_common && git commit -m "hbb_common: security fix <hbb-sha>"
 ```
 
-Then run the same tests, `rebrand.py` and `check.py` as above. Push, wait for green CI, and fast-forward `open-fork`. Leave `pins.py` and `VERSION` alone: the base tag hasn't changed. The next normal rebase drops the cherry-pick on its own once the fix is in `NEW`. If git stops on it, run `git rebase --skip`.
+Then run the same tests, `rebrand.py` and `check.py` as above. Build locally (`boring/release/build-mac`), then fast-forward `open-fork`. Leave `pins.py` alone: the base tag hasn't changed. The next normal rebase drops the cherry-pick on its own once the fix is in `NEW`. If git stops on it, run `git rebase --skip`.
 
 ## When `rebrand.py` exits 2 (patch target moved)
 

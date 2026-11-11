@@ -34,13 +34,10 @@ def export_clean_tree(dest):
         archive = subprocess.run(["git", "-C", str(REPO / sub), "archive", "HEAD"],
                                  check=True, capture_output=True).stdout
         subprocess.run(["tar", "-x", "-C", str(out)], input=archive, check=True)
-    # Our own workflows come from the working tree, so the tests see what you are editing.
-    wf = dest / ".github/workflows"
-    wf.mkdir(parents=True, exist_ok=True)
-    for ours in (REPO / ".github/workflows").glob("boring-*.yml"):
-        shutil.copy2(ours, wf / ours.name)
     # An unpatched upstream tree still has its own workflows; put one back so the
     # tree under test looks like a fresh upstream checkout.
+    wf = dest / ".github/workflows"
+    wf.mkdir(parents=True, exist_ok=True)
     (wf / "flutter-build.yml").write_text(
         "jobs:\n  b:\n    steps:\n      - run: ./build.py --flutter --hwcodec --unix-file-copy-paste\n")
 
@@ -168,15 +165,6 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("FAIL MSI dialog art", r.stdout)
-
-    def test_stale_app_version_pin_fails_check(self):
-        cargo = self.root / "Cargo.toml"
-        cargo.write_text(re.sub(r'(?m)^version = "[^"]*"', 'version = "9.9.9"', cargo.read_text(), 1))
-        self.rebrand()
-        r = run(CHECK, self.root)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("FAIL workflow VERSION matches Cargo.toml version", r.stdout)
-        self.assertIn("9.9.9", r.stdout)
 
     def edit(self, rel, old, new):
         path = self.root / rel
