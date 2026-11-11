@@ -83,6 +83,11 @@ LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows the
     "verification-method": "use-permanent-password",
     "temporary-password-length": "10",  # moot with the line above; pinned in case it goes
     "allow-remote-config-modification": "N",
+    # ticket 06: password AND click. "" is RustDesk's "both": a right password from a trusted
+    # Controller logs in, an unknown one also needs Accept on the Target (src/trust_policy.rs).
+    # Not "password": that hides the Accept button. The prompt can't be hidden either.
+    "approve-mode": "",
+    "allow-hide-cm": "N",
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
     "allow-only-conn-window-open": "N",
@@ -601,13 +606,21 @@ PATCHES += [
 # src/password_lock.rs and generated_password.dart are ours; these wire them in.
 # The locks themselves are in LOCKED (verification-method, allow-remote-config-modification).
 NO_PASSWORD_GATE = (
-    "            // boring-remote: no permanent password, no way in (ticket 05). Not click-to-accept.\n"
-    "            if crate::password_lock::refuse_login(\n"
-    "                &Config::get_option(\"verification-method\"),\n"
-    "                Config::has_permanent_password(),\n"
-    "            ) {\n"
-    "                self.send_login_error(crate::password_lock::NO_PASSWORD_ERROR).await;\n"
+    "            // boring-remote: permanent password only (ticket 05). None set yet: no unattended\n"
+    "            // access, but someone at this computer can still click Accept, not remembered (ticket 06).\n"
+    "            if crate::password_lock::refuse_login(&Config::get_option(\"verification-method\")) {\n"
+    "                self.send_login_error(crate::password_lock::LOCK_GONE_ERROR).await;\n"
     "                return false;\n"
+    "            }\n"
+    "            if !Config::has_permanent_password() {\n"
+    "                crate::trust_policy::on_login(\n"
+    "                    self.inner.id(),\n"
+    "                    &lr.my_id,\n"
+    "                    crate::trust_policy::Password::NotSet,\n"
+    "                );\n"
+    "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+    "                self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS).await;\n"
+    "                return true;\n"
     "            }\n")
 GENERATE_BUTTON = (
     "        // boring-remote: Generate (ticket 05) sets a strong password and shows it once.\n"
@@ -693,6 +706,67 @@ PATCHES += [
      GENERATE_BUTTON
      + "        return [\n          cancelButton,\n          generateButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n        ];\n",
      "Generate button in Set Password"),
+]
+
+# --- Trusted Controllers (ticket 06) ----------------------------------------------
+# src/trust_policy.rs and trusted_controllers.dart are ours; these wire them in. The
+# approve-mode / allow-hide-cm locks are in LOCKED; the session guard on the trusted list is
+# password_lock::SECURITY_OPTIONS.
+TRUST_GATE = (
+    "                    // boring-remote: a Controller not on the trusted list also needs a click\n"
+    "                    // on this computer (ticket 06). Nobody answers: the login times out.\n"
+    "                    if crate::trust_policy::on_login(\n"
+    "                        self.inner.id(),\n"
+    "                        &lr.my_id,\n"
+    "                        crate::trust_policy::Password::Right,\n"
+    "                    ) != crate::trust_policy::Decision::Allow\n"
+    "                    {\n"
+    "                        self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+    "                        self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)\n"
+    "                            .await;\n"
+    "                        return true;\n"
+    "                    }\n")
+ACCEPT_GATE = (
+    "                            // boring-remote: Accept counts only for a login waiting on it:\n"
+    "                            // password checked, or none set on this computer (ticket 06).\n"
+    "                            if !crate::trust_policy::on_accept(conn.inner.id()) {\n"
+    "                                continue;\n"
+    "                            }\n")
+FORGET_ON_LOGIN = ("            crate::trust_policy::forget(self.inner.id()); "
+                   "// boring-remote: a new attempt voids any wait (ticket 06)\n")
+TRUST_CARD = "                _Card(title: 'Trusted Controllers', children: [TrustedControllers()]),\n"
+_PW_OK = ("                    self.update_failure_with_scope(failure, true, 0, FailureScope::Default);\n"
+          "                    if !self.send_logon_response_and_keep_alive().await {\n")
+_AUTHORIZE = ("                        ipc::Data::Authorize => {\n"
+              "                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);\n")
+_LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n"
+          "            if !self.check_login_scope(&lr).await {\n")
+PATCHES += [
+    ("src/lib.rs", "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
+     "mod password_lock; // boring-remote: permanent password only (ticket 05)\n"
+     "mod trust_policy; // boring-remote: trusted Controllers (ticket 06)\n",
+     "trust policy module"),
+    ("src/server/connection.rs", _PW_OK,
+     _PW_OK.replace("                    if !self.send_logon_response_and_keep_alive", TRUST_GATE
+                    + "                    if !self.send_logon_response_and_keep_alive", 1),
+     "unknown Controller waits for a click after the right password"),
+    ("src/server/connection.rs", _AUTHORIZE,
+     _AUTHORIZE.replace("                            conn.set_conn_audit", ACCEPT_GATE
+                        + "                            conn.set_conn_audit", 1),
+     "Accept only for a password-checked Controller"),
+    ("src/server/connection.rs", _LOGIN, _LOGIN.replace("            if !self.check_login_scope", FORGET_ON_LOGIN
+                                                        + "            if !self.check_login_scope", 1),
+     "a new login attempt voids the wait"),
+    ("src/server/connection.rs", "        self.closed = true;\n",
+     "        self.closed = true;\n        crate::trust_policy::forget(self.inner.id()); // boring-remote (ticket 06)\n",
+     "a closed connection voids the wait"),
+    (SETTINGS, "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n"
+     "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n",
+     "trusted Controllers import (settings)"),
+    (SETTINGS, "                _Card(title: '2FA', children: [tfa()]),\n",
+     "                _Card(title: '2FA', children: [tfa()]),\n" + TRUST_CARD,
+     "trusted Controllers list in Security settings"),
 ]
 
 COPIES = [

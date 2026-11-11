@@ -2,8 +2,9 @@
 //!
 //! - `generate`: a strong permanent password from the OS RNG. The UI shows it once, at
 //!   generate/reset; the daemon stores only its salted hash, so it is never readable again.
-//! - `refuse_login`: no permanent password set (or the lock gone) means the login is refused,
-//!   not handed to click-to-accept.
+//! - `refuse_login`: the permanent-only lock gone means every login is refused. No permanent
+//!   password set means no unattended access, only a click on the Target
+//!   (`trust_policy::Password::NotSet`, ticket 06).
 //! - `config_write_allowed` / `guard_options`: while any authorised remote session exists, the
 //!   daemon refuses password and PIN writes and keeps the security options as they were, so a
 //!   Controller driving the Target's Settings window can't loosen them.
@@ -19,8 +20,8 @@ pub const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz2
 pub const LEN: usize = 20;
 /// The only verification method this build accepts (locked in OVERWRITE_SETTINGS).
 pub const PERMANENT_ONLY: &str = "use-permanent-password";
-/// Login error when the Target has no permanent password.
-pub const NO_PASSWORD_ERROR: &str = "No password is set on this computer";
+/// Login error if the permanent-only lock is ever gone.
+pub const LOCK_GONE_ERROR: &str = "Connection not allowed";
 
 /// Config writes (IPC `Data::Config`) refused during a remote session.
 pub const PROTECTED_CONFIG: &[&str] = &["permanent-password", "salt", "unlock-pin"];
@@ -52,6 +53,9 @@ pub const SECURITY_OPTIONS: &[&str] = &[
     "enable-record-session",
     "enable-block-input",
     "enable-remote-printer",
+    // ticket 06: the accept prompt can't be hidden, and no session edits the trusted list
+    "allow-hide-cm",
+    "boring-trusted-controllers",
 ];
 
 pub fn generate_with<R: Rng>(rng: &mut R) -> String {
@@ -64,9 +68,9 @@ pub fn generate() -> String {
     generate_with(&mut OsRng)
 }
 
-/// True when the login must be refused outright.
-pub fn refuse_login(verification_method: &str, has_permanent_password: bool) -> bool {
-    verification_method != PERMANENT_ONLY || !has_permanent_password
+/// True when the login must be refused outright: the permanent-only lock is gone.
+pub fn refuse_login(verification_method: &str) -> bool {
+    verification_method != PERMANENT_ONLY
 }
 
 pub fn config_write_allowed(name: &str, remote_sessions: usize) -> bool {
@@ -146,15 +150,15 @@ mod tests {
     }
 
     #[test]
-    fn login_refused_without_a_permanent_password() {
-        assert!(refuse_login(PERMANENT_ONLY, false));
-        assert!(!refuse_login(PERMANENT_ONLY, true));
+    fn login_not_refused_outright_with_the_lock_in_place() {
+        // No password set is not refused here: it goes to the click (trust_policy, ticket 06).
+        assert!(!refuse_login(PERMANENT_ONLY));
     }
 
     #[test]
     fn login_refused_if_the_permanent_only_lock_is_gone() {
         for m in ["", "use-temporary-password", "use-both-passwords"] {
-            assert!(refuse_login(m, true), "{m}");
+            assert!(refuse_login(m), "{m}");
         }
     }
 
@@ -193,6 +197,18 @@ mod tests {
         let current = map(&[("allow-remote-config-modification", "N")]);
         let out = guard_options(HashMap::new(), &current, 2);
         assert_eq!(out.get("allow-remote-config-modification").map(String::as_str), Some("N"));
+    }
+
+    #[test]
+    fn trusted_controllers_kept_during_a_session() {
+        let key = crate::trust_policy::TRUSTED_OPTION;
+        let current = map(&[(key, "111111111")]);
+        let incoming = map(&[(key, "111111111,666666666")]);
+        let out = guard_options(incoming, &current, 1);
+        assert_eq!(out.get(key).map(String::as_str), Some("111111111"));
+        // ...and can't be emptied either; with no session the local user can change it.
+        assert_eq!(guard_options(HashMap::new(), &current, 1).get(key).map(String::as_str), Some("111111111"));
+        assert_eq!(guard_options(HashMap::new(), &current, 0).get(key), None);
     }
 
     #[test]

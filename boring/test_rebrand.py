@@ -363,7 +363,7 @@ class RebrandSeam(unittest.TestCase):
 
     # --- ticket 05: permanent password only ---------------------------------------
     PERMANENT_ONLY = "one-time password off: only the permanent password is accepted"
-    NO_PASSWORD = "no permanent password refuses the login, before click-to-accept"
+    NO_PASSWORD = "no permanent password: no unattended access, only a click on the Target (not remembered)"
     THROTTLED = "wrong passwords are still throttled before and after every password check"
     IPC_GUARDED = "a remote session can't change the password, PIN or security options"
     GENERATOR = "generated password: OS RNG, 16+ characters, no look-alike characters, wired to Set Password"
@@ -405,10 +405,34 @@ class RebrandSeam(unittest.TestCase):
                   "            }\n" + rebrand.NO_PASSWORD_GATE + "            if self.is_recent_session(false) {\n")
         self.assert_check_fails(self.NO_PASSWORD)
 
-    def test_refuse_login_ignoring_missing_password_fails_check(self):
+    def test_refuse_login_ignoring_the_lock_fails_check(self):
         self.rebrand()
-        self.edit("src/password_lock.rs", "verification_method != PERMANENT_ONLY || !has_permanent_password",
-                  "verification_method != PERMANENT_ONLY")
+        self.edit("src/password_lock.rs", "    verification_method != PERMANENT_ONLY\n", "    false\n")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_no_password_login_counted_as_right_password_fails_check(self):
+        # ticket 06: Right would let a trusted Controller in unattended and remember new ones.
+        self.rebrand()
+        self.edit("src/server/connection.rs", "crate::trust_policy::Password::NotSet", "crate::trust_policy::Password::Right")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_no_password_login_falling_through_fails_check(self):
+        self.rebrand()
+        conn = "src/server/connection.rs"
+        gate = rebrand.NO_PASSWORD_GATE
+        self.edit(conn, gate, gate.replace("                return true;\n            }\n", "            }\n"))
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_no_password_approval_remembered_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "if decision == Decision::Allow && password == Password::Right {",
+                  "if decision == Decision::Allow {")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_no_password_trusted_controller_skipping_the_click_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    if password == Password::Right && trusted.contains(controller) {",
+                  "    if trusted.contains(controller) {")
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_throttle_dropped_from_the_password_check_fails_check(self):
@@ -456,6 +480,125 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/password_lock.rs", "generate_with(&mut OsRng)",
                   "generate_with(&mut hbb_common::rand::thread_rng())")
         self.assert_check_fails(self.GENERATOR)
+
+    # --- ticket 06: trusted Controllers --------------------------------------------
+    APPROVE_LOCKED = "unknown Controllers need the password and a click on the Target (approve mode locked, prompt can't hide)"
+    TRUST_GATE = "a right password from an unknown Controller waits for a click on the Target before logging in"
+    ACCEPT_GATED = "the Target's Accept only counts for a login waiting on it (password checked, or none set)"
+    TRUST_LIST = "trusted Controllers saved in the daemon's config, a remote session can't change them"
+    TRUST_SETTINGS = "Settings lists trusted Controllers with Remove, behind the security unlock"
+
+    def test_trust_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
+                     self.TRUST_SETTINGS):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_trust_facts_fail_on_clean_upstream_tree(self):
+        r = run(CHECK, self.root)
+        for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
+                     self.TRUST_SETTINGS):
+            self.assertIn(f"FAIL {fact}", r.stdout)
+
+    def test_password_only_approve_mode_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("approve-mode", "")', '("approve-mode", "password")')
+        self.assert_check_fails(self.APPROVE_LOCKED)
+
+    def test_hideable_prompt_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("allow-hide-cm", "N")', '("allow-hide-cm", "Y")')
+        self.assert_check_fails(self.APPROVE_LOCKED)
+
+    def test_trust_gate_removed_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.TRUST_GATE, "")
+        self.assert_check_fails(self.TRUST_GATE)
+
+    def test_trust_gate_after_logon_fails_check(self):
+        self.rebrand()
+        conn = "src/server/connection.rs"
+        self.edit(conn, rebrand.TRUST_GATE, "")
+        self.edit(conn, "                    self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n                }\n            }\n",
+                  rebrand.TRUST_GATE + "                    self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n"
+                  "                }\n            }\n")
+        self.assert_check_fails(self.TRUST_GATE)
+
+    def test_trust_gate_that_lets_ask_through_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                        return true;\n                    }\n"
+                  "                    if !self.send_logon_response_and_keep_alive().await {",
+                  "                    }\n                    if !self.send_logon_response_and_keep_alive().await {")
+        self.assert_check_fails(self.TRUST_GATE)
+
+    def test_policy_not_refusing_wrong_password_first_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    if password == Password::Wrong {\n        return Decision::Refuse;\n    }\n", "")
+        self.assert_check_fails(self.TRUST_GATE)
+
+    def test_policy_allowing_unanswered_prompt_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "AtTarget::NoAnswer => Decision::Refuse,", "AtTarget::NoAnswer => Decision::Allow,")
+        self.assert_check_fails(self.TRUST_GATE)
+
+    def test_ungated_accept_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.ACCEPT_GATE, "")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_wait_not_voided_by_a_new_login_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.FORGET_ON_LOGIN, "")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_accept_that_ignores_pending_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "            return false;\n        };\n        let (_, controller, password)",
+                  "            return true;\n        };\n        let (_, controller, password)")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_unanswered_prompt_no_longer_times_out_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                _ = login_deadline(conn.authorized, started) => {\n"
+                  "                    conn.on_close(\"Timeout\", true).await;\n                    break;\n                }\n", "")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_trusted_list_left_out_of_the_session_guard_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", '    "boring-trusted-controllers",\n', "")
+        self.assert_check_fails(self.TRUST_LIST)
+
+    def test_trusted_list_key_mismatch_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", 'pub const TRUSTED_OPTION: &str = "boring-trusted-controllers";',
+                  'pub const TRUSTED_OPTION: &str = "boring-trusted";')
+        self.assert_check_fails(self.TRUST_LIST)
+
+    def test_trusted_list_in_local_options_fails_check(self):
+        # Local options live in the UI process's config, not the daemon's, and skip the guard.
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "Config::set_option(TRUSTED_OPTION", "LocalConfig::set_option(TRUSTED_OPTION")
+        self.assert_check_fails(self.TRUST_LIST)
+
+    def test_settings_without_trusted_list_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, rebrand.TRUST_CARD, "")
+        self.assert_check_fails(self.TRUST_SETTINGS)
+
+    def test_settings_list_outside_the_unlock_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.SETTINGS, rebrand.TRUST_CARD, "")
+        self.edit(rebrand.SETTINGS, "            _lock(locked, 'Unlock Security Settings', () {\n",
+                  rebrand.TRUST_CARD + "            _lock(locked, 'Unlock Security Settings', () {\n")
+        self.assert_check_fails(self.TRUST_SETTINGS)
+
+    def test_settings_widget_on_another_key_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/widgets/trusted_controllers.dart",
+                  "const kBoringTrustedControllers = 'boring-trusted-controllers';",
+                  "const kBoringTrustedControllers = 'trusted';")
+        self.assert_check_fails(self.TRUST_SETTINGS)
 
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",

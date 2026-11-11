@@ -664,12 +664,22 @@ def password_lock_checks(c, locked):
     lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
     gate = conn.find("if crate::password_lock::refuse_login(")
     click = conn.find("if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)")
-    refuse = fn_body(lock, "pub fn refuse_login(verification_method: &str, has_permanent_password: bool) -> bool {")
-    c.fact("no permanent password refuses the login, before click-to-accept",
-           0 <= gate < click and "Config::has_permanent_password()" in conn[gate:click]
-           and "return false;" in conn[gate:click] and refuse is not None
-           and "!has_permanent_password" in refuse and "PERMANENT_ONLY" in refuse,
-           f"gate at {gate}, click branch at {click}, refuse_login {refuse!r}")
+    refuse = fn_body(lock, "pub fn refuse_login(verification_method: &str) -> bool {")
+    # ticket 06 changed this: no password set → attended click only (spec slice 4, tailnet access
+    # keeps working while setup is pending), never the unattended password path, never remembered.
+    trust = strip_tests_and_comments(c.read("src/trust_policy.rs"))
+    unset = re.search(r"if !Config::has_permanent_password\(\) \{\s*crate::trust_policy::on_login\(\s*self\.inner\.id\(\),"
+                      r"\s*&lr\.my_id,\s*crate::trust_policy::Password::NotSet,\s*\);\s*"
+                      r"self\.try_start_cm\(lr\.my_id, lr\.my_name, false\);\s*"
+                      r"self\.send_login_error\(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS\)\.await;\s*return true;\s*\}",
+                      conn[gate:click] if 0 <= gate < click else "")
+    c.fact("no permanent password: no unattended access, only a click on the Target (not remembered)",
+           0 <= gate < click and "return false;" in conn[gate:click] and unset is not None
+           and refuse is not None and refuse.strip() == "verification_method != PERMANENT_ONLY"
+           and "if password == Password::Right && trusted.contains(controller) {" in trust
+           and "if decision == Decision::Allow && password == Password::Right {" in trust,
+           f"gate at {gate}, click branch at {click}, no-password click path {unset is not None}, "
+           f"refuse_login {refuse!r}")
 
     throttle = fn_body(conn, "async fn check_failure_with_scope(") or ""
     ok = (THROTTLED_LOGIN.search(conn) is not None and conn.count("self.validate_password(") == 1
@@ -699,6 +709,70 @@ def password_lock_checks(c, locked):
            and "OsRng" in gen and not missing, "; ".join(missing))
     c.fact("one-time password label hidden when it is off",
            'translate(showOneTime ? "One-time Password" : "Password"),' in c.read(rebrand.HOME))
+
+
+def trust_checks(c, locked):
+    """Ticket 06: a Controller not on the Target's trusted list needs the password and a click."""
+    c.fact("unknown Controllers need the password and a click on the Target (approve mode locked, prompt can't hide)",
+           locked.get("approve-mode") == "" and "approve-mode" in locked and locked.get("allow-hide-cm") == "N",
+           f"approve-mode {locked.get('approve-mode')!r}, allow-hide-cm {locked.get('allow-hide-cm')!r}")
+
+    conn = c.read("src/server/connection.rs")
+    trust = strip_tests_and_comments(c.read("src/trust_policy.rs"))
+    decide = fn_body(trust, "pub fn decide(") or ""
+    ok_at = conn.find("self.update_failure_with_scope(failure, true, 0, FailureScope::Default);")
+    logon = conn.find("if !self.send_logon_response_and_keep_alive().await {", ok_at)
+    gate = conn.find("if crate::trust_policy::on_login(\n                        self.inner.id(),\n"
+                     "                        &lr.my_id,\n                        crate::trust_policy::Password::Right,", ok_at)
+    wait = conn[gate:logon] if 0 <= ok_at < gate < logon else ""
+    c.fact("a right password from an unknown Controller waits for a click on the Target before logging in",
+           "!= crate::trust_policy::Decision::Allow" in wait and "return true;" in wait
+           and "self.try_start_cm(lr.my_id, lr.my_name, false);" in wait
+           and "mod trust_policy;" in c.read("src/lib.rs")
+           and re.match(r"\s*if password == Password::Wrong \{\s*return Decision::Refuse;\s*\}\s*"
+                        r"if password == Password::Right && trusted\.contains\(controller\) \{\s*"
+                        r"return Decision::Allow;\s*\}", decide)
+           and "AtTarget::NoAnswer => Decision::Refuse," in decide and decide.count("Decision::Allow") == 2,
+           f"password ok at {ok_at}, trust gate at {gate}, logon at {logon}")
+
+    authorize = conn.find("ipc::Data::Authorize => {")
+    arm = conn[authorize:conn.find("ipc::Data::Close =>", authorize)] if authorize >= 0 else ""
+    accept = fn_body(trust, "pub fn on_accept(conn_id: i32) -> bool {") or ""
+    login = conn.find("if let Some(message::Union::LoginRequest(lr)) = msg.union {")
+    loop = re.search(r"_ = login_deadline\(conn\.authorized, started\) => \{\s*conn\.on_close\(\"Timeout\", true\)\.await;"
+                     r"\s*break;", conn)
+    c.fact("the Target's Accept only counts for a login waiting on it (password checked, or none set)",
+           arm.find("if !crate::trust_policy::on_accept(conn.inner.id()) {") >= 0
+           and arm.find("if !crate::trust_policy::on_accept(") < arm.find("send_logon_response_and_keep_alive")
+           and conn.count("ipc::Data::Authorize") == 1
+           and "crate::trust_policy::forget(self.inner.id());" in conn[login:login + 200]
+           and re.search(r"let Some\(i\) = pending\.iter\(\)\.position\(\|\(c, _, _\)\| \*c == conn_id\) else \{"
+                         r".{0,200}?return false;\s*\};", accept, re.S) is not None
+           and "PENDING.lock().unwrap().push(" in (fn_body(trust, "pub fn on_login(") or "")
+           and loop is not None,
+           f"Authorize arm at {authorize}, login timeout {'kept' if loop else 'gone'}")
+
+    lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
+    guarded = re.search(r"pub const SECURITY_OPTIONS: &\[&str\] = &\[(.*?)\];", lock, re.S)
+    key = re.search(r'pub const TRUSTED_OPTION: &str = "([^"]+)";', trust)
+    c.fact("trusted Controllers saved in the daemon's config, a remote session can't change them",
+           key is not None and guarded is not None and f'"{key.group(1)}"' in guarded.group(1)
+           and re.search(r"(?<!Local)Config::set_option\(TRUSTED_OPTION", trust) is not None
+           and re.search(r"(?<!Local)Config::get_option\(TRUSTED_OPTION", trust) is not None
+           and "LocalConfig" not in trust and "mod trust_policy;" in c.read("src/lib.rs"),
+           f"key {key.group(1) if key else None}")
+
+    settings = c.read(rebrand.SETTINGS)
+    widget = c.read("flutter/lib/desktop/widgets/trusted_controllers.dart")
+    unlock = settings.find("_lock(locked, 'Unlock Security Settings'")
+    card = settings.find(rebrand.TRUST_CARD)
+    dart_key = re.search(r"const kBoringTrustedControllers = '([^']+)';", widget)
+    c.fact("Settings lists trusted Controllers with Remove, behind the security unlock",
+           0 <= unlock < settings.find("preventMouseKeyBuilder(", unlock) < card
+           and "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';" in settings
+           and key is not None and dart_key is not None and dart_key.group(1) == key.group(1)
+           and "bind.mainSetOption(key: kBoringTrustedControllers" in widget and "translate('Remove')" in widget,
+           f"unlock at {unlock}, card at {card}, widget key {dart_key.group(1) if dart_key else None}")
 
 
 def run_checks(root):
@@ -764,6 +838,7 @@ def run_checks(root):
     c.fact("allow-only-conn-window-open available in settings",
            "'allow-only-conn-window-open'" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
     password_lock_checks(c, locked)
+    trust_checks(c, locked)
 
     # sync, NAT test, updater
     for rel, sig, what in (
