@@ -1,7 +1,6 @@
-"""Mac release: signing, DMG, verify, secret export.
+"""Mac release: signing, DMG, verify.
 
-Seams: boring/dmg/release-mac.sh and boring/dmg/export-signing-secret.sh run as
-commands (exit code, files written, output), boring/dmg/settings.py as dmgbuild
+Seams: boring/dmg/release-mac.sh run as a command (exit code, files written, output), boring/dmg/settings.py as dmgbuild
 reads it, and the text of boring/release/build-mac (the local release). The Mac-only tests build a throwaway self-signed
 identity in a temp keychain; nothing touches the real signing identity.
 
@@ -291,16 +290,16 @@ class UpdatePackage(unittest.TestCase):
 
 class ReleaseScripts(unittest.TestCase):
     def test_no_secret_is_echoed_or_traced(self):
-        for f in (BUILD_MAC, DMG / "release-mac.sh", DMG / "export-signing-secret.sh"):
+        for f in (BUILD_MAC, DMG / "release-mac.sh"):
             text = f.read_text()
             self.assertNotRegex(text, r"set -x|set -o xtrace|bash -x", f)
             for line in text.splitlines():
                 if re.search(r"\b(echo|printf)\b", line) and re.search(r"\$\{?(MAC_SIGN_P12\w*|p12|p12pw|pw|kcpw)\b", line):
                     # only allowed: piping the value straight into a consumer
-                    self.assertRegex(line, r"\| *(base64 --decode|gh secret set|swift)", f"{f.name}: {line}")
+                    self.assertRegex(line, r"\| *base64 --decode", f"{f.name}: {line}")
 
     def test_pin_is_the_same_everywhere(self):
-        for f in (DMG / "release-mac.sh", DMG / "export-signing-secret.sh", BUILD_MAC):
+        for f in (DMG / "release-mac.sh", BUILD_MAC):
             self.assertIn(f"PIN=${{BR_SIGN_SHA1:-{PIN}}}", f.read_text())
 
     def test_temp_keychain_is_deleted_on_exit(self):
@@ -315,7 +314,7 @@ class ReleaseScripts(unittest.TestCase):
             self.assertNotRegex(f.read_text(), r"osascript|tell application \"Finder\"", f)
 
     def test_the_release_runs_this_suite(self):
-        self.assertIn("boring.test_dmg.ReleaseMac", BUILD_MAC.read_text())
+        self.assertIn("boring/test_dmg.py", BUILD_MAC.read_text())
         self.assertIn("boring/test_dmg.py", (ROOT / "run-tests.sh").read_text())
 
 
@@ -349,96 +348,6 @@ class Settings(unittest.TestCase):
 
     def test_art_prints_the_first_launch_step(self):
         self.assertIn("right-click the app, then Open", (DMG / "make_art.py").read_text())
-
-
-EXPORT = DMG / "export-signing-secret.sh"
-
-
-@unittest.skipUnless(ON_MAC, "needs macOS")
-class ExportSecret(unittest.TestCase):
-    """export-signing-secret.sh against a temp keychain holding the target and a decoy."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp = pathlib.Path(tempfile.mkdtemp(prefix="br-export-"))
-        cls.kc = cls.tmp / "test.keychain-db"
-        subprocess.run(["security", "create-keychain", "-p", "kcpw", cls.kc], check=True)
-        subprocess.run(["security", "unlock-keychain", "-p", "kcpw", cls.kc], check=True)
-        cls.sha = {}
-        for cn in ("Boring Remote Code Signing", "Boring Stories Local Code Signing"):
-            p12, sha = make_identity(cls.tmp, cn, "x")
-            # -A: the test keychain lets any app export, so no GUI prompt in the suite
-            subprocess.run(["security", "import", cls.tmp / f"{cn}.p12", "-k", cls.kc, "-f", "pkcs12", "-P", "x",
-                            "-A"], check=True, capture_output=True)
-            cls.sha[cn] = sha
-        cls.bin = cls.tmp / "bin"
-        cls.bin.mkdir()
-        gh = cls.bin / "gh"
-        # Stub gh: logs argv, stores what `secret set` read on stdin (test key only).
-        gh.write_text('#!/bin/bash\necho "$*" >> "$GH_LOG"\n'
-                      'if [ "$1 $2" = "secret set" ]; then cat > "$GH_DIR/$3"; fi\n')
-        gh.chmod(0o755)
-
-    @classmethod
-    def tearDownClass(cls):
-        subprocess.run(["security", "delete-keychain", cls.kc])
-        shutil.rmtree(cls.tmp, True)
-
-    def export(self, *args, pin=None):
-        d = pathlib.Path(tempfile.mkdtemp(dir=self.tmp))
-        env = {"BR_EXPORT_KEYCHAIN": str(self.kc), "BR_SIGN_SHA1": pin or self.sha["Boring Remote Code Signing"],
-               "PATH": f"{self.bin}:{os.environ['PATH']}", "GH_LOG": str(d / "gh.log"), "GH_DIR": str(d),
-               "TMPDIR": str(d) + "/"}
-        return run(["bash", str(EXPORT), *args], env=env), d
-
-    def p12_certs(self, p12, pw):
-        out = subprocess.run(["openssl", "pkcs12", "-nokeys", "-passin", f"pass:{pw}"], input=p12,
-                             capture_output=True).stdout.decode()
-        return [hashlib.sha1(subprocess.run(["openssl", "x509", "-outform", "der"], input=c.encode(),
-                                            capture_output=True).stdout).hexdigest().upper()
-                for c in re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out, re.S)]
-
-    def test_sets_both_secrets_with_only_the_boring_remote_identity(self):
-        r, d = self.export()
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        log = (d / "gh.log").read_text()
-        self.assertIn("secret set MAC_SIGN_P12 -R Monolith3-studio/boring-remote-desk", log)
-        self.assertIn("secret set MAC_SIGN_P12_PASSWORD -R Monolith3-studio/boring-remote-desk", log)
-        pw = (d / "MAC_SIGN_P12_PASSWORD").read_text()
-        b64 = (d / "MAC_SIGN_P12").read_text()
-        self.assertGreaterEqual(len(pw), 32)
-        p12 = __import__("base64").b64decode(b64)
-        self.assertEqual(self.p12_certs(p12, pw), [self.sha["Boring Remote Code Signing"]])
-        keys = subprocess.run(["openssl", "pkcs12", "-nocerts", "-nodes", "-passin", f"pass:{pw}"], input=p12,
-                              capture_output=True).stdout.count(b"BEGIN PRIVATE KEY")
-        self.assertEqual(keys, 1)
-        for secret in (pw, b64[:40]):
-            self.assertNotIn(secret, r.stdout + r.stderr)
-        # Nothing the script wrote to TMPDIR holds the key (gh stub's own files aside).
-        for f in d.rglob("*"):
-            if f.is_file() and f.name not in ("MAC_SIGN_P12", "MAC_SIGN_P12_PASSWORD", "gh.log"):
-                self.assertNotIn(p12[:64], f.read_bytes(), f)
-
-    def test_round_trips_into_release_mac(self):
-        r, d = self.export()
-        self.assertEqual(r.returncode, 0, r.stderr)
-        rel = run(["bash", "-c", 'printf "%s" "$MAC_SIGN_P12" | base64 --decode | openssl pkcs12 -nokeys '
-                   '-passin env:MAC_SIGN_P12_PASSWORD | openssl x509 -noout -subject'],
-                  env={"MAC_SIGN_P12": (d / "MAC_SIGN_P12").read_text(),
-                       "MAC_SIGN_P12_PASSWORD": (d / "MAC_SIGN_P12_PASSWORD").read_text()})
-        self.assertIn("Boring Remote Code Signing", rel.stdout)
-
-    def test_dry_run_sets_nothing(self):
-        r, d = self.export("--dry-run")
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertFalse((d / "gh.log").exists() and "secret set" in (d / "gh.log").read_text())
-        self.assertIn("dry run", r.stdout)
-
-    def test_wrong_pin_sets_nothing(self):
-        r, d = self.export(pin=self.sha["Boring Stories Local Code Signing"][::-1])
-        self.assertNotEqual(r.returncode, 0)
-        self.assertFalse((d / "MAC_SIGN_P12").exists())
-        self.assertFalse((d / "MAC_SIGN_P12_PASSWORD").exists())
 
 
 if __name__ == "__main__":

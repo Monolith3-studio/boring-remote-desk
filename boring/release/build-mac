@@ -238,9 +238,8 @@ else
   smoke_test
 fi
 dmgbuild_venv
-# the DMG suite's release half (throwaway identities); ExportSecret is the old CI-secret exporter
-in_src python3 -m unittest -v boring.test_dmg.ReleaseMac boring.test_dmg.VersionFile boring.test_dmg.UpdatePackage \
-  boring.test_dmg.Settings
+# the DMG suite again with the pinned dmgbuild on PATH (throwaway identities in temp keychains)
+in_src python3 -m unittest -v boring/test_dmg.py
 echo "+ git -C $REPO show $TAG:Cargo.toml > $WORK/Cargo.toml   (and boring/min-version: the tag's, not the checkout's)"
 $DRY || git -C "$REPO" show "$TAG:Cargo.toml" > "$WORK/Cargo.toml"
 $DRY || git -C "$REPO" show "$TAG:boring/min-version" > "$WORK/min-version"

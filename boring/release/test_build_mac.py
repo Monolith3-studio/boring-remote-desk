@@ -96,7 +96,7 @@ class DryRun(unittest.TestCase):
             self.assertIn(f"  {self.out}/{name}\n", out)
         steps = ["boring/rebrand.py", "boring/check.py", "flutter_rust_bridge_codegen", "vcpkg",
                  "build.py --flutter --unix-file-copy-paste --screencapturekit", "--version",
-                 "BoringRemote-1.8.0-macos-arm64-unsigned.zip", "boring.test_dmg.ReleaseMac",
+                 "BoringRemote-1.8.0-macos-arm64-unsigned.zip", "boring/test_dmg.py",
                  "boring/dmg/release-mac.sh", "boring/dmg/make-update-package.sh",
                  "boring/dmg/write-version-file.sh"]
         at = [out.index(s, out.index("plan:")) for s in steps]
