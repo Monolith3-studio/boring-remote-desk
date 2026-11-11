@@ -315,7 +315,7 @@ class ReleaseScripts(unittest.TestCase):
             self.assertNotRegex(f.read_text(), r"osascript|tell application \"Finder\"", f)
 
     def test_the_release_runs_this_suite(self):
-        self.assertIn("boring/test_dmg.py", BUILD_MAC.read_text())
+        self.assertIn("boring.test_dmg.ReleaseMac", BUILD_MAC.read_text())
         self.assertIn("boring/test_dmg.py", (ROOT / "run-tests.sh").read_text())
 
 
