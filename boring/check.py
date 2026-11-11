@@ -7,13 +7,12 @@ Reads the tree after boring/rebrand.py has run and asserts what the spec asks
 for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
 on all interfaces, allow-only-conn-window-open available and off, sync / NAT
 test / updater / LAN discovery unreachable (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
-no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
-Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
-tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
+no GitHub Actions workflow, no hwcodec/vram in any build invocation, Mac build with
+file copy-paste, the Windows MSI (name, exe, art sizes, license, icon, no RustDesk text), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
 translations, app metadata, every logo slot; one AGPL line on the About page), that
 the connect box takes an IP or a tailnet name and never reaches the ID/rendezvous
 path, and that the protocol files are upstream's. It only reads the tree.
-Idempotence is proved by test_rebrand.py and the CI clean-diff step.
+Idempotence is proved by test_rebrand.py and build-mac's second-run step.
 
 Prints one PASS/FAIL line per fact, then
     rebrand check: <n> passed, <m> failed
@@ -53,6 +52,7 @@ VERSION_URL_DECL = re.compile(r'pub const VERSION_URL: &str = "(https://boringla
 BANNED = re.compile(r"hwcodec|vram")
 BUILD_CALL = re.compile(r"build\.py|cargo\b|FEATURES")
 HBB = rebrand.HBB
+RELEASE_SCRIPT = "boring/release/build-mac"  # the local release (spec slice 7); GitHub never builds
 
 
 class Check:
@@ -204,8 +204,8 @@ def protocol_matches(root):
     return not bad, ", ".join(bad)
 
 
-def msi_checks(c, workflows):
-    """Windows installer: name, exe, art, license, no RustDesk text, release on tags."""
+def msi_checks(c):
+    """Windows installer: name, exe, art, license, no RustDesk text."""
     pkg = c.root / MSI_DIR
     wxs = c.read(f"{MSI_DIR}/Package.wxs")
     pre = c.read("res/msi/preprocess.py")
@@ -241,19 +241,10 @@ def msi_checks(c, workflows):
     c.fact(f"product icon is {SHOWN}'s", all(
         (c.root / p).is_file() and (c.root / p).read_bytes() == icon
         for p in ("res/icon.ico", "flutter/windows/runner/resources/app_icon.ico")))
-    amyuni = [w.name for w in workflows if "usbmmidd" in w.read_text()]
+    amyuni = [RELEASE_SCRIPT] if "usbmmidd" in c.read(RELEASE_SCRIPT) else []
     if 'Custom Action="RemoveAmyuniIdd"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"):
         amyuni.append("RustDesk.wxs")
     c.fact("no Amyuni driver in the build or the installer", not amyuni, ", ".join(amyuni))
-
-    ours = "".join(w.read_text() for w in workflows if w.name.startswith(rebrand.OUR_WORKFLOW_PREFIX))
-    c.fact("tags publish a GitHub release with the MSI and its sha256",
-           "startsWith(github.ref, 'refs/tags/')" in ours and "preprocess.py" in ours
-           and ".msi.sha256" in ours and "contents: write" in ours)
-    # PowerShell's Set-Content ends lines with CRLF; sha256sum -c on Ubuntu then looks for "x.msi\r"
-    writers = [l.strip() for l in ours.splitlines() if ".sha256" in l and re.search(r"Set-Content|Out-File|>", l)]
-    c.fact("MSI .sha256 is written with LF, so sha256sum -c passes on Linux",
-           writers and all("-NoNewline" in l and '`n"' in l for l in writers), str(writers))
 
 
 # --- branding: what a person sees on Mac and Windows ------------------------
@@ -645,8 +636,21 @@ def updater_checks(c):
     c.fact("both update public keys present and different (ADR 0004)", ok, str(keys))
 
 
+def workflow_guard(c):
+    """No GitHub Actions: any file under .github/workflows/, on disk or tracked in git, fails.
+    Releases build on the Studio (boring/release/build-mac). .github/patches/ is fine."""
+    wf = c.root / ".github/workflows"
+    found = {p.relative_to(c.root).as_posix() for p in wf.rglob("*") if p.is_file()} if wf.is_dir() else set()
+    if (c.root / ".git").exists():
+        r = subprocess.run(["git", "-C", str(c.root), "ls-files", "--", ".github/workflows"],
+                           capture_output=True, text=True)
+        found |= set(r.stdout.split())
+    c.fact("no GitHub Actions workflow (.github/workflows/ is empty)", not found, ", ".join(sorted(found)))
+
+
 def run_checks(root):
     c = Check(root)
+    workflow_guard(c)
     cfg = c.read(HBB)
 
     # identity
@@ -783,18 +787,14 @@ def run_checks(root):
     c.fact("id@public peer fails with an error", public is not None and "split_first()" in public.group(1)
            and "bail!(" in public.group(1), public and public.group(1)[:200])
 
-    # banned codecs and the Mac build flags
-    wf_dir = c.root / ".github/workflows"
-    workflows = sorted(wf_dir.glob("*.y*ml")) if wf_dir.is_dir() else []
-    upstream = [w.name for w in workflows if not w.name.startswith(rebrand.OUR_WORKFLOW_PREFIX)]
-    c.fact("only our workflows remain", not upstream, ", ".join(upstream))
+    # banned codecs and the Mac build flags (releases build locally: boring/release/build-mac)
     bad = []
     for p in sorted(c.root.rglob("*")):
         rel = p.relative_to(c.root).as_posix()
-        if not p.is_file() or rel.startswith(("boring/", ".git/", "target/")):
+        if not p.is_file() or (rel.startswith(("boring/", ".git/", "target/")) and rel != RELEASE_SCRIPT):
             continue
         is_wf = rel.startswith(".github/workflows/")
-        if not (is_wf or p.suffix in (".sh", ".ps1", ".bat", ".cmd", ".py") or p.name == "Dockerfile"):
+        if not (is_wf or p.suffix in (".sh", ".ps1", ".bat", ".cmd", ".py") or p.name in ("Dockerfile", "build-mac")):
             continue
         for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if BANNED.search(line) and (is_wf or BUILD_CALL.search(line)):
@@ -805,18 +805,13 @@ def run_checks(root):
     c.fact("hwcodec and vram not default features", m is not None and not BANNED.search(m.group(1)))
     c.fact("build.py refuses hwcodec and vram", "hwcodec and vram are banned" in c.read("build.py")
            and "features.append('hwcodec')" not in c.read("build.py"))
-    mac_builds = [l for w in workflows for l in w.read_text().splitlines()
+    mac_builds = [l for l in c.read(RELEASE_SCRIPT).splitlines()
                   if "build.py" in l and "--flutter" in l and "--portable" not in l]
     c.fact("Mac build has --unix-file-copy-paste",
            mac_builds and all("--unix-file-copy-paste" in l for l in mac_builds), str(mac_builds))
-    # the other pins can only be checked against upstream's workflows: boring/pins.py
-    app = re.search(r'(?m)^version = "([^"]*)"', c.read("Cargo.toml"))
-    wfv = re.search(r'(?m)^  VERSION: "([^"]*)"', c.read(".github/workflows/boring-build.yml"))
-    c.fact("workflow VERSION matches Cargo.toml version",
-           app and wfv and app.group(1) == wfv.group(1),
-           f"workflow {wfv and wfv.group(1)}, Cargo.toml {app and app.group(1)}; run boring/pins.py --fix")
+    # toolchain pins are checked against upstream's workflows by boring/pins.py; the app version is Cargo.toml's
 
-    msi_checks(c, workflows)
+    msi_checks(c)
     branding_checks(c)
     connect_checks(c)
 
