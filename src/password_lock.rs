@@ -6,12 +6,17 @@
 //!   password set means no unattended access, only a click on the Target
 //!   (`trust_policy::Password::NotSet`, ticket 06).
 //! - `config_write_allowed` / `guard_options`: while any authorised remote session exists, the
-//!   daemon refuses password and PIN writes and keeps the security options as they were, so a
-//!   Controller driving the Target's Settings window can't loosen them.
+//!   daemon refuses password, salt and PIN writes, keeps the security options as they were and
+//!   refuses a whole-config sync (`Data::SyncConfig`), so a Controller driving the Target's
+//!   Settings window can't loosen them. Out of scope: a Controller that runs its own code as
+//!   the logged-in user can talk to the daemon directly; nothing here stops that.
 //!
 //! The decisions are pure; `generate_and_set` and `authed_sessions` are the thin wiring.
-use hbb_common::log;
-use hbb_common::rand::{rngs::OsRng, Rng};
+use base::config::keys;
+use hbb_common::{
+    log,
+    rand::{rngs::OsRng, Rng},
+};
 use std::collections::HashMap;
 
 /// No 0/O, 1/l/I: safe to read aloud or copy by hand.
@@ -29,33 +34,32 @@ pub const PROTECTED_CONFIG: &[&str] = &["permanent-password", "salt", "unlock-pi
 /// Options (IPC `Data::Options`) a remote session can't change. Locked ones are here too,
 /// in case a lock is ever dropped.
 pub const SECURITY_OPTIONS: &[&str] = &[
-    "verification-method",
-    "temporary-password-length",
-    "allow-numeric-one-time-password",
-    "approve-mode",
-    "access-mode",
-    "allow-remote-config-modification",
-    "whitelist",
-    "direct-server",
-    "allow-only-conn-window-open",
+    keys::OPTION_VERIFICATION_METHOD,
+    keys::OPTION_TEMPORARY_PASSWORD_LENGTH,
+    keys::OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD,
+    keys::OPTION_APPROVE_MODE,
+    keys::OPTION_ACCESS_MODE,
+    keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION,
+    keys::OPTION_WHITELIST,
+    keys::OPTION_DIRECT_SERVER,
+    keys::OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN,
     "2fa",
-    "enable-trusted-devices",
-    "disable-change-permanent-password",
-    "disable-unlock-pin",
-    "enable-keyboard",
-    "enable-clipboard",
-    "enable-file-transfer",
-    "enable-audio",
-    "enable-camera",
-    "enable-terminal",
-    "enable-tunnel",
-    "enable-remote-restart",
-    "enable-record-session",
-    "enable-block-input",
-    "enable-remote-printer",
-    // ticket 06: the accept prompt can't be hidden, and no session edits the trusted list
+    keys::OPTION_ENABLE_TRUSTED_DEVICES,
+    keys::OPTION_DISABLE_CHANGE_PERMANENT_PASSWORD,
+    keys::OPTION_DISABLE_UNLOCK_PIN,
+    keys::OPTION_ENABLE_KEYBOARD,
+    keys::OPTION_ENABLE_CLIPBOARD,
+    keys::OPTION_ENABLE_FILE_TRANSFER,
+    keys::OPTION_ENABLE_AUDIO,
+    keys::OPTION_ENABLE_CAMERA,
+    keys::OPTION_ENABLE_TERMINAL,
+    keys::OPTION_ENABLE_TUNNEL,
+    keys::OPTION_ENABLE_REMOTE_RESTART,
+    keys::OPTION_ENABLE_RECORD_SESSION,
+    keys::OPTION_ENABLE_BLOCK_INPUT,
+    keys::OPTION_ENABLE_REMOTE_PRINTER,
     "allow-hide-cm",
-    "boring-trusted-controllers",
+    crate::trust_policy::TRUSTED_OPTION,
 ];
 
 pub fn generate_with<R: Rng>(rng: &mut R) -> String {

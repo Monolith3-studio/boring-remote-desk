@@ -25,6 +25,7 @@ CONNECT_TAILNET = "names connect Direct IP only to Tailscale addresses, else the
 NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
+REMOTE_CONFIG = "allow-remote-config-modification locked off (a UI hint; the session guard holds the settings)"
 HBB = rebrand.HBB
 
 
@@ -355,18 +356,25 @@ class RebrandSeam(unittest.TestCase):
     THROTTLED = "wrong passwords are still throttled before and after every password check"
     IPC_GUARDED = "a remote session can't change the password, PIN or security options"
     GENERATOR = "generated password: OS RNG, 16+ characters, no look-alike characters, wired to Set Password"
+    SYNC_GUARDED = "a remote session can't replace the whole config (Data::SyncConfig refused)"
+    TYPED_16 = "a typed password needs 16+ characters; Generate (Reset once set) is the main action"
+    SHOWN_ONCE = "the new password closes only on I've saved it, and Reset asks before replacing"
+    CLIPBOARD = "a copied password leaves the clipboard after a minute"
+    ONE_TIME_LABEL = "one-time password label hidden when it is off (desktop and mobile)"
+    UI_KEYS = "new UI strings (tickets 05, 06) have a key in every translation file"
 
     def test_password_lock_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
         for fact in (self.PERMANENT_ONLY, self.NO_PASSWORD, self.THROTTLED, self.IPC_GUARDED, self.GENERATOR,
-                     "a Controller can't change the Target's settings (allow-remote-config-modification locked off)",
-                     "one-time password length pinned", "one-time password label hidden when it is off"):
+                     REMOTE_CONFIG, self.SYNC_GUARDED, self.TYPED_16, self.SHOWN_ONCE, self.CLIPBOARD,
+                     self.ONE_TIME_LABEL, self.UI_KEYS, "one-time password length pinned"):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_password_lock_facts_fail_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
-        for fact in (self.PERMANENT_ONLY, self.NO_PASSWORD, self.IPC_GUARDED, self.GENERATOR):
+        for fact in (self.PERMANENT_ONLY, self.NO_PASSWORD, self.IPC_GUARDED, self.GENERATOR, self.SYNC_GUARDED,
+                     self.TYPED_16, self.SHOWN_ONCE, self.ONE_TIME_LABEL, self.UI_KEYS):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_both_passwords_allowed_fails_check(self):
@@ -378,7 +386,7 @@ class RebrandSeam(unittest.TestCase):
     def test_remote_config_modification_allowed_fails_check(self):
         self.rebrand()
         self.edit(HBB, '("allow-remote-config-modification", "N")', '("allow-remote-config-modification", "Y")')
-        self.assert_check_fails("a Controller can't change the Target's settings")
+        self.assert_check_fails(REMOTE_CONFIG)
 
     def test_no_password_gate_removed_fails_check(self):
         self.rebrand()
@@ -413,8 +421,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_password_approval_remembered_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "if decision == Decision::Allow && password == Password::Right {",
-                  "if decision == Decision::Allow {")
+        self.edit("src/trust_policy.rs", "if password == Password::Right && remember {", "if remember {")
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_no_password_trusted_controller_skipping_the_click_fails_check(self):
@@ -469,24 +476,106 @@ class RebrandSeam(unittest.TestCase):
                   "generate_with(&mut hbb_common::rand::thread_rng())")
         self.assert_check_fails(self.GENERATOR)
 
+    def test_generator_drawing_from_part_of_the_alphabet_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "rng.gen_range(0..ALPHABET.len())", "rng.gen_range(0..10)")
+        self.assert_check_fails(self.GENERATOR)
+
+    def test_refuse_login_on_a_constant_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD))",
+                  "refuse_login(crate::password_lock::PERMANENT_ONLY)")
+        self.assert_check_fails(self.NO_PASSWORD)
+
+    def test_widened_throttle_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "let res = if failure.2 > 30 {", "let res = if failure.2 > 3000 {")
+        self.assert_check_fails(self.THROTTLED)
+
+    def test_session_count_always_zero_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "    crate::server::AUTHED_CONNS.lock().unwrap().len()\n", "    0\n")
+        self.assert_check_fails(self.IPC_GUARDED)
+
+    def test_option_dropped_from_the_security_list_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "    keys::OPTION_APPROVE_MODE,\n", "")
+        self.assert_check_fails(self.IPC_GUARDED)
+
+    def test_ipc_guard_moved_off_its_arm_fails_check(self):
+        # Still three guards in the file, but the salt write is no longer behind one.
+        self.rebrand()
+        self.edit("src/ipc.rs", f'name == "salt" {{\n                    if {rebrand.IPC_GUARD} {{',
+                  f'name == "salt" {{\n                    // {rebrand.IPC_GUARD}\n                    if false {{')
+        self.assert_check_fails(self.IPC_GUARDED)
+
+    def test_config_sync_during_a_session_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", rebrand.SYNC_GUARD, "")
+        self.assert_check_fails(self.SYNC_GUARDED)
+
+    def test_short_typed_password_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "MinCharactersValidationRule(16)", "MinCharactersValidationRule(8)")
+        self.assert_check_fails(self.TYPED_16)
+
+    def test_new_password_closing_on_escape_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/widgets/generated_password.dart",
+                  "dialogButton(\"I've saved it\", onPressed: close),\n        ],\n",
+                  "dialogButton(\"I've saved it\", onPressed: close),\n        ],\n        onCancel: close,\n")
+        self.assert_check_fails(self.SHOWN_ONCE)
+
+    def test_reset_without_asking_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "              final go = await confirmReplacePassword();\n              if (go == null) return;\n",
+                  "              final go = true;\n")
+        self.assert_check_fails(self.SHOWN_ONCE)
+
+    def test_password_left_on_the_clipboard_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/desktop/widgets/generated_password.dart",
+                  "await Clipboard.setData(const ClipboardData(text: ''));", "")
+        self.assert_check_fails(self.CLIPBOARD)
+
+    def test_mobile_one_time_label_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.MOBILE_SERVER, "translate(showOneTime ? 'One-time Password' : 'Password'),",
+                  "translate('One-time Password'),")
+        self.assert_check_fails(self.ONE_TIME_LABEL)
+
+    def test_ui_string_missing_from_a_language_fails_check(self):
+        self.rebrand()
+        self.edit("src/lang/de.rs", '        ("Trusted Controllers", ""),\n', "")
+        self.assert_check_fails(self.UI_KEYS)
+
     # --- ticket 06: trusted Controllers --------------------------------------------
     APPROVE_LOCKED = "unknown Controllers need the password and a click on the Target (approve mode locked, prompt can't hide)"
-    TRUST_GATE = "a right password from an unknown Controller waits for a click on the Target before logging in"
-    ACCEPT_GATED = "the Target's Accept only counts for a login waiting on it (password checked, or none set)"
-    TRUST_LIST = "trusted Controllers saved in the daemon's config, a remote session can't change them"
+    TRUST_GATE = "a right password from a Controller ID not on the trusted list waits for a click on the Target"
+    ACCEPT_GATED = "the Target's Accept only counts for a login waiting on it; a stray one ends the connection"
+    TRUST_LIST = "trusted Controllers live in the daemon's config; only an Accept with no other session open adds one"
+    BUDGET = "every Accept prompt counts against the IP's failure budget; an approval clears it"
+    SWAP = "a new login on a connection waiting on Accept ends it (the click can't land on another login)"
+    NO_DEAD_ACCEPT = "no Accept prompt for a login without the right password (empty or wrong)"
+    LOGON_SITES = "exactly five ways into a session, each gated or explained"
+    REMOVE = "removing a trusted Controller works during a session and ends its sessions"
+    ID_LOG = "a Controller-supplied ID is logged throttled and only if storable"
     TRUST_SETTINGS = "Settings lists trusted Controllers with Remove, behind the security unlock"
 
     def test_trust_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
         for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
-                     self.TRUST_SETTINGS):
+                     self.TRUST_SETTINGS, self.BUDGET, self.SWAP, self.NO_DEAD_ACCEPT, self.LOGON_SITES,
+                     self.REMOVE, self.ID_LOG):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_trust_facts_fail_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
         for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
-                     self.TRUST_SETTINGS):
+                     self.TRUST_SETTINGS, self.BUDGET, self.SWAP, self.NO_DEAD_ACCEPT, self.LOGON_SITES,
+                     self.REMOVE):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_password_only_approve_mode_fails_check(self):
@@ -516,18 +605,19 @@ class RebrandSeam(unittest.TestCase):
     def test_trust_gate_that_lets_ask_through_fails_check(self):
         self.rebrand()
         self.edit("src/server/connection.rs", "                        return true;\n                    }\n"
-                  "                    if !self.send_logon_response_and_keep_alive().await {",
-                  "                    }\n                    if !self.send_logon_response_and_keep_alive().await {")
+                  "                    self.update_failure_with_scope(failure, true,",
+                  "                    }\n                    self.update_failure_with_scope(failure, true,")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_policy_not_refusing_wrong_password_first_fails_check(self):
+    def test_policy_letting_an_unasked_controller_in_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    if password == Password::Wrong {\n        return Decision::Refuse;\n    }\n", "")
+        self.edit("src/trust_policy.rs", "AtTarget::NotAsked => Decision::Ask,", "AtTarget::NotAsked => Decision::Allow,")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_policy_allowing_unanswered_prompt_fails_check(self):
+    def test_trusted_check_without_the_password_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "AtTarget::NoAnswer => Decision::Refuse,", "AtTarget::NoAnswer => Decision::Allow,")
+        self.edit("src/trust_policy.rs", "    if password == Password::Right && trusted.contains(controller) {",
+                  "    if trusted.contains(controller) {")
         self.assert_check_fails(self.TRUST_GATE)
 
     def test_ungated_accept_fails_check(self):
@@ -535,16 +625,70 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", rebrand.ACCEPT_GATE, "")
         self.assert_check_fails(self.ACCEPT_GATED)
 
-    def test_wait_not_voided_by_a_new_login_fails_check(self):
+    def test_new_login_on_a_waiting_connection_kept_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.FORGET_ON_LOGIN, "")
-        self.assert_check_fails(self.ACCEPT_GATED)
+        self.edit("src/server/connection.rs", rebrand.FORGET_ON_LOGIN,
+                  "            crate::trust_policy::forget(self.inner.id());\n")
+        self.assert_check_fails(self.SWAP)
 
     def test_accept_that_ignores_pending_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "            return false;\n        };\n        let (_, controller, password)",
-                  "            return true;\n        };\n        let (_, controller, password)")
+        self.edit("src/trust_policy.rs", "        return false;\n    };\n    let trusted = load();",
+                  "        return true;\n    };\n    let trusted = load();")
         self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_stray_accept_left_hanging_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                                conn.send_close_reason_no_retry(\"\").await;\n"
+                  "                                conn.on_close(\"connection manager\", true).await;\n"
+                  "                                break;\n                            }\n                            clear_failures",
+                  "                                continue;\n                            }\n                            clear_failures")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_wait_kept_after_close_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs",
+                  "        crate::trust_policy::forget(self.inner.id()); // boring-remote (ticket 06)\n", "")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_prompt_not_counted_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                    {\n                        "
+                  "self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n",
+                  "                    {\n")
+        self.assert_check_fails(self.BUDGET)
+
+    def test_no_password_prompt_not_throttled_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                let (failure, res) = self.check_failure(0).await;\n"
+                  "                if !res {\n                    return true;\n                }\n"
+                  "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+                  "                crate::trust_policy::on_login(", "                crate::trust_policy::on_login(")
+        self.assert_check_fails(self.BUDGET)
+
+    def test_accept_prompt_after_a_wrong_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "LOGIN_MSG_PASSWORD_WRONG)\n                        .await;\n",
+                  "LOGIN_MSG_PASSWORD_WRONG)\n                        .await;\n"
+                  "                    self.try_start_cm(lr.my_id, lr.my_name, false);\n")
+        self.assert_check_fails(self.NO_DEAD_ACCEPT)
+
+    def test_accept_prompt_without_a_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.EMPTY_PASSWORD_NO_CM, rebrand.EMPTY_PASSWORD_CM)
+        self.assert_check_fails(self.NO_DEAD_ACCEPT)
+
+    def test_sixth_way_into_a_session_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "            if !self.check_login_scope(&lr).await {\n",
+                  "            if !self.send_logon_response_and_keep_alive().await {\n                return false;\n"
+                  "            }\n            if !self.check_login_scope(&lr).await {\n")
+        self.assert_check_fails(self.LOGON_SITES)
+
+    def test_recent_session_with_one_time_passwords_on_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("verification-method", "use-permanent-password")', '("verification-method", "use-both-passwords")')
+        self.assert_check_fails(self.LOGON_SITES)
 
     def test_unanswered_prompt_no_longer_times_out_fails_check(self):
         self.rebrand()
@@ -554,20 +698,49 @@ class RebrandSeam(unittest.TestCase):
 
     def test_trusted_list_left_out_of_the_session_guard_fails_check(self):
         self.rebrand()
-        self.edit("src/password_lock.rs", '    "boring-trusted-controllers",\n', "")
+        self.edit("src/password_lock.rs", "    crate::trust_policy::TRUSTED_OPTION,\n", "")
         self.assert_check_fails(self.TRUST_LIST)
 
     def test_trusted_list_key_mismatch_fails_check(self):
+        # The session guard names the constant itself; the Settings list must follow a rename.
         self.rebrand()
         self.edit("src/trust_policy.rs", 'pub const TRUSTED_OPTION: &str = "boring-trusted-controllers";',
                   'pub const TRUSTED_OPTION: &str = "boring-trusted";')
-        self.assert_check_fails(self.TRUST_LIST)
+        self.assert_check_fails(self.TRUST_SETTINGS)
+
+    def test_remove_key_mismatch_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", 'pub const REMOVE_OPTION: &str = "boring-trusted-controllers-remove";',
+                  'pub const REMOVE_OPTION: &str = "boring-untrust";')
+        self.assert_check_fails(self.REMOVE)
 
     def test_trusted_list_in_local_options_fails_check(self):
         # Local options live in the UI process's config, not the daemon's, and skip the guard.
         self.rebrand()
         self.edit("src/trust_policy.rs", "Config::set_option(TRUSTED_OPTION", "LocalConfig::set_option(TRUSTED_OPTION")
         self.assert_check_fails(self.TRUST_LIST)
+
+    def test_approval_remembered_during_another_session_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "let remember = crate::password_lock::authed_sessions() == 0;", "let remember = true;")
+        self.assert_check_fails(self.TRUST_LIST)
+
+    def test_ui_copy_of_the_trusted_list_taken_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", "                let removed = crate::trust_policy::take_options(&mut value, &Config::get_options());\n",
+                  "                let removed: Vec<String> = Vec::new();\n")
+        self.assert_check_fails(self.TRUST_LIST)
+
+    def test_removed_controller_keeps_its_session_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.CLOSE_ARM, "")
+        self.assert_check_fails(self.REMOVE)
+
+    def test_controller_id_logged_on_every_login_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "        hbb_common::throttled_log!(\n            std::time::Duration::from_secs(60),\n            info,\n",
+                  "        log::info!(\n")
+        self.assert_check_fails(self.ID_LOG)
 
     def test_settings_without_trusted_list_fails_check(self):
         self.rebrand()

@@ -35,6 +35,16 @@ TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 # What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
 NOT_FOUND = "Couldn't find that machine. Type its Tailscale name or IP."
+# New UI strings (tickets 05, 06). Each is its own translation key: English text, "" in every
+# language file until translated (AGENTS.md, Localization).
+SESSION_SET_FAILED = "Couldn't set the password. If a remote session is open, end it and try again."
+UI_KEYS = [
+    "Generate", "Reset", "Copy", "New password", "Write it down or copy it now. It won't be shown again.",
+    "I've saved it", "Replace", "Replace the password?", "Every Controller will need the new password.",
+    "Also clear trusted Controllers", SESSION_SET_FAILED, "Trusted Controllers",
+    "None yet. A computer connecting for the first time needs a click here.",
+]
+LANG_KEYS = [NOT_FOUND] + UI_KEYS
 # Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
 # out (check.py derives them from TAILNET and compares).
 TAILNET_RESOLVER = f"""
@@ -605,53 +615,106 @@ PATCHES += [
 # --- Permanent password only (ticket 05) ------------------------------------------
 # src/password_lock.rs and generated_password.dart are ours; these wire them in.
 # The locks themselves are in LOCKED (verification-method, allow-remote-config-modification).
+# Shared by both gates below: upstream's click branch (Windows terminal OS-login prep, the
+# version check before the wait message), so a gated login behaves like an upstream click login.
+def _click_wait(indent):
+    i = " " * indent
+    return (
+        f"{i}#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+        f"{i}if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {{\n"
+        f"{i}    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {{\n"
+        f"{i}        return keep_alive;\n"
+        f"{i}    }}\n"
+        f"{i}}}\n"
+        f"{i}self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+        f"{i}if hbb_common::get_version_number(&lr.version)\n"
+        f"{i}    >= hbb_common::get_version_number(\"1.2.0\")\n"
+        f"{i}{{\n"
+        f"{i}    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS).await;\n"
+        f"{i}}}\n"
+        f"{i}return true;\n")
+
+
 NO_PASSWORD_GATE = (
     "            // boring-remote: permanent password only (ticket 05). None set yet: no unattended\n"
     "            // access, but someone at this computer can still click Accept, not remembered (ticket 06).\n"
-    "            if crate::password_lock::refuse_login(&Config::get_option(\"verification-method\")) {\n"
+    "            if crate::password_lock::refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD)) {\n"
     "                self.send_login_error(crate::password_lock::LOCK_GONE_ERROR).await;\n"
     "                return false;\n"
     "            }\n"
     "            if !Config::has_permanent_password() {\n"
+    "                // Every prompt counts against this IP's failure budget: no prompt spam.\n"
+    "                let (failure, res) = self.check_failure(0).await;\n"
+    "                if !res {\n"
+    "                    return true;\n"
+    "                }\n"
+    "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
     "                crate::trust_policy::on_login(\n"
     "                    self.inner.id(),\n"
     "                    &lr.my_id,\n"
     "                    crate::trust_policy::Password::NotSet,\n"
     "                );\n"
-    "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
-    "                self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS).await;\n"
-    "                return true;\n"
+    + _click_wait(16) +
     "            }\n")
 GENERATE_BUTTON = (
-    "        // boring-remote: Generate (ticket 05) sets a strong password and shows it once.\n"
+    "        // boring-remote: Generate (ticket 05) sets a strong password and shows it once. Reset asks\n"
+    "        // first and can clear the trusted Controllers too (ticket 06).\n"
     "        final generateButton = dialogButton(\n"
-    "          \"Generate\",\n"
+    "          permanentPasswordSet ? \"Reset\" : \"Generate\",\n"
     "          icon: Icon(Icons.casino_outlined),\n"
     "          onPressed: () async {\n"
+    "            var clearTrusted = false;\n"
+    "            if (permanentPasswordSet) {\n"
+    "              final go = await confirmReplacePassword();\n"
+    "              if (go == null) return;\n"
+    "              clearTrusted = go;\n"
+    "            }\n"
     "            final pass = await bind.mainGeneratePermanentPassword();\n"
     "            if (pass.isEmpty) {\n"
     "              setState(() {\n"
-    "                errMsg0 = '${translate('Prompt')}: ${translate(\"Failed\")}';\n"
+    f"                errMsg0 = '${{translate('Prompt')}}: ${{translate(\"{SESSION_SET_FAILED}\")}}';\n"
     "              });\n"
     "              return;\n"
     "            }\n"
+    "            if (clearTrusted) clearTrustedControllers();\n"
     "            close();\n"
     "            notEmptyCallback?.call();\n"
     "            showGeneratedPasswordOnce(pass);\n"
     "          },\n"
-    "          isOutline: true,\n"
     "        );\n")
 IPC_GUARD = ("!crate::password_lock::config_write_allowed(&name, "
              "crate::password_lock::authed_sessions())")
+SYNC_GUARD = (
+    "            // boring-remote: no whole-config replace during a remote session (tickets 05, 06).\n"
+    "            if crate::password_lock::authed_sessions() > 0 {\n"
+    "                log::warn!(\"config sync refused during a remote session\");\n"
+    "                return;\n"
+    "            }\n")
+OPTIONS_HOOK = (
+    "                // boring-remote: security options stay put during a remote session (ticket 05).\n"
+    "                let mut value = crate::password_lock::guard_options(\n"
+    "                    value,\n"
+    "                    &Config::get_options(),\n"
+    "                    crate::password_lock::authed_sessions(),\n"
+    "                );\n"
+    "                // The trusted list is the daemon's; removing one ends its sessions (ticket 06).\n"
+    "                let removed = crate::trust_policy::take_options(&mut value, &Config::get_options());\n"
+    "                Config::set_options(value);\n"
+    "                crate::trust_policy::close_removed(&removed);\n")
+MOBILE_SERVER = "flutter/lib/mobile/pages/server_page.dart"
+NON_IOS = '#[cfg(not(target_os = "ios"))] // boring-remote: Target side only\n'
 PATCHES += [
     ("src/lib.rs", "mod lang;\n",
-     "mod lang;\nmod password_lock; // boring-remote: permanent password only (ticket 05)\n",
-     "password lock module"),
+     "mod lang;\n" + NON_IOS + "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
+     "password lock module (no Target side on iOS)"),
     ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
      "/// boring-remote: set a generated permanent password (ticket 05) and return it once for the\n"
      "/// UI to show. Empty if the daemon refused it. Never logged, never readable again.\n"
      "pub fn main_generate_permanent_password() -> String {\n"
-     "    crate::password_lock::generate_and_set()\n"
+     "    #[cfg(not(target_os = \"ios\"))]\n"
+     "    return crate::password_lock::generate_and_set();\n"
+     "    #[cfg(target_os = \"ios\")]\n"
+     "    String::new()\n"
      "}\n\n"
      "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
      "generate password bridge call"),
@@ -672,6 +735,7 @@ PATCHES += [
      '                } else if name == "salt" {\n                    Config::set_salt(&value);\n',
      '                } else if name == "salt" {\n'
      f"                    if {IPC_GUARD} {{\n"
+     '                        log::warn!("salt write refused during a remote session");\n'
      "                        return;\n"
      "                    }\n"
      "                    Config::set_salt(&value);\n",
@@ -687,79 +751,147 @@ PATCHES += [
      "no unlock PIN change during a remote session"),
     ("src/ipc.rs",
      "                Config::set_options(value);\n                allow_err!(stream.send(&Data::Options(None)).await);\n",
-     "                // boring-remote: security options stay put during a remote session (ticket 05).\n"
-     "                let value = crate::password_lock::guard_options(\n"
-     "                    value,\n"
-     "                    &Config::get_options(),\n"
-     "                    crate::password_lock::authed_sessions(),\n"
-     "                );\n"
-     "                Config::set_options(value);\n                allow_err!(stream.send(&Data::Options(None)).await);\n",
-     "security options kept during a remote session"),
+     OPTIONS_HOOK + "                allow_err!(stream.send(&Data::Options(None)).await);\n",
+     "security options kept during a remote session; trusted list removals end sessions"),
+    ("src/ipc.rs",
+     "        Data::SyncConfig(Some(configs)) => {\n            let (config, config2) = *configs;\n",
+     "        Data::SyncConfig(Some(configs)) => {\n" + SYNC_GUARD + "            let (config, config2) = *configs;\n",
+     "no whole-config sync during a remote session"),
     (HOME, 'translate("One-time Password"),',
      'translate(showOneTime ? "One-time Password" : "Password"),',
      "no one-time password label when it is off"),
     (HOME, "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
      "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n"
-     "import 'package:flutter_hbb/desktop/widgets/generated_password.dart';\n",
-     "generated password import (home)"),
+     "import 'package:flutter_hbb/desktop/widgets/generated_password.dart';\n"
+     "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n",
+     "generated password + trusted list imports (home)"),
+    (HOME, "    MinCharactersValidationRule(8),\n",
+     "    MinCharactersValidationRule(16), // boring-remote: typed passwords 16+ (ticket 05)\n",
+     "typed password needs 16+ characters"),
+    (HOME, "          onPressed: canSubmit ? submit : null,\n        );\n",
+     "          onPressed: canSubmit ? submit : null,\n          isOutline: true,\n        );\n",
+     "OK is the secondary action; Generate/Reset is the main one"),
     (HOME, "        return [\n          cancelButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n        ];\n",
      GENERATE_BUTTON
-     + "        return [\n          cancelButton,\n          generateButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n        ];\n",
-     "Generate button in Set Password"),
+     + "        return [\n          cancelButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n"
+       "          generateButton,\n        ];\n",
+     "Generate/Reset button in Set Password"),
+    (MOBILE_SERVER, "                translate('One-time Password'),\n",
+     "                translate(showOneTime ? 'One-time Password' : 'Password'),\n",
+     "mobile: no one-time password label when it is off"),
+    (MOBILE_SERVER, "            if (showPasswordOption)\n              PopupMenuItem(\n                value: kUse",
+     "            if (showPasswordOption && !isOptionFixed(kOptionVerificationMethod))\n"
+     "              PopupMenuItem(\n                value: kUse",
+     "mobile: no verification method menu when it is locked"),
 ]
 
 # --- Trusted Controllers (ticket 06) ----------------------------------------------
 # src/trust_policy.rs and trusted_controllers.dart are ours; these wire them in. The
-# approve-mode / allow-hide-cm locks are in LOCKED; the session guard on the trusted list is
-# password_lock::SECURITY_OPTIONS.
+# approve-mode / allow-hide-cm locks are in LOCKED. Known limit: the list is keyed on the ID the
+# Controller reports (lr.my_id), so it is not spoof resistant (src/trust_policy.rs).
 TRUST_GATE = (
     "                    // boring-remote: a Controller not on the trusted list also needs a click\n"
-    "                    // on this computer (ticket 06). Nobody answers: the login times out.\n"
+    "                    // on this computer (ticket 06). Every prompt counts against this IP's\n"
+    "                    // failure budget. Nobody answers: the login times out.\n"
     "                    if crate::trust_policy::on_login(\n"
     "                        self.inner.id(),\n"
     "                        &lr.my_id,\n"
     "                        crate::trust_policy::Password::Right,\n"
     "                    ) != crate::trust_policy::Decision::Allow\n"
     "                    {\n"
-    "                        self.try_start_cm(lr.my_id, lr.my_name, false);\n"
-    "                        self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)\n"
-    "                            .await;\n"
-    "                        return true;\n"
+    "                        self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+    + _click_wait(24) +
     "                    }\n")
 ACCEPT_GATE = (
-    "                            // boring-remote: Accept counts only for a login waiting on it:\n"
-    "                            // password checked, or none set on this computer (ticket 06).\n"
+    "                            // boring-remote: Accept counts only for a login waiting on it\n"
+    "                            // (ticket 06). Before login, anything else ends the connection, so\n"
+    "                            // the CM never shows a session that isn't there. An approval clears\n"
+    "                            // the IP's prompt count.\n"
     "                            if !crate::trust_policy::on_accept(conn.inner.id()) {\n"
-    "                                continue;\n"
-    "                            }\n")
-FORGET_ON_LOGIN = ("            crate::trust_policy::forget(self.inner.id()); "
-                   "// boring-remote: a new attempt voids any wait (ticket 06)\n")
+    "                                if conn.authorized {\n"
+    "                                    continue;\n"
+    "                                }\n"
+    "                                conn.send_close_reason_no_retry(\"\").await;\n"
+    "                                conn.on_close(\"connection manager\", true).await;\n"
+    "                                break;\n"
+    "                            }\n"
+    "                            clear_failures(&mut LOGIN_FAILURES[0].lock().unwrap(), &conn.failure_keys());\n")
+FORGET_ON_LOGIN = (
+    "            // boring-remote: a new login while this one waits on Accept could swap the login\n"
+    "            // the prompt approves, so it ends the connection (ticket 06).\n"
+    "            if crate::trust_policy::forget(self.inner.id()) {\n"
+    "                self.send_login_error(\"Connection not allowed\").await;\n"
+    "                return false;\n"
+    "            }\n")
+CLOSE_CONTROLLER = (
+    "/// boring-remote: end every authorised connection from this Controller ID (ticket 06).\n"
+    "pub fn close_controller(peer_id: &str) {\n"
+    "    for c in AUTHED_CONNS.lock().unwrap().iter() {\n"
+    "        if c.session_key.peer_id == peer_id {\n"
+    "            c.sender.send(ipc::Data::Close).ok();\n"
+    "        }\n"
+    "    }\n"
+    "}\n\n")
+CLOSE_ARM = (
+    "                        // boring-remote: its Controller was removed from the trusted list (ticket 06).\n"
+    "                        ipc::Data::Close => {\n"
+    "                            conn.send_close_reason_no_retry(\"\").await;\n"
+    "                            conn.on_close(\"trusted Controller removed\", true).await;\n"
+    "                            break;\n"
+    "                        }\n")
 TRUST_CARD = "                _Card(title: 'Trusted Controllers', children: [TrustedControllers()]),\n"
+# Upstream starts the CM (an Accept button) on these two paths too; Accept can't let them in,
+# so they show nothing and the Controller asks for the password.
+EMPTY_PASSWORD_CM = (
+    "            } else if lr.password.is_empty() {\n"
+    "                #[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+    "                if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {\n"
+    "                    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await\n"
+    "                    {\n"
+    "                        return keep_alive;\n"
+    "                    }\n"
+    "                }\n"
+    "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+    "            } else {\n")
+EMPTY_PASSWORD_NO_CM = (
+    "            } else if lr.password.is_empty() {\n"
+    "                // boring-remote: no Accept for a login without the password (ticket 06).\n"
+    "            } else {\n")
+WRONG_PASSWORD_CM = (
+    "                    self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)\n"
+    "                        .await;\n"
+    "                    self.try_start_cm(lr.my_id, lr.my_name, false);\n")
 _PW_OK = ("                    self.update_failure_with_scope(failure, true, 0, FailureScope::Default);\n"
           "                    if !self.send_logon_response_and_keep_alive().await {\n")
 _AUTHORIZE = ("                        ipc::Data::Authorize => {\n"
               "                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);\n")
 _LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n"
           "            if !self.check_login_scope(&lr).await {\n")
+_AUTHED_TAIL = "                        _ => {}\n                    }\n                }\n                _ = second_timer.tick() => {\n"
 PATCHES += [
     ("src/lib.rs", "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
      "mod password_lock; // boring-remote: permanent password only (ticket 05)\n"
-     "mod trust_policy; // boring-remote: trusted Controllers (ticket 06)\n",
-     "trust policy module"),
-    ("src/server/connection.rs", _PW_OK,
-     _PW_OK.replace("                    if !self.send_logon_response_and_keep_alive", TRUST_GATE
-                    + "                    if !self.send_logon_response_and_keep_alive", 1),
+     + NON_IOS + "mod trust_policy; // boring-remote: trusted Controllers (ticket 06)\n",
+     "trust policy module (no Target side on iOS)"),
+    ("src/server/connection.rs", _PW_OK, TRUST_GATE + _PW_OK,
      "unknown Controller waits for a click after the right password"),
     ("src/server/connection.rs", _AUTHORIZE,
      _AUTHORIZE.replace("                            conn.set_conn_audit", ACCEPT_GATE
                         + "                            conn.set_conn_audit", 1),
-     "Accept only for a password-checked Controller"),
+     "Accept only for a login waiting on it"),
     ("src/server/connection.rs", _LOGIN, _LOGIN.replace("            if !self.check_login_scope", FORGET_ON_LOGIN
                                                         + "            if !self.check_login_scope", 1),
-     "a new login attempt voids the wait"),
+     "a new login on a waiting connection ends it"),
     ("src/server/connection.rs", "        self.closed = true;\n",
      "        self.closed = true;\n        crate::trust_policy::forget(self.inner.id()); // boring-remote (ticket 06)\n",
      "a closed connection voids the wait"),
+    ("src/server/connection.rs", EMPTY_PASSWORD_CM, EMPTY_PASSWORD_NO_CM, "no Accept prompt without a password"),
+    ("src/server/connection.rs", WRONG_PASSWORD_CM, WRONG_PASSWORD_CM.replace(
+        "                    self.try_start_cm(lr.my_id, lr.my_name, false);\n", ""),
+     "no Accept prompt after a wrong password"),
+    ("src/server/connection.rs", "#[cfg(windows)]\npub struct PortableState {\n",
+     CLOSE_CONTROLLER + "#[cfg(windows)]\npub struct PortableState {\n", "close a removed Controller's sessions"),
+    ("src/server/connection.rs", _AUTHED_TAIL, CLOSE_ARM + _AUTHED_TAIL, "removed Controller's session closes"),
     (SETTINGS, "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n",
      "import 'package:flutter_hbb/desktop/widgets/license_key_field.dart';\n"
      "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n",
@@ -863,11 +995,12 @@ def plan(root):
             texts[rel] = _read(p)
         text, crlf = texts[rel]
         text2 = LANG_VALUE.sub(_lang_value, text)
-        if f'("{NOT_FOUND}", ' not in text2:
-            text2 = LANG_END.sub(f'),\n        ("{NOT_FOUND}", ""),\n\\1', text2, count=1)
+        missing = "".join(f'        ("{k}", ""),\n' for k in LANG_KEYS if f'("{k}", ' not in text2)
+        if missing:
+            text2 = LANG_END.sub(lambda m: "),\n" + missing + m.group(1), text2, count=1)
         if text2 != text:
             texts[rel] = (text2, crlf)
-            changed.append(f"{rel}: translations say {DISPLAY_NAME}, plain not-found error")
+            changed.append(f"{rel}: translations say {DISPLAY_NAME}, new keys (not-found error, tickets 05/06)")
     writes, deletes = {}, []
     for rel, (text, crlf) in texts.items():
         if text is not None:

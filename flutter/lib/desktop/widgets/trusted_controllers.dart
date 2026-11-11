@@ -2,12 +2,20 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 
-/// Ticket 06: must match `trust_policy::TRUSTED_OPTION` in Rust.
+/// Must match `trust_policy::TRUSTED_OPTION` and `REMOVE_OPTION` in Rust.
 const kBoringTrustedControllers = 'boring-trusted-controllers';
+const kBoringTrustedControllersRemove = 'boring-trusted-controllers-remove';
 
-/// Ticket 06: the Controllers this computer lets in with the password alone. Remove one and
-/// its next connection needs a click here again. The daemon ignores changes to this list
-/// while a remote session is open, so only someone at this computer can edit it.
+/// Asks the daemon to drop these IDs. It owns the list (the UI's copy can be a second old)
+/// and ends their open sessions.
+Future<void> removeTrustedControllers(String ids) =>
+    bind.mainSetOption(key: kBoringTrustedControllersRemove, value: ids);
+
+Future<void> clearTrustedControllers() => removeTrustedControllers(
+    bind.mainGetOptionSync(key: kBoringTrustedControllers));
+
+/// The Controllers this computer lets in with the password alone. Remove one and its next
+/// connection needs a click here again; an open session of it ends.
 class TrustedControllers extends StatefulWidget {
   const TrustedControllers({Key? key}) : super(key: key);
 
@@ -24,8 +32,9 @@ class _TrustedControllersState extends State<TrustedControllers> {
       .toList();
 
   Future<void> _remove(String id) async {
-    final rest = _ids().where((x) => x != id).join(',');
-    await bind.mainSetOption(key: kBoringTrustedControllers, value: rest);
+    await removeTrustedControllers(id);
+    // The UI's option cache refreshes about once a second.
+    await Future.delayed(const Duration(milliseconds: 1500));
     if (mounted) setState(() {});
   }
 
@@ -33,10 +42,10 @@ class _TrustedControllersState extends State<TrustedControllers> {
   Widget build(BuildContext context) {
     final ids = _ids();
     if (ids.isEmpty) {
-      return const Padding(
-        padding: EdgeInsets.all(8),
-        child: Text(
-            'None yet. A computer connecting for the first time needs a click here.'),
+      return Padding(
+        padding: const EdgeInsets.all(8),
+        child: Text(translate(
+            'None yet. A computer connecting for the first time needs a click here.')),
       );
     }
     return Column(
