@@ -1161,6 +1161,100 @@ class RebrandSeam(unittest.TestCase):
                   "                            &lr.username,\n")
         self.assert_check_fails(self.PROOF)
 
+    # --- ticket 08: tailnet first, the Hosted servers as fallback -----------------------
+    FIRST = "a saved Machine ID tries its tailnet address first (~3 s), then the Hosted servers (ticket 08)"
+    TAILNET_SIGNED = "a tailnet-first login signs only the address its own connection reached (ticket 08)"
+    LEARNED = "a saved Machine ID records a tailnet address only from its verified Target (ticket 08)"
+    DOWN = "Hosted servers unreachable: a plain error naming rs.theboringremote.com (ticket 08)"
+    PATH = "the session shows tailnet direct, direct or relayed (ticket 08)"
+
+    def test_tailnet_first_facts_pass_after_rebrand_and_fail_on_upstream(self):
+        r = run(CHECK, self.root)
+        for fact in (self.FIRST, self.TAILNET_SIGNED, self.LEARNED, self.DOWN, self.PATH):
+            self.assertIn(f"FAIL {fact}", r.stdout)
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.FIRST, self.TAILNET_SIGNED, self.LEARNED, self.DOWN, self.PATH, self.HOSTED_SIGNED):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_no_tailnet_attempt_before_the_hosted_servers_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        if let Some((stream, addr)) = boring_tailnet_first(peer, interface.is_force_relay()).await {",
+                  "        if let Some((stream, addr)) = None::<(Stream, String)> {")
+        self.assert_check_fails(self.FIRST)
+
+    def test_slow_tailnet_attempt_fails_check(self):
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "pub const TAILNET_TIMEOUT_MS: u64 = 3_000;",
+                  "pub const TAILNET_TIMEOUT_MS: u64 = 30_000;")
+        self.assert_check_fails(self.FIRST)
+
+    def test_saved_lan_address_dialed_fails_check(self):
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip));",
+                  "a.parse::<IpAddr>().ok());")
+        self.assert_check_fails(self.FIRST)
+
+    def test_typed_name_falling_back_to_the_hosted_servers_fails_check(self):
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "        return vec![Attempt::DirectIp(peer.id.to_owned())];\n",
+                  "        let _ = Attempt::DirectIp(peer.id.to_owned());\n")
+        self.assert_check_fails(self.FIRST)
+
+    def test_tailnet_address_kept_across_connections_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs",
+                  "        interface.get_lch().write().unwrap().boring_tailnet_target = None; // boring-remote (ticket 08)\n", "")
+        self.assert_check_fails(self.TAILNET_SIGNED)
+
+    def test_tailnet_address_read_elsewhere_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        crate::trust_policy::sign_login(",
+                  "        let _ = &self.boring_tailnet_target;\n        crate::trust_policy::sign_login(")
+        self.assert_check_fails(self.TAILNET_SIGNED)
+
+    def test_controller_signing_a_saved_lan_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", ".filter(|ip| is_tailnet(*ip)).map(|ip| ip.to_string()))",
+                  ".map(|ip| ip.to_string()))")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_unverified_session_recording_a_tailnet_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "    if verified != Some(id) || !crate::client::boring_is_machine_id(id) {",
+                  "    if !crate::client::boring_is_machine_id(id) {")
+        self.assert_check_fails(self.LEARNED)
+
+    def test_target_not_reporting_its_tailnet_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "        crate::connect_plan::add_own_tailnet(&mut platform_additions);\n", "")
+        self.assert_check_fails(self.LEARNED)
+
+    def test_rendezvous_error_passed_through_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n", "            err\n")
+        self.assert_check_fails(self.DOWN)
+
+    def test_hosted_down_error_not_naming_our_servers_fails_check(self):
+        self.rebrand()
+        self.edit("src/connect_plan.rs", " (rs.theboringremote.com)", "")
+        self.assert_check_fails(self.DOWN)
+
+    def test_hosted_down_key_missing_from_a_language_fails_check(self):
+        self.rebrand()
+        self.edit("src/lang/de.rs", f'        ("{rebrand.HOSTED_DOWN}", ""),\n', "")
+        self.assert_check_fails(self.DOWN)
+
+    def test_session_without_the_tailnet_label_fails_check(self):
+        self.rebrand()
+        self.edit("flutter/lib/common.dart", "  if (streamType == 'Tailnet') {\n", "  if (false) {\n")
+        self.assert_check_fails(self.PATH)
+
+    def test_insecure_prompt_skipped_for_every_stream_fails_check(self):
+        self.rebrand()
+        self.edit("src/client/io_loop.rs", "&& stream_type != crate::connect_plan::TAILNET_STREAM", "&& false")
+        self.assert_check_fails(self.PATH)
+
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",
                 "libs/hbb_common/src/config.rs"]

@@ -14,7 +14,8 @@
 //!
 //! "The Target it dialed" is one of two names, each one only this Target can answer to:
 //! - a tailnet address: the one the Controller connected to (dialed as an address, or the
-//!   address a tailnet name resolved to; `dialed_target`), which has to be the address the
+//!   address a tailnet name resolved to; `dialed_target`; or, ticket 08, the saved tailnet
+//!   address a Machine ID's tailnet-first attempt reached), which has to be the address the
 //!   connection arrived on here, from a tailnet address (`target_name`). WireGuard means only
 //!   this Target answers at its tailnet address.
 //! - its Machine ID (ticket 07): signed only on a session whose Target identity verified against
@@ -376,9 +377,13 @@ pub fn verified_target(peer: &str, key: &str, target_pk: Option<&[u8]>, secured:
 
 /// What this Controller signs as the Target: a tailnet address it connected to
 /// (`dialed_target`), or the Machine ID this session verified (`verified`, from
-/// `verified_target`) when that is the Target this login is for. None for anything else.
+/// `verified_target`) when that is the Target this login is for, or (ticket 08) the tailnet
+/// address this session reached Direct IP for a saved Machine ID (`verified`, which
+/// `Client::start` sets from that connection only). None for anything else.
 pub fn signed_target(peer: &str, verified: Option<&str>) -> Option<String> {
-    dialed_target(peer).or_else(|| verified.filter(|v| *v == peer).map(str::to_owned))
+    dialed_target(peer)
+        .or_else(|| verified.filter(|v| *v == peer).map(str::to_owned))
+        .or_else(|| verified.and_then(ip_in).filter(|ip| is_tailnet(*ip)).map(|ip| ip.to_string()))
 }
 
 /// Sign this login with the Controller's own key pair, for the Target's trusted list. Left
@@ -821,6 +826,20 @@ mod tests {
         assert_eq!(target_decides(&lr, CHALLENGE, &list), Decision::Allow);
         // A name this Controller never resolved (or typed differently) isn't signed.
         assert!(c.login(CHALLENGE, "never-dialed.tail1.ts.net:21118").boring_login_sig.is_empty());
+    }
+
+    #[test]
+    fn saved_machine_id_reached_on_its_tailnet_address_signs_that_address() {
+        // Ticket 08: Client::start hands the login the tailnet address this connection reached.
+        let c = controller(KNOWN);
+        let list = trusted(&[(KNOWN, &c.pk)]);
+        let lr = c.login_verified(CHALLENGE, MACHINE_ID, Some(TARGET));
+        assert_eq!(decides_on(&lr, CHALLENGE, &list, TARGET_IP, FROM), Decision::Allow);
+        // Relayed or punched (not arriving on the tailnet address), it binds nothing: a click.
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        assert_eq!(decides_on(&lr, CHALLENGE, &list, lan, "203.0.113.7"), Decision::Ask);
+        // A non-tailnet address is never signed.
+        assert!(c.login_verified(CHALLENGE, MACHINE_ID, Some("192.168.1.20")).boring_login_sig.is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@ no GitHub Actions workflow, no hwcodec/vram in any build invocation, Mac build w
 file copy-paste, the Windows MSI (name, exe, art sizes, license, icon, no RustDesk text), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
 translations, app metadata, every logo slot; one AGPL line on the About page), that
 the connect box sends a Machine ID through the Hosted servers and any other name Direct IP
-to a tailnet address, that the Target shows its Machine ID, and that the protocol files are
+to a tailnet address, that the Target shows its Machine ID, that a saved Machine ID tries its
+tailnet address first and then the Hosted servers (ticket 08), and that the protocol files are
 upstream's. It only reads the tree.
 Idempotence is proved by test_rebrand.py and build-mac's second-run step.
 
@@ -987,14 +988,17 @@ def hosted_signing_checks(c, client, trust, squash):
                     ".then(|| peer.to_owned())"):
         why.append(f"verified_target is {verified[:90]!r}")
     signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, verified: Option<&str>) -> Option<String> {"))
-    if signed != "dialed_target(peer).or_else(|| verified.filter(|v| *v == peer).map(str::to_owned))":
+    # Or (ticket 08) the tailnet address this connection reached Direct IP: tailnet_first_checks.
+    if signed != ("dialed_target(peer) .or_else(|| verified.filter(|v| *v == peer).map(str::to_owned)) "
+                  ".or_else(|| verified.and_then(ip_in).filter(|ip| is_tailnet(*ip)).map(|ip| ip.to_string()))"):
         why.append(f"signed_target is {signed[:90]!r}")
     code = strip_tests_and_comments(client)
     start = fn_body(code, "    pub async fn start(\n") or ""
     clear, run, record = start.find(VERIFIED_CLEARED), start.find("Self::_start("), start.find(VERIFIED_AT_START)
     if not (0 <= clear < run < record and start[run:record].count("Ok(x) => {") == 1):
         why.append("Client::start doesn't clear, then record, the verified Machine ID on each connection")
-    if code.count("boring_verified_target =") != 2 or code.count(".boring_verified_target") != 3:
+    # Ticket 08 adds one write (start: the tailnet address) and two reads (that, and handle_peer_info).
+    if code.count("boring_verified_target =") != 3 or code.count(".boring_verified_target") != 5:
         why.append("the verified Machine ID is written or read somewhere else")
     secure = fn_body(code, "    async fn secure_connection(\n") or ""
     vouched = re.search(r"let rs_pk = get_rs_pk\(if key\.is_empty\(\) \{\s*config::RS_PUB_KEY\s*\} else \{\s*key\s*\}\);", secure)
@@ -1010,6 +1014,113 @@ def hosted_signing_checks(c, client, trust, squash):
                    "under the servers' word (is_secured() would not mean verified)")
     c.fact("Controllers sign a Machine-ID login only on a session that verified the Target against the baked server key",
            not why, "; ".join(why))
+
+
+# Ticket 08, pinned here (not taken from rebrand.py).
+TAILNET_FIRST = (
+    "        if let Some((stream, addr)) = boring_tailnet_first(peer, interface.is_force_relay()).await {\n"
+    "            interface.get_lch().write().unwrap().boring_tailnet_target = Some(addr);\n"
+    "            return Ok(((stream, true, None, None, \"TCP\"), (0, \"\".to_owned()), false));\n"
+    "        }\n")
+TAILNET_DIAL = ("let options = PeerConfig::load(peer).options; "
+                "let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) }; "
+                "let reach = Reach { tailnet_up: crate::connect_plan::own_tailnet_addr().is_some(), relay_only }; "
+                "for attempt in plan(&record, reach) { let Attempt::Tailnet(addr) = attempt else { break }; "
+                "match connect_tcp_local(check_port(&addr, RELAY_PORT + 1), None, TAILNET_TIMEOUT_MS).await {")
+TAILNET_PLAN = ("if !crate::client::boring_is_machine_id(peer.id) { return vec![Attempt::DirectIp(peer.id.to_owned())]; } "
+                "let mut attempts = Vec::new(); "
+                "let saved = peer.tailnet.and_then(|a| a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip)); "
+                "if let Some(ip) = saved { if reach.tailnet_up && !reach.relay_only { "
+                "attempts.push(Attempt::Tailnet(ip.to_string())); } } "
+                "attempts.push(Attempt::Hosted(peer.id.to_owned())); attempts")
+TAILNET_CLEARED = "interface.get_lch().write().unwrap().boring_tailnet_target = None;"
+TAILNET_TAKEN = ("let tailnet = interface.get_lch().write().unwrap().boring_tailnet_target.take();\n"
+                 "                if tailnet.is_some() {\n"
+                 "                    interface.get_lch().write().unwrap().boring_verified_target = tailnet;\n")
+REMEMBERED = ("crate::connect_plan::remember_tailnet(\n            &mut config.options,\n            &self.id,\n"
+              "            self.boring_verified_target.as_deref(),\n            &pi.platform_additions,\n        );")
+TAILNET_REMEMBER_IF = "if verified != Some(id) || !crate::client::boring_is_machine_id(id) {"
+HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
+               " connection, or connect by Tailscale name or IP.")
+HOSTED_DOWN_MAP = ("let mut socket = socket.map_err(|err| {\n"
+                   '            log::warn!("Hosted servers unreachable: {err}");\n'
+                   "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n        })?;")
+PATH_LABEL = "let stream_type = crate::connect_plan::stream_label(stream_type, direct, peer.local_addr().ip());"
+INSECURE_SKIP = ("                    && !crate::common::is_direct_ip_access(&self.handler.get_id())\n"
+                 "                    && stream_type != crate::connect_plan::TAILNET_STREAM")
+
+
+def tailnet_first_checks(c):
+    """Ticket 08 (spec slice 3): a saved Machine ID tries its tailnet address first (~3 s), then the
+    Hosted servers; the login signs that address only on the connection that reached it; the
+    address is learned only from a verified Target; a plain error when the Hosted servers are down;
+    the session shows tailnet direct / direct / relayed."""
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    client, plan_rs = c.read("src/client.rs"), c.read("src/connect_plan.rs")
+    code = strip_tests_and_comments(client)
+    plan_code = strip_tests_and_comments(plan_rs)
+    body = fn_body(client, "    async fn _start(\n") or ""
+    guard = body.find(TAILNET_GUARD)
+    first, rendezvous = body.find(TAILNET_FIRST), body.find("let other_server = interface.get_lch()")
+    why = []
+    if "mod connect_plan;" not in c.read("src/lib.rs"):
+        why.append("no connect_plan module")
+    if not (0 <= guard < first < rendezvous):
+        why.append("_start doesn't try the tailnet address after the typed-name branch and before the Hosted servers")
+    elif strip_tests_and_comments(body[guard:rendezvous]).count("return Ok((") != 2:
+        why.append("something else returns between the tailnet attempt and the Hosted servers")
+    dial = squash(fn_body(code, "async fn boring_tailnet_first(peer: &str, relay_only: bool) -> Option<(Stream, String)> {"))
+    if TAILNET_DIAL not in dial or "Ok(stream) => return Some((stream, addr))," not in dial:
+        why.append(f"boring_tailnet_first isn't Direct IP to the plan's tailnet address only: {dial[:80]!r}")
+    if squash(fn_body(plan_code, "pub fn plan(peer: &PeerRecord, reach: Reach) -> Vec<Attempt> {")) != TAILNET_PLAN:
+        why.append("plan isn't: typed names Direct IP only; a Machine ID's saved tailnet address, then the Hosted servers")
+    if "pub const TAILNET_TIMEOUT_MS: u64 = 3_000;" not in plan_code:
+        why.append("the tailnet attempt isn't ~3 s")
+    c.fact("a saved Machine ID tries its tailnet address first (~3 s), then the Hosted servers (ticket 08)",
+           not why, "; ".join(why))
+
+    why = []
+    start = fn_body(code, "    pub async fn start(\n") or ""
+    clear, run, record = start.find(TAILNET_CLEARED), start.find("Self::_start("), start.find(VERIFIED_AT_START)
+    taken = start.find(TAILNET_TAKEN)
+    if not (0 <= clear < run < record < taken):
+        why.append("Client::start doesn't clear the tailnet address, then move it into the login after 07's record")
+    if code.count("boring_tailnet_target =") != 2 or code.count(".boring_tailnet_target") != 3:
+        why.append("the tailnet address is written or read somewhere else")
+    c.fact("a tailnet-first login signs only the address its own connection reached (ticket 08)",
+           not why, "; ".join(why))
+
+    remember = squash(fn_body(plan_code, "pub fn remember_tailnet("))
+    peer_info = fn_body(code, "    pub fn handle_peer_info(&mut self, pi: &PeerInfo) {") or ""
+    conn = c.read("src/server/connection.rs")
+    reported = conn.find("crate::connect_plan::add_own_tailnet(&mut platform_additions);")
+    c.fact("a saved Machine ID records a tailnet address only from its verified Target (ticket 08)",
+           0 <= peer_info.find(REMEMBERED) < peer_info.find("self.save_config(config);")
+           and f"{squash(TAILNET_REMEMBER_IF)} return; }}" in remember
+           and plan_code.count("TAILNET_OPTION.to_owned()") == 1 and code.count("TAILNET_OPTION") == 2
+           and 0 <= reported < conn.find("pi.platform_additions = serde_json::to_string(&platform_additions)"),
+           remember[:80])
+
+    inner = fn_body(code, "    async fn _start_inner(\n") or ""
+    langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
+    missing = [p.name for p in langs for k in (HOSTED_DOWN, rebrand.TAILNET_LABEL)
+               if p.read_text(encoding="utf-8").count(f'("{k}", ') != 1]
+    c.fact(f"Hosted servers unreachable: a plain error naming {HOSTED} (ticket 08)",
+           HOSTED_DOWN_MAP in inner and "socket?;" not in inner and HOSTED in HOSTED_DOWN
+           and f'pub const HOSTED_DOWN: &str = "{HOSTED_DOWN}";' in plan_code and rebrand.HOSTED_DOWN == HOSTED_DOWN
+           and bool(langs) and not missing, ", ".join(missing[:5]))
+
+    io_loop = c.read("src/client/io_loop.rs")
+    label = squash(fn_body(plan_code, "pub fn stream_label(stream_type: &'static str, direct: bool, local: IpAddr) -> &'static str {"))
+    dart = fn_body(c.read(rebrand.DART_COMMON), "String getConnectionText(bool secure, bool direct, String streamType) {") or ""
+    c.fact("the session shows tailnet direct, direct or relayed (ticket 08)",
+           0 <= io_loop.find(PATH_LABEL) < io_loop.find(".set_connection_type(is_secured, direct, stream_type);")
+           and label == "if direct && is_tailnet(local) { TAILNET_STREAM } else { stream_type }"
+           and 'pub const TAILNET_STREAM: &str = "Tailnet";' in plan_code
+           and INSECURE_SKIP in io_loop and io_loop.count("connect_plan::TAILNET_STREAM") == 1
+           and dart.lstrip("\n ").split("\n")[1:3] == ["  if (streamType == 'Tailnet') {",
+                                                     f"    return translate('{rebrand.TAILNET_LABEL}');"],
+           label[:60])
 
 
 def trust_checks(c, locked):
@@ -1330,6 +1441,7 @@ def run_checks(root):
     msi_checks(c)
     branding_checks(c)
     connect_checks(c)
+    tailnet_first_checks(c)
 
     # protocol: every .proto in the tree is upstream's, byte for byte, except our two LoginRequest fields
     c.fact("protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)",
