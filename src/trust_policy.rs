@@ -12,22 +12,33 @@
 //! only when the ID is on the list with that key and the signature checks out. A stolen
 //! password plus a known Controller ID is not enough.
 //!
-//! "The Target it dialed" (`dialed_target` on the Controller, `target_names` here) is the
-//! Target's Machine ID, or for Direct IP the IP address the Controller connected to (a tailnet
-//! name counts as the address it resolved to), which has to be the address the connection
-//! arrived on here. So a Target that a Controller logs in to can't pass that signature on to
-//! another Target.
+//! "The Target it dialed" is a tailnet address: the one the Controller connected to (dialed as
+//! an address, or the address a tailnet name resolved to; `dialed_target`), which has to be the
+//! address the connection arrived on here, from a tailnet address (`target_name`). WireGuard
+//! means only this Target answers at its tailnet address, so a Target the Controller logs in to
+//! can't pass the signature on to another one.
 //!
 //! A Controller without a signature (1.7 and older, stock RustDesk) gets a click every time and
 //! is never remembered. The list used to hold IDs only; `load` drops those entries once, so each
-//! of those Controllers needs one more click.
+//! of those Controllers needs one more click. A prompt for an ID already on the list that shows
+//! another key lets that session in on the click but doesn't replace the stored key: Remove the
+//! old entry first (a reinstalled Controller has a new key).
 //!
-//! Known limits: a Controller's identity is its key file (the key pair in its config). Whoever
-//! copies that file and has the password gets in with no click, as that Controller; Remove ends
-//! it. Reinstalling or wiping a Controller's config makes a new key, so it needs approving
-//! again. Two networks can reuse one private address: a Controller tricked into dialing an
-//! attacker at the same address its trusted Target receives on, at the moment the attacker
-//! logs in to that Target, would have its signature relayed.
+//! Known limits:
+//! - A Controller's identity is its key file (the key pair in its config). Whoever copies that
+//!   file and has the password gets in with no click, as that Controller; Remove ends it.
+//!   Reinstalling or wiping a Controller's config makes a new key, so it needs approving again.
+//! - Never trusted, so a click every time: Direct IP to a LAN or other non-tailnet address
+//!   (someone else can answer at it on another network), Direct IP through NAT or a port
+//!   forward, relayed or hole-punched logins and Machine-ID logins (no address to bind; the ID
+//!   path is signed only once the session verifies the Target's identity, tickets 07/08),
+//!   Controllers on another server (`id@server` isn't a storable ID), a tailnet name typed
+//!   differently from the one that resolved (`note_dialed` is keyed by the exact text), and a
+//!   Controller UI that has no key pair yet (it never makes one; the service does).
+//! - Tailscale addresses are unique only per tailnet: a Controller logged in to the attacker's
+//!   tailnet, dialing the address its trusted Target has on its own tailnet, could be relayed.
+//! - The port isn't bound: another listener on the Target's own tailnet address could relay a
+//!   Controller that dials that port. The challenge is ~30 bits, fresh per connection.
 //!
 //! No Permanent password set on the Target (a 1.7 Target before setup): no unattended access,
 //! but someone at the Target can still click Accept, so tailnet access keeps working while
@@ -207,24 +218,29 @@ fn ip_in(peer: &str) -> Option<IpAddr> {
         .map(canonical)
 }
 
-/// What a Controller may have signed as this Target: its Machine ID, and the IP the connection
-/// arrived on (Direct IP).
-pub fn target_names(my_id: &str, arrived_on: IpAddr) -> Vec<String> {
-    let mut names = vec![my_id.to_owned()];
-    let ip = canonical(arrived_on);
-    if !ip.is_unspecified() && !ip.is_loopback() {
-        names.push(ip.to_string());
+/// Tailscale's ranges: the connect box's own test (`boring_is_tailnet` in `client.rs`).
+fn is_tailnet(ip: IpAddr) -> bool {
+    crate::client::boring_is_tailnet(SocketAddr::new(ip, 0))
+}
+
+/// What a Controller may have signed as this Target: the tailnet address the connection arrived
+/// on (`arrived_on`), only when it came from a tailnet address (`from`): Direct IP across the
+/// tailnet. A relayed or hole-punched connection arrives on the Target's LAN side toward the
+/// relay, and a WebSocket one reports the relay's address as its local one
+/// (`WsFramedStream::local_addr` returns the remote side), so none of them has a name to sign.
+pub fn target_name(arrived_on: IpAddr, from: &str) -> Option<String> {
+    let from = ip_in(from)?;
+    if !(is_tailnet(arrived_on) && is_tailnet(from)) {
+        return None;
     }
-    names.retain(|n| !n.is_empty());
-    names
+    Some(canonical(arrived_on).to_string())
 }
 
 /// The Controller's key, proven for this login on this Target. None means the login can't
 /// skip the click and won't be remembered.
-pub fn login_key(lr: &LoginRequest, challenge: &str, my_id: &str, arrived_on: IpAddr) -> Option<Key> {
-    target_names(my_id, arrived_on).iter().find_map(|target| {
-        proven_key(&lr.my_id, &lr.boring_controller_pk, &lr.boring_login_sig, challenge, target)
-    })
+pub fn login_key(lr: &LoginRequest, challenge: &str, arrived_on: IpAddr, from: &str) -> Option<Key> {
+    let target = target_name(arrived_on, from)?;
+    proven_key(&lr.my_id, &lr.boring_controller_pk, &lr.boring_login_sig, challenge, &target)
 }
 
 pub fn decide(
@@ -244,8 +260,9 @@ pub fn decide(
 }
 
 /// Someone at the Target accepted a Controller: the list to save. Remembered only with a
-/// proven key, when its password checked out and `remember` (no other session is open, see
-/// `on_accept`).
+/// proven key, when its password checked out, `remember` (no other session is open, see
+/// `on_accept`) and the ID isn't on the list already: a trusted ID showing another key could be
+/// someone claiming it, so the stored key stays until Remove.
 pub fn accepted(
     trusted: &Trusted,
     controller: &str,
@@ -255,7 +272,7 @@ pub fn accepted(
 ) -> Trusted {
     let mut next = trusted.clone();
     if let Some(key) = key {
-        if password == Password::Right && remember {
+        if password == Password::Right && remember && !trusted.has_id(controller) {
             next.add(controller, key);
         }
     }
@@ -298,28 +315,37 @@ pub fn note_dialed(peer: &str, ip: IpAddr) {
     dialed.push((peer.to_owned(), canonical(ip)));
 }
 
-/// What this Controller signs as the Target: for Direct IP the IP it connected to (dialed as an
-/// address, or a tailnet name `note_dialed` resolved), else the Machine ID it dialed.
-pub fn dialed_target(peer: &str) -> String {
-    if let Some(ip) = ip_in(peer) {
-        return ip.to_string();
-    }
-    let dialed = DIALED.lock().unwrap();
-    match dialed.iter().find(|(p, _)| p == peer) {
-        Some((_, ip)) => ip.to_string(),
-        None => peer.to_owned(),
-    }
+/// What this Controller signs as the Target: the tailnet address it connected to (dialed as an
+/// address, or a tailnet name `note_dialed` resolved). None for anything else, so the login goes
+/// unsigned and clicks: someone else can answer at a LAN or NAT address on another network, and
+/// a Machine ID isn't signed until the session verifies the Target's identity (tickets 07/08).
+pub fn dialed_target(peer: &str) -> Option<String> {
+    let ip = match ip_in(peer) {
+        Some(ip) => ip,
+        None => DIALED.lock().unwrap().iter().find(|(p, _)| p == peer)?.1,
+    };
+    is_tailnet(ip).then(|| ip.to_string())
 }
 
 /// Sign this login with the Controller's own key pair, for the Target's trusted list. Left
-/// unsigned without a key pair or for a challenge no Target makes (the Target then asks); the
-/// key pair isn't touched then (a login built before any `Hash`, or in a test).
+/// unsigned (the Target then asks) for a Target it can't bind, a challenge no Target makes, or
+/// no key pair. On desktop it takes the key pair the service made and never makes one: a key
+/// made by this UI process could differ from the service's or race it. Mobile runs both sides
+/// in one process.
 pub fn sign_login(lr: &mut LoginRequest, challenge: &str) {
-    let target = dialed_target(&lr.username);
+    let Some(target) = dialed_target(&lr.username) else {
+        return;
+    };
     if login_message(challenge, &target, &lr.my_id).is_none() {
         return;
     }
-    let (sk, pk) = Config::get_key_pair();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let pair = Some(Config::get_key_pair());
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let pair = Config::get_existing_key_pair();
+    let Some((sk, pk)) = pair else {
+        return;
+    };
     if let Some(sig) = signature(challenge, &target, &lr.my_id, &sk) {
         lr.boring_controller_pk = pk.into();
         lr.boring_login_sig = sig.into();
@@ -351,7 +377,11 @@ fn load() -> Trusted {
     let stored = Config::get_option(TRUSTED_OPTION);
     let trusted = Trusted::parse(&stored);
     if trusted.to_option() != stored {
-        log::info!("trusted Controllers: entries without a key dropped, they need approving again");
+        hbb_common::throttled_log!(
+            std::time::Duration::from_secs(60),
+            warn,
+            "trusted Controllers: entries without a key dropped, they need approving again"
+        );
         save(&trusted);
     }
     trusted
@@ -394,6 +424,14 @@ pub fn on_accept(conn_id: i32) -> bool {
     let trusted = load();
     let remember = crate::password_lock::authed_sessions() == 0;
     let next = accepted(&trusted, &w.controller, w.key.as_ref(), w.password, remember);
+    if matches!(w.key, Some(k) if trusted.has_id(&w.controller) && !trusted.contains(&w.controller, &k)) {
+        hbb_common::throttled_log!(
+            std::time::Duration::from_secs(60),
+            warn,
+            "Controller {}: not its trusted key; let in on the click, not remembered (Remove it to approve a new key)",
+            w.controller
+        );
+    }
     if next != trusted {
         save(&next);
         log::info!("Controller {} approved and trusted", w.controller);
@@ -427,13 +465,15 @@ pub fn close_removed(removed: &[String]) {
 mod tests {
     use super::*;
     use hbb_common::{protobuf::Message as _, rendezvous_proto::IdPk};
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
 
     const NEW: &str = "123456789";
     const KNOWN: &str = "987654321";
-    const TARGET: &str = "555666777";
     const CHALLENGE: &str = "k3m9xz";
-    const TAILNET_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 101, 102, 103));
+    /// The Target's tailnet address, and the Controller's, on a Direct IP login.
+    const TARGET: &str = "100.101.102.103";
+    const TARGET_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 101, 102, 103));
+    const FROM: &str = "100.70.0.9";
 
     struct Controller {
         id: &'static str,
@@ -447,16 +487,19 @@ mod tests {
     }
 
     impl Controller {
-        /// The LoginRequest this Controller sends after dialing `dialed`.
+        /// The LoginRequest this Controller sends after dialing `dialed` (unsigned where
+        /// `dialed_target` has nothing to bind, as `sign_login` does).
         fn login(&self, challenge: &str, dialed: &str) -> LoginRequest {
             let mut lr = LoginRequest {
                 my_id: self.id.to_owned(),
                 username: dialed.to_owned(),
                 ..Default::default()
             };
-            let sig = signature(challenge, &dialed_target(dialed), self.id, &self.sk.0).unwrap();
-            lr.boring_controller_pk = self.pk.to_vec().into();
-            lr.boring_login_sig = sig.into();
+            if let Some(target) = dialed_target(dialed) {
+                let sig = signature(challenge, &target, self.id, &self.sk.0).unwrap();
+                lr.boring_controller_pk = self.pk.to_vec().into();
+                lr.boring_login_sig = sig.into();
+            }
             lr
         }
     }
@@ -469,10 +512,16 @@ mod tests {
         t
     }
 
-    /// What the Target decides for this login, before anyone clicks.
-    fn target_decides(lr: &LoginRequest, challenge: &str, list: &Trusted) -> Decision {
-        let key = login_key(lr, challenge, TARGET, TAILNET_IP);
+    /// What the Target decides for this login arriving on `arrived_on` from `from`, before
+    /// anyone clicks.
+    fn decides_on(lr: &LoginRequest, challenge: &str, list: &Trusted, arrived_on: IpAddr, from: &str) -> Decision {
+        let key = login_key(lr, challenge, arrived_on, from);
         decide(&lr.my_id, key.as_ref(), Password::Right, list, AtTarget::NotAsked)
+    }
+
+    /// The same, for Direct IP across the tailnet.
+    fn target_decides(lr: &LoginRequest, challenge: &str, list: &Trusted) -> Decision {
+        decides_on(lr, challenge, list, TARGET_IP, FROM)
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -532,8 +581,9 @@ mod tests {
         // Another Target the Controller logged in to passes its signature on to this one.
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        for elsewhere in ["111222333", "100.101.102.104", "fd7a:115c:a1e0::9"] {
+        for elsewhere in ["100.101.102.104", "fd7a:115c:a1e0::9"] {
             let lr = c.login(CHALLENGE, elsewhere);
+            assert!(!lr.boring_login_sig.is_empty(), "{elsewhere}: a tailnet address is signed");
             assert_eq!(target_decides(&lr, CHALLENGE, &list), Decision::Ask, "{elsewhere}");
         }
     }
@@ -548,16 +598,46 @@ mod tests {
     }
 
     #[test]
+    fn relay_punched_or_lan_arrival_asks() {
+        // review M1: an attacker answering at 192.168.1.5 on the Controller's network, logging in
+        // to the Target by relay or punch, so the Target's arrival address is its own 192.168.1.5.
+        let c = controller(KNOWN);
+        let list = trusted(&[(KNOWN, &c.pk)]);
+        let lan: IpAddr = "192.168.1.5".parse().unwrap();
+        // The Controller doesn't sign a LAN address at all...
+        assert!(c.login(CHALLENGE, "192.168.1.5").boring_login_sig.is_empty());
+        // ...and even a signature over one is never a name of this Target.
+        let mut lr = c.login(CHALLENGE, TARGET);
+        lr.boring_login_sig = signature(CHALLENGE, "192.168.1.5", KNOWN, &c.sk.0).unwrap().into();
+        assert_eq!(decides_on(&lr, CHALLENGE, &list, lan, "203.0.113.7"), Decision::Ask);
+        assert_eq!(decides_on(&lr, CHALLENGE, &list, lan, FROM), Decision::Ask);
+        // A tailnet arrival from a non-tailnet peer (relay, public rendezvous address) has no name.
+        let ok = c.login(CHALLENGE, TARGET);
+        assert_eq!(decides_on(&ok, CHALLENGE, &list, TARGET_IP, "203.0.113.7"), Decision::Ask);
+        assert_eq!(decides_on(&ok, CHALLENGE, &list, TARGET_IP, "not an address"), Decision::Ask);
+        // WebSocket's local_addr is the relay's address: a public one, never a tailnet one.
+        assert_eq!(decides_on(&ok, CHALLENGE, &list, "203.0.113.1".parse().unwrap(), FROM), Decision::Ask);
+    }
+
+    #[test]
+    fn machine_id_logins_are_not_signed() {
+        // No session in this build verifies a Target's Machine ID (tickets 07/08).
+        let c = controller(KNOWN);
+        assert!(c.login(CHALLENGE, "555666777").boring_login_sig.is_empty());
+        assert_eq!(dialed_target("555666777"), None);
+    }
+
+    #[test]
     fn direct_ip_login_is_bound_to_the_address_it_arrived_on() {
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        for dialed in ["100.101.102.103", "100.101.102.103:21118"] {
+        for dialed in [TARGET, "100.101.102.103:21118"] {
             let lr = c.login(CHALLENGE, dialed);
             assert_eq!(target_decides(&lr, CHALLENGE, &list), Decision::Allow, "{dialed}");
         }
-        // The dual-stack listener sees an IPv4 peer as ::ffff:100.x.
+        // The dual-stack listener sees IPv4 as ::ffff:100.x, on both ends.
         let mapped = IpAddr::V6(Ipv4Addr::new(100, 101, 102, 103).to_ipv6_mapped());
-        let key = login_key(&c.login(CHALLENGE, "100.101.102.103"), CHALLENGE, TARGET, mapped);
+        let key = login_key(&c.login(CHALLENGE, TARGET), CHALLENGE, mapped, "::ffff:100.70.0.9");
         assert_eq!(key, Some(c.pk));
     }
 
@@ -565,20 +645,11 @@ mod tests {
     fn tailnet_name_signs_the_address_it_resolved_to() {
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        note_dialed("studio-test.tail1.ts.net:21118", TAILNET_IP);
+        note_dialed("studio-test.tail1.ts.net:21118", TARGET_IP);
         let lr = c.login(CHALLENGE, "studio-test.tail1.ts.net:21118");
         assert_eq!(target_decides(&lr, CHALLENGE, &list), Decision::Allow);
-        // A name this Controller never resolved signs the name, which no Target answers to.
-        let lr = c.login(CHALLENGE, "never-dialed.tail1.ts.net:21118");
-        assert_eq!(target_decides(&lr, CHALLENGE, &list), Decision::Ask);
-    }
-
-    #[test]
-    fn an_unspecified_or_loopback_arrival_address_is_never_a_target_name() {
-        let any = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
-        assert_eq!(target_names(TARGET, any), [TARGET.to_owned()]);
-        assert_eq!(target_names(TARGET, IpAddr::V4(Ipv4Addr::LOCALHOST)), [TARGET.to_owned()]);
-        assert_eq!(target_names("", TAILNET_IP), ["100.101.102.103".to_owned()]);
+        // A name this Controller never resolved (or typed differently) isn't signed.
+        assert!(c.login(CHALLENGE, "never-dialed.tail1.ts.net:21118").boring_login_sig.is_empty());
     }
 
     #[test]
@@ -592,14 +663,17 @@ mod tests {
     }
 
     #[test]
-    fn a_login_built_before_the_challenge_is_left_unsigned() {
-        let mut lr = LoginRequest {
-            my_id: KNOWN.to_owned(),
-            username: TARGET.to_owned(),
-            ..Default::default()
-        };
-        sign_login(&mut lr, "");
-        assert!(lr.boring_login_sig.is_empty() && lr.boring_controller_pk.is_empty());
+    fn a_login_it_cant_bind_or_built_before_the_challenge_is_left_unsigned() {
+        // Returns before the key pair is read.
+        for (challenge, dialed) in [("", TARGET), (CHALLENGE, "192.168.1.5"), (CHALLENGE, "555666777")] {
+            let mut lr = LoginRequest {
+                my_id: KNOWN.to_owned(),
+                username: dialed.to_owned(),
+                ..Default::default()
+            };
+            sign_login(&mut lr, challenge);
+            assert!(lr.boring_login_sig.is_empty() && lr.boring_controller_pk.is_empty(), "{dialed}");
+        }
     }
 
     #[test]
@@ -649,13 +723,19 @@ mod tests {
     }
 
     #[test]
-    fn approving_again_with_a_new_key_replaces_the_old_one() {
-        let old = controller(KNOWN);
-        let reinstalled = controller(KNOWN);
-        let next = accepted(&trusted(&[(KNOWN, &old.pk)]), KNOWN, Some(&reinstalled.pk), Password::Right, true);
-        assert!(next.contains(KNOWN, &reinstalled.pk));
-        assert!(!next.contains(KNOWN, &old.pk));
-        assert_eq!(next.ids(), [KNOWN]);
+    fn approving_a_trusted_id_with_another_key_keeps_the_stored_one() {
+        // review S1: the prompt shows a familiar ID; the click lets this session in, nothing more.
+        let real = controller(KNOWN);
+        let claimant = controller(KNOWN);
+        let list = trusted(&[(KNOWN, &real.pk)]);
+        assert_eq!(decide(KNOWN, Some(&claimant.pk), Password::Right, &list, AtTarget::Approved), Decision::Allow);
+        let next = accepted(&list, KNOWN, Some(&claimant.pk), Password::Right, true);
+        assert_eq!(next, list);
+        // A reinstalled Controller is approved once Remove has dropped its old entry.
+        let mut removed = list.clone();
+        removed.remove(KNOWN);
+        let next = accepted(&removed, KNOWN, Some(&claimant.pk), Password::Right, true);
+        assert!(next.contains(KNOWN, &claimant.pk) && !next.contains(KNOWN, &real.pk));
     }
 
     #[test]

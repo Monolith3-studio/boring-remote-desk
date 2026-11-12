@@ -423,7 +423,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_password_approval_remembered_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "if password == Password::Right && remember {", "if remember {")
+        self.edit("src/trust_policy.rs", "if password == Password::Right && remember && !trusted.has_id(controller) {",
+                  "if remember && !trusted.has_id(controller) {")
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_no_password_trusted_controller_skipping_the_click_fails_check(self):
@@ -781,13 +782,67 @@ class RebrandSeam(unittest.TestCase):
 
     def test_signature_naming_the_claimed_target_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "target_names(my_id, arrived_on).iter()", "[lr.username.clone()].iter()")
+        self.edit("src/trust_policy.rs", "    let target = target_name(arrived_on, from)?;\n",
+                  "    let target = lr.username.clone();\n")
         self.assert_check_fails(self.PROOF)
 
-    def test_target_matching_an_unspecified_address_fails_check(self):
+    def test_target_named_by_a_relay_or_lan_arrival_address_fails_check(self):
+        # review M1: a relayed or punched login arrives on the Target's LAN or relay-side address.
         self.rebrand()
-        self.edit("src/trust_policy.rs", "if !ip.is_unspecified() && !ip.is_loopback() {", "if true {")
+        self.edit("src/trust_policy.rs", "    if !(is_tailnet(arrived_on) && is_tailnet(from)) {\n",
+                  "    if !is_tailnet(arrived_on) {\n")
         self.assert_check_fails(self.PROOF)
+
+    def test_gate_key_not_proven_against_this_connection_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "self.stream.local_addr().ip(), &self.ip)",
+                  'self.stream.local_addr().ip(), "100.64.0.1")')
+        self.assert_check_fails(self.PROOF)
+
+    def test_controller_signing_a_lan_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    is_tailnet(ip).then(|| ip.to_string())\n", "    Some(ip.to_string())\n")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_controller_signing_a_machine_id_fails_check(self):
+        # No signed ID logins until the session's Target identity is verified (Hosted, 07/08).
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "        None => DIALED.lock().unwrap().iter().find(|(p, _)| p == peer)?.1,\n",
+                  "        None => return Some(peer.to_owned()),\n")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_controller_ui_making_its_own_key_pair_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    let pair = Config::get_existing_key_pair();\n",
+                  "    let pair = Some(Config::get_key_pair());\n")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_sign_login_signing_another_id_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "signature(challenge, &target, &lr.my_id, &sk)",
+                  "signature(challenge, &target, &lr.username, &sk)")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_approval_replacing_a_trusted_key_fails_check(self):
+        # review S1: a prompt for an already trusted ID with another key must not swap the key.
+        self.rebrand()
+        self.edit("src/trust_policy.rs", " && remember && !trusted.has_id(controller) {", " && remember {")
+        self.assert_check_fails(self.TRUST_LIST)
+
+    def test_renumbered_login_fields_fail_the_pin(self):
+        # review S3: the pin is check.py's own, so moving our fields in rebrand.py alone fails.
+        self.rebrand()
+        moved = rebrand.PROTO_FIELDS.replace("= 1001;", "= 18;")
+        self.edit("libs/base/protos/message.proto", rebrand.PROTO_FIELDS, moved)
+        saved = rebrand.PROTO_PATCH
+        rel, old, new, why = saved
+        rebrand.PROTO_PATCH = (rel, old, new.replace(rebrand.PROTO_FIELDS, moved), why)
+        try:
+            ok, msg = check.protocol_matches(self.root)
+        finally:
+            rebrand.PROTO_PATCH = saved
+        self.assertFalse(ok)
+        self.assertIn("pinned", msg)
 
     def test_keyless_entry_kept_by_parse_fails_check(self):
         self.rebrand()

@@ -189,6 +189,10 @@ def license_after_preprocess(root, app_name):
 
 
 PROTOCOL_HASHES = pathlib.Path(__file__).resolve().parent / "protocol.sha256"
+# Our two LoginRequest fields (ticket 06), pinned here rather than taken from rebrand.py, so
+# renumbering or retyping them there (onto a number upstream may use) fails until this changes
+# too, on purpose: it is a protocol change for trusted Controllers (boring/REBASE.md).
+OUR_PROTO_FIELDS = ("  bytes boring_controller_pk = 1000;\n", "  bytes boring_login_sig = 1001;\n")
 
 
 def protocol_matches(root):
@@ -201,6 +205,10 @@ def protocol_matches(root):
     want = dict(reversed(l.split(maxsplit=1)) for l in PROTOCOL_HASHES.read_text().splitlines() if l.strip())
     rel_ours, old, new, _ = rebrand.PROTO_PATCH
     have, why = {}, []
+    fields = tuple(l for l in new.splitlines(keepends=True)
+                   if l.strip() and not l.lstrip().startswith(("//", "}")) and l not in old)
+    if fields != OUR_PROTO_FIELDS or old != "  string avatar = 17;\n}\n":
+        why.append(f"our LoginRequest fields aren't the pinned ones: {fields}")
     for p in root.rglob("*.proto"):
         rel = p.relative_to(root).as_posix()
         if not p.is_file() or rel.startswith(("target/", ".git/")):
@@ -675,6 +683,10 @@ CLICK_WAIT = (r"#\[cfg\(not\(any\(target_os = \"android\", target_os = \"ios\"\)
               r"self\.send_login_error\(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS\)\.await;\s*\}\s*return true;")
 BUMP = r"self\.update_failure_with_scope\(failure, false, 0, FailureScope::Default\);"
 # The one way decide() lets a login in unasked: right password, and the ID listed with the key it proved.
+# The trust gate's key, written out here (not taken from rebrand.py): proven against this connection.
+GATE_KEY = "crate::trust_policy::login_key(&lr, &self.hash.challenge, self.stream.local_addr().ip(), &self.ip)"
+# accepted() remembers only a new ID: a trusted one showing another key keeps the stored key.
+REMEMBER_IF = "if password == Password::Right && remember && !trusted.has_id(controller) {"
 TRUSTED_IF = "if password == Password::Right && key.map_or(false, |k| trusted.contains(controller, k)) {"
 
 
@@ -738,7 +750,7 @@ def password_lock_checks(c, locked):
                          r"crate::trust_policy::Password::NotSet,\s*None,\s*\);", unset.group(1)) is not None
            and refuse is not None and refuse.strip() == "verification_method != PERMANENT_ONLY"
            and TRUSTED_IF in trust
-           and "if password == Password::Right && remember {" in trust,
+           and REMEMBER_IF in trust,
            f"gate at {gate}, click branch at {click}, no-password click path {unset is not None}, "
            f"refuse_login {refuse!r}")
 
@@ -850,7 +862,8 @@ def proof_checks(c, conn, trust, wait):
     entry = squash(fn_body(trust, "fn entry(s: &str) -> Option<(&str, Key)> {"))
     parse = squash(fn_body(trust, "pub fn parse(option: &str) -> Self {"))
     proven = squash(fn_body(trust, "pub fn proven_key("))
-    names = squash(fn_body(trust, "pub fn target_names(my_id: &str, arrived_on: IpAddr) -> Vec<String> {"))
+    names = squash(fn_body(trust, "pub fn target_name(arrived_on: IpAddr, from: &str) -> Option<String> {"))
+    tailnet = squash(fn_body(trust, "fn is_tailnet(ip: IpAddr) -> bool {"))
     login_key = squash(fn_body(trust, "pub fn login_key("))
     why = []
     if "pub struct Trusted(Vec<(String, Key)>);" not in trust:
@@ -862,16 +875,16 @@ def proof_checks(c, conn, trust, wait):
     if proven != ("let key: Key = pk.try_into().ok()?; let want = login_message(challenge, target, controller)?; "
                   "let signed = sign::verify(sig, &sign::PublicKey(key)).ok()?; (signed == want).then_some(key)"):
         why.append("proven_key doesn't verify the signature over this login")
-    if "if !ip.is_unspecified() && !ip.is_loopback() {" not in names or not names.startswith("let mut names = vec![my_id.to_owned()];"):
-        why.append("target_names isn't this Target's ID and arrival address")
-    if login_key != ("target_names(my_id, arrived_on).iter().find_map(|target| { proven_key(&lr.my_id, "
-                     "&lr.boring_controller_pk, &lr.boring_login_sig, challenge, target) })"):
+    if names != ("let from = ip_in(from)?; if !(is_tailnet(arrived_on) && is_tailnet(from)) { return None; } "
+                 "Some(canonical(arrived_on).to_string())"):
+        why.append("target_name isn't the tailnet address a tailnet peer arrived on (relay/LAN addresses relay)")
+    if tailnet != "crate::client::boring_is_tailnet(SocketAddr::new(ip, 0))":
+        why.append(f"is_tailnet is {tailnet!r}")
+    if login_key != ("let target = target_name(arrived_on, from)?; proven_key(&lr.my_id, "
+                     "&lr.boring_controller_pk, &lr.boring_login_sig, challenge, &target)"):
         why.append(f"login_key is {login_key[:80]!r}")
-    if f"crate::trust_policy::Password::Right,\n                        {rebrand.LOGIN_KEY},\n" not in wait:
-        why.append("the trust gate doesn't pass the proven key")
-    if "Config::get_id()" not in rebrand.LOGIN_KEY or "self.hash.challenge" not in rebrand.LOGIN_KEY \
-            or "self.stream.local_addr().ip()" not in rebrand.LOGIN_KEY:
-        why.append("the gate's key isn't proven against this connection")
+    if f"crate::trust_policy::Password::Right,\n                        {GATE_KEY},\n" not in wait:
+        why.append("the trust gate doesn't pass the key proven against this connection")
     c.fact("a trusted login needs the stored key's signature over this login; a known ID alone never skips the click",
            not why, "; ".join(why))
 
@@ -888,10 +901,19 @@ def proof_checks(c, conn, trust, wait):
         why.append("create_login_msg doesn't sign before sending")
     if rebrand.HASH_FIRST_NEW.split("    true\n")[0] not in hash_fn:
         why.append("handle_hash sends the login before it stores the challenge")
-    if not ("let target = dialed_target(&lr.username);" in signing and "let (sk, pk) = Config::get_key_pair(); "
-            "if let Some(sig) = signature(challenge, &target, &lr.my_id, &sk) { lr.boring_controller_pk = pk.into(); "
-            "lr.boring_login_sig = sig.into();" in signing):
-        why.append("sign_login isn't the key pair over (challenge, dialed Target, own ID)")
+    dialed = squash(fn_body(trust, "pub fn dialed_target(peer: &str) -> Option<String> {"))
+    if dialed != ("let ip = match ip_in(peer) { Some(ip) => ip, None => DIALED.lock().unwrap().iter()"
+                  ".find(|(p, _)| p == peer)?.1, }; is_tailnet(ip).then(|| ip.to_string())"):
+        why.append("the Controller signs a target other than a tailnet address it connected to")
+    want = ('let Some(target) = dialed_target(&lr.username) else { return; }; '
+            'if login_message(challenge, &target, &lr.my_id).is_none() { return; } '
+            '#[cfg(any(target_os = "android", target_os = "ios"))] let pair = Some(Config::get_key_pair()); '
+            '#[cfg(not(any(target_os = "android", target_os = "ios")))] let pair = Config::get_existing_key_pair(); '
+            'let Some((sk, pk)) = pair else { return; }; '
+            'if let Some(sig) = signature(challenge, &target, &lr.my_id, &sk) { lr.boring_controller_pk = pk.into(); '
+            'lr.boring_login_sig = sig.into(); }')
+    if signing != want:
+        why.append("sign_login isn't the service's key pair over (challenge, dialed Target, own ID)")
     if not re.search(r'const LOGIN_DOMAIN: &\[u8\] = b"\\0[^"]*";', trust):
         why.append("the signed login has no zero-led domain (could read as a SignedId)")
     if not re.search(r"let challenge_ok = !challenge\.is_empty\(\)\s*&& challenge\.len\(\) <= 64\s*"
@@ -985,7 +1007,7 @@ def trust_checks(c, locked):
            and re.search(r"if trusted\.to_option\(\) != stored \{[^}]*save\(&trusted\);\s*\}",
                          fn_body(trust, "fn load() -> Trusted {") or "") is not None
            and "let remember = crate::password_lock::authed_sessions() == 0;" in accept
-           and "if password == Password::Right && remember {" in trust
+           and REMEMBER_IF in trust
            and "LocalConfig" not in trust and "mod trust_policy;" in c.read("src/lib.rs"),
            f"key {key.group(1) if key else None}, options hook {hook is not None}")
 

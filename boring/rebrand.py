@@ -55,7 +55,7 @@ TAILNET_RESOLVER = f"""
 // if every address it resolves to is a Tailscale one. Anything else is refused.
 const BORING_NOT_FOUND: &str = "{NOT_FOUND}";
 
-fn boring_is_tailnet(addr: SocketAddr) -> bool {{
+pub(crate) fn boring_is_tailnet(addr: SocketAddr) -> bool {{
     match hbb_common::try_into_v4(addr).ip() {{
         std::net::IpAddr::V4(ip) => ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64,
         std::net::IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
@@ -792,11 +792,13 @@ PATCHES += [
 # --- Trusted Controllers (ticket 06) ----------------------------------------------
 # src/trust_policy.rs and trusted_controllers.dart are ours; these wire them in. The
 # approve-mode / allow-hide-cm locks are in LOCKED. Trust is bound to the Controller's own key:
-# it signs each login (SIGN_LOGIN, two LoginRequest fields in PROTO_PATCH), and the Target trusts
-# an ID only with its stored key and a valid signature over this login (LOGIN_KEY). A known ID
-# alone, or a 1.7 Controller that doesn't sign, always gets the click.
-LOGIN_KEY = ("crate::trust_policy::login_key(&lr, &self.hash.challenge, &Config::get_id(), "
-             "self.stream.local_addr().ip())")
+# it signs each tailnet Direct IP login (SIGN_LOGIN, two LoginRequest fields in PROTO_PATCH), and
+# the Target trusts an ID only with its stored key and a valid signature over this login on this
+# connection (LOGIN_KEY). A known ID alone, a 1.7 Controller, LAN Direct IP and relayed logins
+# always get the click.
+# The key is proven against this connection: its challenge, the address it arrived on and the
+# address it came from (both tailnet, or the login has no name to sign and clicks).
+LOGIN_KEY = "crate::trust_policy::login_key(&lr, &self.hash.challenge, self.stream.local_addr().ip(), &self.ip)"
 TRUST_GATE = (
     "                    // boring-remote: a Controller that doesn't prove a trusted key also needs\n"
     "                    // a click on this computer (ticket 06). Every prompt counts against this\n"
