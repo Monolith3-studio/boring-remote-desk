@@ -192,16 +192,28 @@ PROTOCOL_HASHES = pathlib.Path(__file__).resolve().parent / "protocol.sha256"
 
 
 def protocol_matches(root):
-    """(ok, why): the tree's .proto files are exactly those in protocol.sha256, unchanged.
+    """(ok, why): the tree's .proto files are exactly those in protocol.sha256, plus our one addition.
 
-    The hashes are upstream's at our base, taken with LF endings so a CRLF
-    checkout matches; a rebase that changes a proto updates them (boring/REBASE.md)."""
+    The hashes are upstream's at our base, taken with LF endings so a CRLF checkout matches; a
+    rebase that changes a proto updates them (boring/REBASE.md). Our only change is
+    rebrand.PROTO_PATCH (two LoginRequest fields, ticket 06): it has to be there exactly once,
+    and with it undone the file has to hash to upstream's, so nothing else in it moved."""
     want = dict(reversed(l.split(maxsplit=1)) for l in PROTOCOL_HASHES.read_text().splitlines() if l.strip())
-    have = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
-            for p in root.rglob("*.proto") if p.is_file() and not p.relative_to(root).as_posix().startswith(
-                ("target/", ".git/"))}
+    rel_ours, old, new, _ = rebrand.PROTO_PATCH
+    have, why = {}, []
+    for p in root.rglob("*.proto"):
+        rel = p.relative_to(root).as_posix()
+        if not p.is_file() or rel.startswith(("target/", ".git/")):
+            continue
+        data = p.read_bytes().replace(b"\r\n", b"\n")
+        if rel == rel_ours:
+            text = data.decode("utf-8")
+            if text.count(new) != 1:
+                why.append(f"{rel}: our LoginRequest fields missing or changed")
+            data = text.replace(new, old, 1).encode("utf-8")
+        have[rel] = hashlib.sha256(data).hexdigest()
     bad = sorted(f for f in want.keys() | have.keys() if want.get(f) != have.get(f))
-    return not bad, ", ".join(bad)
+    return not bad and not why, ", ".join(why + bad)
 
 
 def msi_checks(c):
@@ -662,6 +674,8 @@ CLICK_WAIT = (r"#\[cfg\(not\(any\(target_os = \"android\", target_os = \"ios\"\)
               r"if hbb_common::get_version_number\(&lr\.version\)\s*>= hbb_common::get_version_number\(\"1\.2\.0\"\)\s*\{\s*"
               r"self\.send_login_error\(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS\)\.await;\s*\}\s*return true;")
 BUMP = r"self\.update_failure_with_scope\(failure, false, 0, FailureScope::Default\);"
+# The one way decide() lets a login in unasked: right password, and the ID listed with the key it proved.
+TRUSTED_IF = "if password == Password::Right && key.map_or(false, |k| trusted.contains(controller, k)) {"
 
 
 def option_consts(c):
@@ -721,9 +735,9 @@ def password_lock_checks(c, locked):
            0 <= gate < click and conn[gate:].startswith(live) and "return false;" in conn[gate:click]
            and unset is not None
            and re.search(r"crate::trust_policy::on_login\(\s*self\.inner\.id\(\),\s*&lr\.my_id,\s*"
-                         r"crate::trust_policy::Password::NotSet,\s*\);", unset.group(1)) is not None
+                         r"crate::trust_policy::Password::NotSet,\s*None,\s*\);", unset.group(1)) is not None
            and refuse is not None and refuse.strip() == "verification_method != PERMANENT_ONLY"
-           and "if password == Password::Right && trusted.contains(controller) {" in trust
+           and TRUSTED_IF in trust
            and "if password == Password::Right && remember {" in trust,
            f"gate at {gate}, click branch at {click}, no-password click path {unset is not None}, "
            f"refuse_login {refuse!r}")
@@ -828,9 +842,73 @@ def logon_sites(conn, locked):
     return len(sites), unexplained
 
 
+def proof_checks(c, conn, trust, wait):
+    """Trust binding (option B): the Controller signs each login with its own key pair; the Target
+    trusts the ID only with the key stored for it and a valid signature over this very login."""
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    contains = squash(fn_body(trust, "pub fn contains(&self, id: &str, key: &Key) -> bool {"))
+    entry = squash(fn_body(trust, "fn entry(s: &str) -> Option<(&str, Key)> {"))
+    parse = squash(fn_body(trust, "pub fn parse(option: &str) -> Self {"))
+    proven = squash(fn_body(trust, "pub fn proven_key("))
+    names = squash(fn_body(trust, "pub fn target_names(my_id: &str, arrived_on: IpAddr) -> Vec<String> {"))
+    login_key = squash(fn_body(trust, "pub fn login_key("))
+    why = []
+    if "pub struct Trusted(Vec<(String, Key)>);" not in trust:
+        why.append("the list isn't ID + key")
+    if contains != "storable(id) && self.0.iter().any(|(t, k)| t == id && k == key)":
+        why.append(f"contains is {contains!r}")
+    if entry != "let (id, key) = s.trim().split_once(':')?; Some((id, unhex(key)?))" or "filter_map(entry)" not in parse:
+        why.append("parse keeps entries without a key")
+    if proven != ("let key: Key = pk.try_into().ok()?; let want = login_message(challenge, target, controller)?; "
+                  "let signed = sign::verify(sig, &sign::PublicKey(key)).ok()?; (signed == want).then_some(key)"):
+        why.append("proven_key doesn't verify the signature over this login")
+    if "if !ip.is_unspecified() && !ip.is_loopback() {" not in names or not names.startswith("let mut names = vec![my_id.to_owned()];"):
+        why.append("target_names isn't this Target's ID and arrival address")
+    if login_key != ("target_names(my_id, arrived_on).iter().find_map(|target| { proven_key(&lr.my_id, "
+                     "&lr.boring_controller_pk, &lr.boring_login_sig, challenge, target) })"):
+        why.append(f"login_key is {login_key[:80]!r}")
+    if f"crate::trust_policy::Password::Right,\n                        {rebrand.LOGIN_KEY},\n" not in wait:
+        why.append("the trust gate doesn't pass the proven key")
+    if "Config::get_id()" not in rebrand.LOGIN_KEY or "self.hash.challenge" not in rebrand.LOGIN_KEY \
+            or "self.stream.local_addr().ip()" not in rebrand.LOGIN_KEY:
+        why.append("the gate's key isn't proven against this connection")
+    c.fact("a trusted login needs the stored key's signature over this login; a known ID alone never skips the click",
+           not why, "; ".join(why))
+
+    client = c.read("src/client.rs")
+    built = fn_body(client, "    fn create_login_msg(") or ""
+    hash_fn = fn_body(client, "pub async fn handle_hash(") or ""
+    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str) {"))
+    message = fn_body(trust, "pub fn login_message(challenge: &str, target: &str, controller: &str) -> Option<Vec<u8>> {") or ""
+    resolver = fn_body(client, "async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {") or ""
+    lib = c.read("src/lib.rs")
+    why = []
+    sign_at, sent_at = built.find(rebrand.SIGN_LOGIN), built.find("msg_out.set_login_request(lr);")
+    if not 0 <= sign_at < sent_at:
+        why.append("create_login_msg doesn't sign before sending")
+    if rebrand.HASH_FIRST_NEW.split("    true\n")[0] not in hash_fn:
+        why.append("handle_hash sends the login before it stores the challenge")
+    if not ("let target = dialed_target(&lr.username);" in signing and "let (sk, pk) = Config::get_key_pair(); "
+            "if let Some(sig) = signature(challenge, &target, &lr.my_id, &sk) { lr.boring_controller_pk = pk.into(); "
+            "lr.boring_login_sig = sig.into();" in signing):
+        why.append("sign_login isn't the key pair over (challenge, dialed Target, own ID)")
+    if not re.search(r'const LOGIN_DOMAIN: &\[u8\] = b"\\0[^"]*";', trust):
+        why.append("the signed login has no zero-led domain (could read as a SignedId)")
+    if not re.search(r"let challenge_ok = !challenge\.is_empty\(\)\s*&& challenge\.len\(\) <= 64\s*"
+                     r"&& challenge\.bytes\(\)\.all\(\|b\| b\.is_ascii_alphanumeric\(\)\);\s*if !challenge_ok \{\s*return None;",
+                     message):
+        why.append("the Controller would sign any challenge a Target sends")
+    if "crate::trust_policy::note_dialed(peer, addr.ip());" not in resolver:
+        why.append("a tailnet name's login isn't bound to the address it resolved to")
+    if not re.search(r"(?<!Target side only\n)mod trust_policy;", lib):
+        why.append("trust_policy is left out of iOS Controllers")
+    c.fact("Controllers sign each login with their own key (this challenge, the Target they dialed, their ID)",
+           not why, "; ".join(why))
+
+
 def trust_checks(c, locked):
-    """Ticket 06: a Controller ID not on the Target's trusted list needs the password and a click.
-    The ID is what the Controller reports about itself, so this is not spoof resistance."""
+    """Ticket 06: a Controller needs the password and a click unless it proves, by signing this
+    login with its own key, that it is a trusted one. The ID it reports is never enough alone."""
     c.fact("unknown Controllers need the password and a click on the Target (approve mode locked, prompt can't hide)",
            locked.get("approve-mode") == "" and "approve-mode" in locked and locked.get("allow-hide-cm") == "N",
            f"approve-mode {locked.get('approve-mode')!r}, allow-hide-cm {locked.get('allow-hide-cm')!r}")
@@ -839,11 +917,10 @@ def trust_checks(c, locked):
     trust = strip_tests_and_comments(c.read("src/trust_policy.rs"))
     decide = fn_body(trust, "pub fn decide(") or ""
     wait = trust_gate(conn)
-    c.fact("a right password from a Controller ID not on the trusted list waits for a click on the Target",
+    c.fact("a right password waits for a click on the Target unless the Controller proves a trusted key",
            "!= crate::trust_policy::Decision::Allow" in wait and re.search(CLICK_WAIT, wait) is not None
            and "mod trust_policy;" in c.read("src/lib.rs")
-           and re.match(r"\s*if password == Password::Right && trusted\.contains\(controller\) \{\s*"
-                        r"return Decision::Allow;\s*\}", decide)
+           and re.match(r"\s*" + re.escape(TRUSTED_IF) + r"\s*return Decision::Allow;\s*\}", decide)
            and "AtTarget::NotAsked => Decision::Ask," in decide and decide.count("Decision::Allow") == 2,
            f"trust gate {'found' if wait else 'missing or out of place'}")
 
@@ -903,6 +980,10 @@ def trust_checks(c, locked):
            and re.search(r"(?<!Local)Config::set_option\(TRUSTED_OPTION", trust) is not None
            and re.search(r"(?<!Local)Config::get_option\(TRUSTED_OPTION", trust) is not None
            and trust.count("Config::set_option(") == 1
+           and "Config::set_option(TRUSTED_OPTION" in (fn_body(trust, "fn save(trusted: &Trusted) {") or "")
+           and len(re.findall(r"\bsave\(&", trust)) == 2 and "save(&next);" in accept
+           and re.search(r"if trusted\.to_option\(\) != stored \{[^}]*save\(&trusted\);\s*\}",
+                         fn_body(trust, "fn load() -> Trusted {") or "") is not None
            and "let remember = crate::password_lock::authed_sessions() == 0;" in accept
            and "if password == Password::Right && remember {" in trust
            and "LocalConfig" not in trust and "mod trust_policy;" in c.read("src/lib.rs"),
@@ -921,6 +1002,8 @@ def trust_checks(c, locked):
            and remove_key is not None and dart_remove is not None and dart_remove.group(1) == remove_key.group(1)
            and "bind.mainSetOption(key: kBoringTrustedControllersRemove, value: ids)" in widget,
            f"options hook {hook is not None}, close arm {arm_close is not None}")
+
+    proof_checks(c, conn, trust, wait)
 
     on_login = fn_body(trust, "pub fn on_login(") or ""
     c.fact("a Controller-supplied ID is logged throttled and only if storable",
@@ -1108,8 +1191,9 @@ def run_checks(root):
     branding_checks(c)
     connect_checks(c)
 
-    # protocol untouched: every .proto in the tree is upstream's, byte for byte
-    c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))
+    # protocol: every .proto in the tree is upstream's, byte for byte, except our two LoginRequest fields
+    c.fact("protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)",
+           *protocol_matches(c.root))
 
     print(f"rebrand check: {c.passed} passed, {c.failed} failed")
     return 1 if c.failed else 0

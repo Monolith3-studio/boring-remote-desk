@@ -27,6 +27,8 @@ REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
 REMOTE_CONFIG = "allow-remote-config-modification locked off (a UI hint; the session guard holds the settings)"
 HBB = rebrand.HBB
+PROTOCOL = "protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)"
+TRUSTED_IF = "    if password == Password::Right && key.map_or(false, |k| trusted.contains(controller, k)) {"
 
 
 def export_clean_tree(dest):
@@ -426,8 +428,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_password_trusted_controller_skipping_the_click_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    if password == Password::Right && trusted.contains(controller) {",
-                  "    if trusted.contains(controller) {")
+        self.edit("src/trust_policy.rs", TRUSTED_IF, TRUSTED_IF.replace("password == Password::Right && ", ""))
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_throttle_dropped_from_the_password_check_fails_check(self):
@@ -552,7 +553,9 @@ class RebrandSeam(unittest.TestCase):
 
     # --- ticket 06: trusted Controllers --------------------------------------------
     APPROVE_LOCKED = "unknown Controllers need the password and a click on the Target (approve mode locked, prompt can't hide)"
-    TRUST_GATE = "a right password from a Controller ID not on the trusted list waits for a click on the Target"
+    TRUST_GATE = "a right password waits for a click on the Target unless the Controller proves a trusted key"
+    PROOF = "a trusted login needs the stored key's signature over this login; a known ID alone never skips the click"
+    SIGNED = "Controllers sign each login with their own key (this challenge, the Target they dialed, their ID)"
     ACCEPT_GATED = "the Target's Accept only counts for a login waiting on it; a stray one ends the connection"
     TRUST_LIST = "trusted Controllers live in the daemon's config; only an Accept with no other session open adds one"
     BUDGET = "every Accept prompt counts against the IP's failure budget; an approval clears it"
@@ -568,14 +571,14 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
                      self.TRUST_SETTINGS, self.BUDGET, self.SWAP, self.NO_DEAD_ACCEPT, self.LOGON_SITES,
-                     self.REMOVE, self.ID_LOG):
+                     self.REMOVE, self.ID_LOG, self.PROOF, self.SIGNED, PROTOCOL):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_trust_facts_fail_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
         for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
                      self.TRUST_SETTINGS, self.BUDGET, self.SWAP, self.NO_DEAD_ACCEPT, self.LOGON_SITES,
-                     self.REMOVE):
+                     self.REMOVE, self.PROOF, self.SIGNED, PROTOCOL):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_password_only_approve_mode_fails_check(self):
@@ -616,8 +619,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_trusted_check_without_the_password_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    if password == Password::Right && trusted.contains(controller) {",
-                  "    if trusted.contains(controller) {")
+        self.edit("src/trust_policy.rs", TRUSTED_IF, TRUSTED_IF.replace("password == Password::Right && ", ""))
         self.assert_check_fails(self.TRUST_GATE)
 
     def test_ungated_accept_fails_check(self):
@@ -760,6 +762,84 @@ class RebrandSeam(unittest.TestCase):
                   "const kBoringTrustedControllers = 'boring-trusted-controllers';",
                   "const kBoringTrustedControllers = 'trusted';")
         self.assert_check_fails(self.TRUST_SETTINGS)
+
+    # --- trust binding (option B): the Controller proves its key ----------------------
+    def test_trust_keyed_on_the_id_alone_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "|(t, k)| t == id && k == key", "|(t, _)| t == id")
+        self.assert_check_fails(self.PROOF)
+
+    def test_unverified_signature_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    (signed == want).then_some(key)\n", "    let _ = (signed, want);\n    Some(key)\n")
+        self.assert_check_fails(self.PROOF)
+
+    def test_gate_trusting_the_presented_key_unsigned_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.LOGIN_KEY, "lr.boring_controller_pk.as_ref().try_into().ok()")
+        self.assert_check_fails(self.PROOF)
+
+    def test_signature_naming_the_claimed_target_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "target_names(my_id, arrived_on).iter()", "[lr.username.clone()].iter()")
+        self.assert_check_fails(self.PROOF)
+
+    def test_target_matching_an_unspecified_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "if !ip.is_unspecified() && !ip.is_loopback() {", "if true {")
+        self.assert_check_fails(self.PROOF)
+
+    def test_keyless_entry_kept_by_parse_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    Some((id, unhex(key)?))\n", "    Some((id, unhex(key).unwrap_or([0; 32])))\n")
+        self.assert_check_fails(self.PROOF)
+
+    def test_controller_not_signing_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.SIGN_LOGIN, "")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_login_signed_before_the_challenge_is_known_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.HASH_FIRST_NEW, rebrand.HASH_FIRST_OLD)
+        self.assert_check_fails(self.SIGNED)
+
+    def test_controller_signing_any_challenge_fails_check(self):
+        # A Target picks the challenge; unchecked, it could make the Controller's key sign a SignedId.
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "\n        && challenge.bytes().all(|b| b.is_ascii_alphanumeric());", ";")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_login_message_without_its_domain_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", 'const LOGIN_DOMAIN: &[u8] = b"\\0boring-remote', 'const LOGIN_DOMAIN: &[u8] = b"boring-remote')
+        self.assert_check_fails(self.SIGNED)
+
+    def test_tailnet_name_not_bound_to_its_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.NOTE_DIALED, "")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_trust_policy_left_out_of_ios_controllers_fails_check(self):
+        self.rebrand()
+        self.edit("src/lib.rs", "mod trust_policy;", rebrand.NON_IOS + "mod trust_policy;")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_login_fields_dropped_from_the_protocol_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/protos/message.proto", rebrand.PROTO_FIELDS, "")
+        self.assert_check_fails(PROTOCOL)
+
+    def test_other_edit_next_to_the_login_fields_fails_check(self):
+        self.rebrand()
+        self.edit("libs/base/protos/message.proto", rebrand.PROTO_FIELDS,
+                  rebrand.PROTO_FIELDS + "  bytes sneaky = 1002;\n")
+        self.assert_check_fails(PROTOCOL)
+
+    def test_migration_writing_more_than_it_drops_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    trusted\n}\n", "    save(&trusted);\n    trusted\n}\n")
+        self.assert_check_fails(self.TRUST_LIST)
 
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",

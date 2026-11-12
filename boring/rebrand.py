@@ -45,6 +45,8 @@ UI_KEYS = [
     "None yet. A computer connecting for the first time needs a click here.",
 ]
 LANG_KEYS = [NOT_FOUND] + UI_KEYS
+# The login to a tailnet name signs the address it resolved to (ticket 06, src/trust_policy.rs).
+NOTE_DIALED = "crate::trust_policy::note_dialed(peer, addr.ip());\n"
 # Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
 # out (check.py derives them from TAILNET and compares).
 TAILNET_RESOLVER = f"""
@@ -73,7 +75,8 @@ async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {{
     if addrs.is_empty() || !addrs.iter().all(|a| boring_is_tailnet(*a)) {{
         bail!(BORING_NOT_FOUND);
     }}
-    Ok(addrs.iter().find(|a| a.is_ipv4()).copied().unwrap_or(addrs[0]))
+    let addr = addrs.iter().find(|a| a.is_ipv4()).copied().unwrap_or(addrs[0]);
+    {NOTE_DIALED}    Ok(addr)
 }}
 """
 
@@ -653,6 +656,7 @@ NO_PASSWORD_GATE = (
     "                    self.inner.id(),\n"
     "                    &lr.my_id,\n"
     "                    crate::trust_policy::Password::NotSet,\n"
+    "                    None,\n"
     "                );\n"
     + _click_wait(16) +
     "            }\n")
@@ -787,16 +791,21 @@ PATCHES += [
 
 # --- Trusted Controllers (ticket 06) ----------------------------------------------
 # src/trust_policy.rs and trusted_controllers.dart are ours; these wire them in. The
-# approve-mode / allow-hide-cm locks are in LOCKED. Known limit: the list is keyed on the ID the
-# Controller reports (lr.my_id), so it is not spoof resistant (src/trust_policy.rs).
+# approve-mode / allow-hide-cm locks are in LOCKED. Trust is bound to the Controller's own key:
+# it signs each login (SIGN_LOGIN, two LoginRequest fields in PROTO_PATCH), and the Target trusts
+# an ID only with its stored key and a valid signature over this login (LOGIN_KEY). A known ID
+# alone, or a 1.7 Controller that doesn't sign, always gets the click.
+LOGIN_KEY = ("crate::trust_policy::login_key(&lr, &self.hash.challenge, &Config::get_id(), "
+             "self.stream.local_addr().ip())")
 TRUST_GATE = (
-    "                    // boring-remote: a Controller not on the trusted list also needs a click\n"
-    "                    // on this computer (ticket 06). Every prompt counts against this IP's\n"
-    "                    // failure budget. Nobody answers: the login times out.\n"
+    "                    // boring-remote: a Controller that doesn't prove a trusted key also needs\n"
+    "                    // a click on this computer (ticket 06). Every prompt counts against this\n"
+    "                    // IP's failure budget. Nobody answers: the login times out.\n"
     "                    if crate::trust_policy::on_login(\n"
     "                        self.inner.id(),\n"
     "                        &lr.my_id,\n"
     "                        crate::trust_policy::Password::Right,\n"
+    f"                        {LOGIN_KEY},\n"
     "                    ) != crate::trust_policy::Decision::Allow\n"
     "                    {\n"
     "                        self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
@@ -867,12 +876,35 @@ _AUTHORIZE = ("                        ipc::Data::Authorize => {\n"
               "                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);\n")
 _LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n"
           "            if !self.check_login_scope(&lr).await {\n")
+SIGN_LOGIN = ("        // boring-remote: sign this login for the Target's trusted list (ticket 06).\n"
+              "        crate::trust_policy::sign_login(&mut lr, &self.hash.challenge);\n")
+_LOGIN_BUILT = "        };\n        match self.conn_type {\n            ConnType::FILE_TRANSFER => lr.set_file_transfer(FileTransfer {\n"
+# Upstream stores the Target's Hash only after sending the login; the signature needs it first.
+HASH_FIRST_OLD = ("    send_login(lc.clone(), String::new(), String::new(), password, peer).await;\n"
+                  "    lc.write().unwrap().hash = hash;\n    true\n}\n")
+HASH_FIRST_NEW = ("    lc.write().unwrap().hash = hash; // boring-remote: the login signs its challenge (ticket 06)\n"
+                  "    send_login(lc.clone(), String::new(), String::new(), password, peer).await;\n    true\n}\n")
+# Two LoginRequest fields, numbered far from upstream's. A 1.7 Target or stock RustDesk ignores
+# them; a 1.7 Controller leaves them empty. check.py undoes exactly this to compare the proto
+# with upstream's pinned hash (boring/protocol.sha256, boring/REBASE.md).
+PROTO_FIELDS = (
+    "  // boring-remote: trusted Controllers (ticket 06). The Controller's own Ed25519 public key\n"
+    "  // and its signature over this login (src/trust_policy.rs). Empty from older Controllers.\n"
+    "  bytes boring_controller_pk = 1000;\n"
+    "  bytes boring_login_sig = 1001;\n")
+PROTO_PATCH = ("libs/base/protos/message.proto", "  string avatar = 17;\n}\n",
+               "  string avatar = 17;\n" + PROTO_FIELDS + "}\n",
+               "LoginRequest carries the Controller's key and login signature")
 _AUTHED_TAIL = "                        _ => {}\n                    }\n                }\n                _ = second_timer.tick() => {\n"
 PATCHES += [
     ("src/lib.rs", "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
      "mod password_lock; // boring-remote: permanent password only (ticket 05)\n"
-     + NON_IOS + "mod trust_policy; // boring-remote: trusted Controllers (ticket 06)\n",
-     "trust policy module (no Target side on iOS)"),
+     "mod trust_policy; // boring-remote: trusted Controllers (ticket 06); iOS Controllers sign too\n",
+     "trust policy module (Controllers on every platform sign their logins)"),
+    PROTO_PATCH,
+    ("src/client.rs", _LOGIN_BUILT, _LOGIN_BUILT.replace("        match self", SIGN_LOGIN + "        match self", 1),
+     "Controller signs each login with its own key"),
+    ("src/client.rs", HASH_FIRST_OLD, HASH_FIRST_NEW, "the login knows the Target's challenge before it is built"),
     ("src/server/connection.rs", _PW_OK, TRUST_GATE + _PW_OK,
      "unknown Controller waits for a click after the right password"),
     ("src/server/connection.rs", _AUTHORIZE,

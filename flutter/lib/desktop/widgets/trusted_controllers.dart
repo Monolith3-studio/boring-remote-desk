@@ -11,11 +11,22 @@ const kBoringTrustedControllersRemove = 'boring-trusted-controllers-remove';
 Future<void> removeTrustedControllers(String ids) =>
     bind.mainSetOption(key: kBoringTrustedControllersRemove, value: ids);
 
-Future<void> clearTrustedControllers() => removeTrustedControllers(
-    bind.mainGetOptionSync(key: kBoringTrustedControllers));
+Future<void> clearTrustedControllers() =>
+    removeTrustedControllers(trustedControllerIds().join(','));
 
-/// The Controllers this computer lets in with the password alone. Remove one and its next
-/// connection needs a click here again; an open session of it ends.
+/// The stored list is `id:key` entries (the key the Controller proves on each login). An entry
+/// without a key is from before trust binding: not trusted, and the daemon drops it.
+final _entry = RegExp(r'^([A-Za-z0-9_-]{1,64}):[0-9a-f]{64}$');
+
+List<String> trustedControllerIds() => bind
+    .mainGetOptionSync(key: kBoringTrustedControllers)
+    .split(',')
+    .map((s) => _entry.firstMatch(s.trim())?.group(1))
+    .whereType<String>()
+    .toList();
+
+/// The Controllers this computer lets in with the password and no click (each proves its own
+/// key). Remove one and its next connection needs a click here again; an open session of it ends.
 class TrustedControllers extends StatefulWidget {
   const TrustedControllers({Key? key}) : super(key: key);
 
@@ -24,13 +35,6 @@ class TrustedControllers extends StatefulWidget {
 }
 
 class _TrustedControllersState extends State<TrustedControllers> {
-  List<String> _ids() => bind
-      .mainGetOptionSync(key: kBoringTrustedControllers)
-      .split(',')
-      .map((s) => s.trim())
-      .where((s) => s.isNotEmpty)
-      .toList();
-
   Future<void> _remove(String id) async {
     await removeTrustedControllers(id);
     // The UI's option cache refreshes about once a second.
@@ -40,7 +44,7 @@ class _TrustedControllersState extends State<TrustedControllers> {
 
   @override
   Widget build(BuildContext context) {
-    final ids = _ids();
+    final ids = trustedControllerIds();
     if (ids.isEmpty) {
       return Padding(
         padding: const EdgeInsets.all(8),

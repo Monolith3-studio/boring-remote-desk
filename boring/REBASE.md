@@ -1,6 +1,6 @@
 # Rebasing onto upstream RustDesk
 
-The fork is upstream at a release tag plus our commits: `boring/` and the deletion of upstream's workflows and `FUNDING.yml`. There is no GitHub Actions workflow at all (`check.py` fails on any file under `.github/workflows/`); releases build on the Studio with `boring/release/build-mac`. The rebrand runs at build time and is never committed. A rebase means moving those commits to a new base. Nothing upstream gets hand-edited. Our own files outside `boring/` are new files upstream doesn't have, wired in by `rebrand.py`: `src/password_lock.rs`, `src/trust_policy.rs`, `src/update_notice*.rs`, `src/update_install*.rs`, `src/update_rollback.rs`, `src/license_key*.rs`, `src/activate_link.rs`, `src/platform/privileges_scripts/install-update.sh` and the widgets in `flutter/lib/desktop/widgets/` they use (`generated_password.dart`, `trusted_controllers.dart`, `update_notice_banner.dart`, `license_key_field.dart`, `activate_link.dart`). A rebase never conflicts on them; if upstream adds a file of the same name, rename ours.
+The fork is upstream at a release tag plus our commits: `boring/` and the deletion of upstream's workflows and `FUNDING.yml`. There is no GitHub Actions workflow at all (`check.py` fails on any file under `.github/workflows/`); releases build on the Studio with `boring/release/build-mac`. The rebrand runs at build time and is never committed. A rebase means moving those commits to a new base. Nothing upstream gets hand-edited. Our own files outside `boring/` are new files upstream doesn't have, wired in by `rebrand.py` (our one `.proto` change is a `rebrand.py` patch too, see below): `src/password_lock.rs`, `src/trust_policy.rs`, `src/update_notice*.rs`, `src/update_install*.rs`, `src/update_rollback.rs`, `src/license_key*.rs`, `src/activate_link.rs`, `src/platform/privileges_scripts/install-update.sh` and the widgets in `flutter/lib/desktop/widgets/` they use (`generated_password.dart`, `trusted_controllers.dart`, `update_notice_banner.dart`, `license_key_field.dart`, `activate_link.dart`). A rebase never conflicts on them; if upstream adds a file of the same name, rename ours.
 
 `OLD` is the tag we're on now. It's the `version` in `Cargo.toml`. `NEW` is the target.
 
@@ -28,13 +28,15 @@ git reset --hard && git -C libs/hbb_common reset --hard   # drop the scripted ou
 
 `pins.py` covers Flutter, the bridge Flutter, Rust (Mac, Windows, bridge), LLVM, the vcpkg commit, flutter_rust_bridge, cargo-expand, the minimum macOS version. The app version is `Cargo.toml`'s alone; `build-mac` refuses a tag that differs from it. If upstream adds a toolchain pin we don't track, add it to `PINS`. To spot new pins, run `git diff OLD NEW -- .github/workflows/flutter-build.yml .github/workflows/bridge.yml`.
 
-If `check.py` fails `protocol files are upstream's`, upstream changed a `.proto`. Confirm the change is upstream's and read it (`git diff OLD NEW -- '*.proto'`, and `git -C libs/hbb_common diff <old-sha> <new-sha> -- protos`), then record the new hashes on an LF checkout:
+If `check.py` fails `protocol files are upstream's plus our two LoginRequest fields`, upstream changed a `.proto`. Confirm the change is upstream's and read it (`git diff OLD NEW -- '*.proto'`, and `git -C libs/hbb_common diff <old-sha> <new-sha> -- protos`), then record upstream's new hashes on a clean LF checkout, before `rebrand.py` (or after the `git reset --hard` above):
 
 ```
 sha256sum libs/base/protos/message.proto libs/hbb_common/protos/rendezvous.proto > boring/protocol.sha256
 ```
 
 If upstream added or moved a `.proto`, list it there too. Commit it with the pin bump.
+
+`protocol.sha256` always holds upstream's bytes, never ours. Our one protocol change is `PROTO_PATCH` in `rebrand.py`: two `LoginRequest` fields, `boring_controller_pk = 1000` and `boring_login_sig = 1001` (trusted Controllers, ticket 06; `src/trust_policy.rs`). `rebrand.py` adds them at build time like any other patch, and `check.py` undoes exactly that patch before hashing, so any other change to the file still fails. If upstream ever uses 1000 or 1001, or moves `string avatar = 17;` off the end of `LoginRequest` (`rebrand.py` exits 2), move our fields, keep the numbers if they're free, and note it in the release: a Controller and Target that disagree on the numbers fall back to a click on every login. Changing our fields themselves is a protocol version change for trusted Controllers. Do it on purpose: new numbers, the old ones left unused, and a click for every Controller until both ends update.
 
 Then look for new code that contacts RustDesk. `check.py` catches the known server names, but not new kinds of contact:
 
