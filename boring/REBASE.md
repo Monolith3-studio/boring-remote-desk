@@ -81,3 +81,7 @@ It checks every target before it changes any file. It prints `ERROR <file>: patc
 RustDesk is named once, on purpose: `LEGAL_LINE`, plain text on the About page. Translations are rewritten by the script (`RustDesk` becomes the display name in every language) and `lang.rs` does the same at run time for keys that fall back to themselves, so a new translation needs no work.
 
 Logos: `boring/upstream-logos.sha256` lists upstream's logo files. If any of those bytes ship anywhere, or a slot doesn't hold our copy, the check fails. If upstream redraws its icon, add the new file's hash there and a `COPIES` entry for its slot. Our art comes from `python3 boring/art/make_app_art.py` (needs Pillow and the Mac kit's `AppIcon.icns`). Re-run it, never edit the outputs, and look at `boring/art/preview/` before committing.
+
+## The Hosted servers' key (ADR 0005)
+
+`boring/server-key.pub` is the Hosted servers' public key, the same bytes as `keys/id_ed25519.pub` in `boring-remote-servers`. `rebrand.py` bakes it in as `RS_PUB_KEY` and the locked `key` option, and stops (exit 2, nothing written) if the file is missing, isn't a 32-byte base64 Ed25519 key, or is RustDesk's public key. `check.py` fails if the built-in key or the locked option differs from the file. A rebase never touches it. Changing the server key means a new file here and a release: every older Desk app then fails to verify the servers, so Machine-ID logins stop working until it updates (tailnet Direct IP keeps working).

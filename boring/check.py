@@ -4,14 +4,16 @@
 Usage:  python3 boring/check.py [ROOT]
 
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
-for: name, bundle IDs, empty servers, Direct IP on, tailnet whitelist, listener
-on all interfaces, allow-only-conn-window-open available and off, sync / NAT
+for: name, bundle IDs, the Hosted servers as the only servers with every override forced to
+them, their key baked in from boring/server-key.pub (ADR 0005), no Tailscale whitelist,
+Direct IP on, listener on all interfaces, allow-only-conn-window-open available and off, sync / NAT
 test / updater / LAN discovery unreachable (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
 no GitHub Actions workflow, no hwcodec/vram in any build invocation, Mac build with
 file copy-paste, the Windows MSI (name, exe, art sizes, license, icon, no RustDesk text), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
 translations, app metadata, every logo slot; one AGPL line on the About page), that
-the connect box takes an IP or a tailnet name and never reaches the ID/rendezvous
-path, and that the protocol files are upstream's. It only reads the tree.
+the connect box sends a Machine ID through the Hosted servers and any other name Direct IP
+to a tailnet address, that the Target shows its Machine ID, and that the protocol files are
+upstream's. It only reads the tree.
 Idempotence is proved by test_rebrand.py and build-mac's second-run step.
 
 Prints one PASS/FAIL line per fact, then
@@ -41,6 +43,15 @@ LINK_LOGS = [
     ("flutter/lib/main.dart", 'debugPrint("launch args: $args");'),
 ]
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
+# ADR 0005, pinned here (not taken from rebrand.py): the one rendezvous/relay host the app
+# knows, and the key file the build bakes. RustDesk's public servers' key never ships.
+HOSTED = "rs.theboringremote.com"
+SERVER_KEY = pathlib.Path(__file__).resolve().parent / "server-key.pub"
+RUSTDESK_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="
+FORCE_SERVERS = ("if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
+                 " // boring-remote: the Hosted servers only")
+FORCE_SERVER = ('if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
+                " // boring-remote: the Hosted servers only")
 # Upstream update endpoints and GitHub releases URLs never appear in shipped code
 # (ADR 0004 keeps this from ADR 0003; see updater_checks for the allowlist).
 _U = r"[^\s\"'`)]*"
@@ -501,8 +512,11 @@ def branding_checks(c):
                and 0.08 < len(ink) / len(img[2]) < 0.7, img and f"{img[0]}x{img[1]}")
 
 
-TAILNET_GUARD = ("        if true {\n            return Ok((\n                (\n"
+# After the IP branch: anything but a Machine ID returns Direct IP to a tailnet address.
+TAILNET_GUARD = ("        if !boring_is_machine_id(peer) {\n            return Ok((\n                (\n"
                  "                    connect_tcp_local(boring_tailnet_addr(peer).await?, None, CONNECT_TIMEOUT)\n")
+# A Machine ID is digits only: never an address, a tailnet name or id@server (another server).
+MACHINE_ID_TEST = "!peer.is_empty() && peer.len() <= 20 && peer.bytes().all(|b| b.is_ascii_digit())"
 ROUTE_AROUND = re.compile(r"rendezvous|RENDEZVOUS|_start_inner|other_server|is_domain_port_str|get_lch")
 
 
@@ -519,7 +533,8 @@ def tailnet_exprs():
 
 
 def connect_checks(c):
-    """The connect box takes an IP or a tailnet name, never an ID."""
+    """The connect box: a Machine ID goes through the Hosted servers; any other name connects
+    Direct IP to a tailnet address and never reaches the rendezvous path (ADR 0005)."""
     client = c.read("src/client.rs")
     body = fn_body(client, "    async fn _start(\n") or ""
     guard = body.find(TAILNET_GUARD)
@@ -528,19 +543,23 @@ def connect_checks(c):
     tops = [l.strip() for l in pre.splitlines() if l.startswith("        ") and not l.startswith("         ")]
     why = []
     if guard < 0:
-        why.append("no unconditional tailnet return after the IP branch")
+        why.append("no tailnet return for everything but a Machine ID after the IP branch")
     if ROUTE_AROUND.search(pre):
         why.append(f"_start touches the ID path first: {ROUTE_AROUND.findall(pre)}")
     if "if hbb_common::is_ip_str(peer) {" not in pre or any(not t.startswith(("if ", "}")) for t in tops):
         why.append(f"only the incoming-only and IP branches may come first: {tops}")
     if guard >= 0 and ("return Ok((" not in block or "else" in block):
         why.append("the tailnet block does not always return")
+    is_id = re.sub(r"\s+", " ", fn_body(client, "pub(crate) fn boring_is_machine_id(peer: &str) -> bool {") or "").strip()
+    if is_id != MACHINE_ID_TEST:
+        why.append(f"a Machine ID isn't digits only: {is_id!r}")
     calls = [m.start() for m in re.finditer(r"Self::_start_inner\(", client)]
     start = client.find("    async fn _start(\n")
     if not calls or any(not (start < i < start + len(body) + 200) for i in calls) or \
             len(re.findall(r"::_start\(", client)) != 1:
         why.append("_start / _start_inner are called from somewhere else")
-    c.fact("connect box never reaches the ID/rendezvous path", not why, "; ".join(why))
+    c.fact("connect box: only a Machine ID reaches the rendezvous path; names connect Direct IP", not why,
+           "; ".join(why))
 
     resolver = fn_body(client, "async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {") or ""
     is_tailnet = fn_body(client, "fn boring_is_tailnet(addr: SocketAddr) -> bool {") or ""
@@ -556,6 +575,19 @@ def connect_checks(c):
         if need not in is_tailnet:
             why.append(f"tailnet test is not {need}")
     c.fact("names connect Direct IP only to Tailscale addresses, else the plain error", not why, "; ".join(why))
+
+    home = c.read(rebrand.HOME)
+    board = fn_body(home, "buildIDBoard(BuildContext context) {") or ""
+    get_id = re.sub(r"\s+", " ", fn_body(c.read(HBB), "pub fn get_id() -> String {") or "").strip()
+    builtin = re.search(r"static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = (.*?);\n", c.read(HBB))
+    c.fact("the Target shows its Machine ID and keeps it across restarts (made once, then read from its config)",
+           "      if (!isOutgoingOnly) buildIDBoard(context),\n" in home
+           and f'translate("{rebrand.MACHINE_ID_LABEL}")' in board and "controller: model.serverId," in board
+           and get_id == ("let mut id = CONFIG.read().unwrap().id.clone(); if id.is_empty() { "
+                          "if let Some(tmp) = Config::gen_id() { id = tmp; Config::set_id(&id); } } id")
+           and "config.store();" in (fn_body(c.read(HBB), "pub fn set_id(id: &str) {") or "")
+           and builtin is not None and builtin.group(1) == "Default::default()",
+           f"label {'Machine ID' if rebrand.MACHINE_ID_LABEL in board else 'missing'}, get_id {get_id[:60]!r}")
 
     key = f'("{rebrand.NOT_FOUND}", '
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
@@ -684,7 +716,16 @@ CLICK_WAIT = (r"#\[cfg\(not\(any\(target_os = \"android\", target_os = \"ios\"\)
 BUMP = r"self\.update_failure_with_scope\(failure, false, 0, FailureScope::Default\);"
 # The one way decide() lets a login in unasked: right password, and the ID listed with the key it proved.
 # The trust gate's key, written out here (not taken from rebrand.py): proven against this connection.
-GATE_KEY = "crate::trust_policy::login_key(&lr, &self.hash.challenge, self.stream.local_addr().ip(), &self.ip)"
+# Its own Machine ID counts only on a connection keyed to the Target's signed identity (ticket 07).
+GATE_KEY = ("crate::trust_policy::login_key(\n                            &lr,\n"
+            "                            &self.hash.challenge,\n                            self.stream.local_addr().ip(),\n"
+            "                            &self.ip,\n                            &Config::get_id(),\n"
+            "                            self.stream.is_secured(),\n                        )")
+# Ticket 07, the Controller side: what a connection records and what the login signs with it.
+VERIFIED_AT_START = ("interface.get_lch().write().unwrap().boring_verified_target =\n"
+                     "                    crate::trust_policy::verified_target(peer, key, x.0 .2.as_deref(), x.0 .0.is_secured());")
+VERIFIED_CLEARED = "interface.get_lch().write().unwrap().boring_verified_target = None;"
+SIGN_CALL = "crate::trust_policy::sign_login(&mut lr, &self.hash.challenge, self.boring_verified_target.as_deref());"
 # accepted() remembers only a new ID: a trusted one showing another key keeps the stored key.
 REMEMBER_IF = "if password == Password::Right && remember && !trusted.has_id(controller) {"
 TRUSTED_IF = "if password == Password::Right && key.map_or(false, |k| trusted.contains(controller, k)) {"
@@ -824,9 +865,9 @@ def password_lock_checks(c, locked):
            and "translate(showOneTime ? 'One-time Password' : 'Password')," in c.read(rebrand.MOBILE_SERVER))
 
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
-    missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS
+    missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS + [rebrand.MACHINE_ID_LABEL]
                if p.read_text(encoding="utf-8").count(f'("{k}", ') != 1]
-    c.fact("new UI strings (tickets 05, 06) have a key in every translation file", langs and not missing,
+    c.fact("new UI strings (tickets 05, 06, 07) have a key in every translation file", langs and not missing,
            ", ".join(missing[:5]))
 
 
@@ -865,6 +906,7 @@ def proof_checks(c, conn, trust, wait):
     names = squash(fn_body(trust, "pub fn target_name(arrived_on: IpAddr, from: &str) -> Option<String> {"))
     tailnet = squash(fn_body(trust, "fn is_tailnet(ip: IpAddr) -> bool {"))
     login_key = squash(fn_body(trust, "pub fn login_key("))
+    all_names = squash(fn_body(trust, "pub fn target_names(arrived_on: IpAddr, from: &str, own_id: &str, secured: bool) -> Vec<String> {"))
     why = []
     if "pub struct Trusted(Vec<(String, Key)>);" not in trust:
         why.append("the list isn't ID + key")
@@ -880,9 +922,12 @@ def proof_checks(c, conn, trust, wait):
         why.append("target_name isn't the tailnet address a tailnet peer arrived on (relay/LAN addresses relay)")
     if tailnet != "crate::client::boring_is_tailnet(SocketAddr::new(ip, 0))":
         why.append(f"is_tailnet is {tailnet!r}")
-    if login_key != ("let target = target_name(arrived_on, from)?; proven_key(&lr.my_id, "
-                     "&lr.boring_controller_pk, &lr.boring_login_sig, challenge, &target)"):
+    if login_key != ("target_names(arrived_on, from, own_id, secured) .iter() .find_map(|target| "
+                     "proven_key(&lr.my_id, &lr.boring_controller_pk, &lr.boring_login_sig, challenge, target))"):
         why.append(f"login_key is {login_key[:80]!r}")
+    if all_names != ("let mut names: Vec<String> = target_name(arrived_on, from).into_iter().collect(); "
+                     "if secured && crate::client::boring_is_machine_id(own_id) { names.push(own_id.to_owned()); } names"):
+        why.append("the Target's Machine ID counts as its name on a connection not keyed to its signed identity")
     if f"crate::trust_policy::Password::Right,\n                        {GATE_KEY},\n" not in wait:
         why.append("the trust gate doesn't pass the key proven against this connection")
     c.fact("a trusted login needs the stored key's signature over this login; a known ID alone never skips the click",
@@ -891,7 +936,7 @@ def proof_checks(c, conn, trust, wait):
     client = c.read("src/client.rs")
     built = fn_body(client, "    fn create_login_msg(") or ""
     hash_fn = fn_body(client, "pub async fn handle_hash(") or ""
-    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str) {"))
+    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, verified: Option<&str>) {"))
     message = fn_body(trust, "pub fn login_message(challenge: &str, target: &str, controller: &str) -> Option<Vec<u8>> {") or ""
     resolver = fn_body(client, "async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {") or ""
     lib = c.read("src/lib.rs")
@@ -905,7 +950,7 @@ def proof_checks(c, conn, trust, wait):
     if dialed != ("let ip = match ip_in(peer) { Some(ip) => ip, None => DIALED.lock().unwrap().iter()"
                   ".find(|(p, _)| p == peer)?.1, }; is_tailnet(ip).then(|| ip.to_string())"):
         why.append("the Controller signs a target other than a tailnet address it connected to")
-    want = ('let Some(target) = dialed_target(&lr.username) else { return; }; '
+    want = ('let Some(target) = signed_target(&lr.username, verified) else { return; }; '
             'if login_message(challenge, &target, &lr.my_id).is_none() { return; } '
             '#[cfg(any(target_os = "android", target_os = "ios"))] let pair = Some(Config::get_key_pair()); '
             '#[cfg(not(any(target_os = "android", target_os = "ios")))] let pair = Config::get_existing_key_pair(); '
@@ -914,6 +959,8 @@ def proof_checks(c, conn, trust, wait):
             'lr.boring_login_sig = sig.into(); }')
     if signing != want:
         why.append("sign_login isn't the service's key pair over (challenge, dialed Target, own ID)")
+    if SIGN_CALL not in built:
+        why.append("the login isn't signed with this connection's verified Machine ID")
     if not re.search(r'const LOGIN_DOMAIN: &\[u8\] = b"\\0[^"]*";', trust):
         why.append("the signed login has no zero-led domain (could read as a SignedId)")
     if not re.search(r"let challenge_ok = !challenge\.is_empty\(\)\s*&& challenge\.len\(\) <= 64\s*"
@@ -925,6 +972,43 @@ def proof_checks(c, conn, trust, wait):
     if not re.search(r"(?<!Target side only\n)mod trust_policy;", lib):
         why.append("trust_policy is left out of iOS Controllers")
     c.fact("Controllers sign each login with their own key (this challenge, the Target they dialed, their ID)",
+           not why, "; ".join(why))
+    hosted_signing_checks(c, client, trust, squash)
+
+
+def hosted_signing_checks(c, client, trust, squash):
+    """Ticket 07: a Machine-ID login is signed only on a session that verified the Target against
+    the baked server key: the servers' word on its key checked out under that key, and the
+    Target signed this session's key exchange (upstream's plaintext fallback never counts)."""
+    why = []
+    verified = squash(fn_body(trust, "pub fn verified_target(peer: &str, key: &str, target_pk: Option<&[u8]>, secured: bool) -> Option<String> {"))
+    if verified != ("let baked = key.is_empty() || key == hbb_common::config::RS_PUB_KEY; "
+                    "(crate::client::boring_is_machine_id(peer) && baked && target_pk.is_some() && secured) "
+                    ".then(|| peer.to_owned())"):
+        why.append(f"verified_target is {verified[:90]!r}")
+    signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, verified: Option<&str>) -> Option<String> {"))
+    if signed != "dialed_target(peer).or_else(|| verified.filter(|v| *v == peer).map(str::to_owned))":
+        why.append(f"signed_target is {signed[:90]!r}")
+    code = strip_tests_and_comments(client)
+    start = fn_body(code, "    pub async fn start(\n") or ""
+    clear, run, record = start.find(VERIFIED_CLEARED), start.find("Self::_start("), start.find(VERIFIED_AT_START)
+    if not (0 <= clear < run < record and start[run:record].count("Ok(x) => {") == 1):
+        why.append("Client::start doesn't clear, then record, the verified Machine ID on each connection")
+    if code.count("boring_verified_target =") != 2 or code.count(".boring_verified_target") != 3:
+        why.append("the verified Machine ID is written or read somewhere else")
+    secure = fn_body(code, "    async fn secure_connection(\n") or ""
+    vouched = re.search(r"let rs_pk = get_rs_pk\(if key\.is_empty\(\) \{\s*config::RS_PUB_KEY\s*\} else \{\s*key\s*\}\);", secure)
+    target_key = re.search(r"if let Ok\(\(id, pk\)\) = decode_id_pk\(&signed_id_pk, &rs_pk\) \{\s*if id == peer_id \{\s*"
+                           r"sign_pk = Some\(sign::PublicKey\(pk\)\);\s*option_pk = Some\(pk\.to_vec\(\)\);", secure)
+    signed_id = secure.find("decode_id_pk_dtls(&si.id, &sign_pk)")
+    same_id = secure.find("if id == peer_id {", signed_id)
+    keyed = secure.find("conn.set_negotiated_key(")
+    if not (vouched and target_key and secure.count("option_pk = Some") == 1
+            and 0 <= signed_id < same_id < keyed and code.count("set_negotiated_key(") == 1
+            and not re.search(r"\.set_key(?:_split)?\(", code)):
+        why.append("secure_connection no longer keys the stream only after the Target's signed ID checks out "
+                   "under the servers' word (is_secured() would not mean verified)")
+    c.fact("Controllers sign a Machine-ID login only on a session that verified the Target against the baked server key",
            not why, "; ".join(why))
 
 
@@ -1044,6 +1128,51 @@ def trust_checks(c, locked):
            f"unlock at {unlock}, card at {card}, widget key {dart_key.group(1) if dart_key else None}")
 
 
+def baked_key():
+    """(the checked-in server public key, None) or (None, why it can't be the baked key)."""
+    try:
+        text = SERVER_KEY.read_text(encoding="ascii").strip()
+        raw = base64.b64decode(text, validate=True)
+    except (OSError, UnicodeError, ValueError) as e:
+        return None, f"{SERVER_KEY.name} missing or not base64 ({e.__class__.__name__})"
+    if len(raw) != 32 or base64.b64encode(raw).decode() != text:
+        return None, f"{SERVER_KEY.name} is not a 32-byte Ed25519 public key"
+    if text == RUSTDESK_KEY:
+        return None, f"{SERVER_KEY.name} is RustDesk's public servers' key"
+    return text, None
+
+
+def hosted_checks(c, cfg, locked):
+    """ADR 0005: the Hosted servers are the only servers, every override forces them, their key
+    is the checked-in one, and no Tailscale whitelist is left."""
+    servers = re.search(r"pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[(.*?)\];", cfg, re.S)
+    c.fact(f"the only rendezvous server is {HOSTED} (ADR 0005)",
+           servers is not None and servers.group(1).strip() == f'"{HOSTED}"' and rebrand.HOSTED == HOSTED,
+           servers and servers.group(1))
+    firsts = {sig: first_statement(cfg, sig) for sig in ("pub fn get_rendezvous_servers() -> Vec<String> {",
+                                                         "pub fn get_rendezvous_server() -> String {")}
+    c.fact("rendezvous server and list are always ours (exe name, Settings, config file, serial path skipped)",
+           list(firsts.values()) == [FORCE_SERVERS, FORCE_SERVER], firsts)
+    want = {"custom-rendezvous-server": HOSTED, "relay-server": HOSTED, "rendezvous-servers": HOSTED,
+            "api-server": ""}
+    bad = {k: locked.get(k) for k, v in want.items() if locked.get(k) != v}
+    c.fact(f"server settings locked to {HOSTED} (relay follows; no API server)", not bad, bad)
+
+    key, why = baked_key()
+    rs = re.search(r'pub const RS_PUB_KEY: &str = "([^"]*)";', cfg)
+    if key and (rs is None or rs.group(1) != key):
+        why = f"RS_PUB_KEY is {rs and rs.group(1)}, not {SERVER_KEY.name}"
+    elif key and locked.get("key") != key:
+        why = f"locked key option is {locked.get('key')!r}, not {SERVER_KEY.name}"
+    c.fact(f"baked server key is {SERVER_KEY.name} (built-in key and locked key option)", key and not why, why)
+
+    tailnet = set(rebrand.TAILNET.split(","))
+    maps = {name: rust_map(cfg, name) for name in ("OVERWRITE_SETTINGS", "DEFAULT_SETTINGS")}
+    left = [f"{name} {k}" for name, m in maps.items() for k, v in m.items()
+            if k == "whitelist" or tailnet & set(v.split(","))]
+    c.fact("no Tailscale whitelist left (ADR 0005)", not left, ", ".join(left))
+
+
 def run_checks(root):
     c = Check(root)
     workflow_guard(c)
@@ -1085,18 +1214,13 @@ def run_checks(root):
            conf_dir == f"{rebrand.ORG}.{APP}" and dirs == {conf_dir}
            and tomls == {f"{APP}.toml", f"{APP}2.toml"}, f"config dir {conf_dir}, script {dirs} {tomls}")
 
-    # servers and locked settings
-    c.fact("rendezvous servers empty", re.search(r"RENDEZVOUS_SERVERS: &\[&str\] = &\[\s*\];", cfg))
+    # servers and locked settings (ADR 0005: the Hosted servers, forced; no whitelist)
     locked = rust_map(cfg, "OVERWRITE_SETTINGS")
-    for key in ("custom-rendezvous-server", "relay-server", "api-server"):
-        c.fact(f"{key} locked empty", key in locked and locked[key] == "", locked.get(key))
-    c.fact("whitelist locked to the tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48)",
-           sorted(locked.get("whitelist", "").split(",")) == ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
-           locked.get("whitelist"))
+    hosted_checks(c, cfg, locked)
     c.fact("Direct IP locked on", locked.get("direct-server") == "Y")
     conn = c.read("src/server/connection.rs")
     ok, why = whitelist_enforced(conn, c.read("libs/hbb_common/src/lib.rs"))
-    c.fact("whitelist is enforced on incoming connections", ok, why)
+    c.fact("a whitelist the buyer sets is still checked first on incoming connections", ok, why)
     med, tcp = c.read("src/rendezvous_mediator.rs"), c.read("libs/hbb_common/src/tcp.rs")
     c.fact("Direct IP listener on all interfaces",
            "hbb_common::tcp::listen_any(" in med and "Ipv6Addr::UNSPECIFIED), port)" in tcp
@@ -1125,14 +1249,12 @@ def run_checks(root):
          "Windows exe-name license (sets rendezvous and API server)"),
         ("src/common.rs", "pub fn read_custom_client(config: &str) {",
          "custom.txt reader (writes OVERWRITE_SETTINGS)"),
-        (HBB, "pub fn get_rendezvous_servers() -> Vec<String> {",
-         "rendezvous server list (rendezvous-servers option, serial path)"),
+        ("src/common.rs", "fn get_api_server_(api: String, custom: String) -> String {",
+         "API server lookup (none derived from the rendezvous server: no audit posts)"),
     ):
         first = first_statement(c.read(rel), sig)
         c.fact(f"{what} returns before doing anything",
                first is not None and re.match(r"(if true \{ )?(return\b|bail!)", first), f"{rel}: {first!r}")
-    c.fact("rendezvous-servers locked empty", locked.get("rendezvous-servers") == "",
-           locked.get("rendezvous-servers"))
     body = fn_body(cfg, "pub fn get_rendezvous_server() -> String {") or ""
     c.fact("no rendezvous server read from the config file",
            body and "rendezvous_server = CONFIG2" not in body and "get_rendezvous_servers()" in body)
@@ -1171,19 +1293,15 @@ def run_checks(root):
     c.fact("update hooks landed in upstream files (ADR 0004)", not missing, "; ".join(missing))
     activate_link_checks(c)
 
-    hits, index = [], []
+    hits = []
     for base in ("src", "libs", "flutter/lib"):
         for p in sorted((c.root / base).rglob("*")):
             if p.suffix not in (".rs", ".dart") or not p.is_file() or "/lang/" in p.as_posix():
                 continue
             code = strip_tests_and_comments(p.read_text(encoding="utf-8", errors="replace"))
             hits += [f"{p.relative_to(c.root)}: {h}" for h in PUBLIC_SERVER.findall(code)]
-            index += [f"{p.relative_to(c.root)}: {h}" for h in re.findall(r"RENDEZVOUS_SERVERS\[[^\]]*\]", code)]
-    c.fact("no shipped code names a RustDesk public server", not hits, "; ".join(hits[:10]))
-    c.fact("no code indexes the empty RENDEZVOUS_SERVERS (id@public panics)", not index, "; ".join(index))
-    public = re.search(r"if other_server == PUBLIC_SERVER \{(.*?)\} else", c.read("src/client.rs"), re.S)
-    c.fact("id@public peer fails with an error", public is not None and "split_first()" in public.group(1)
-           and "bail!(" in public.group(1), public and public.group(1)[:200])
+            hits += [f"{p.relative_to(c.root)}: RustDesk's server key" for _ in range(code.count(RUSTDESK_KEY))]
+    c.fact("no shipped code names a RustDesk public server or its key", not hits, "; ".join(hits[:10]))
 
     # banned codecs and the Mac build flags (releases build locally: boring/release/build-mac)
     bad = []

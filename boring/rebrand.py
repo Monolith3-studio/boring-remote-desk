@@ -28,9 +28,15 @@ FORK_URL = "https://github.com/Monolith3-studio/boring-remote-desk"  # our sourc
 # The one place RustDesk is named (AGPL attribution), as plain text on the About page.
 LEGAL_LINE = f"Based on RustDesk, \u00a9 Purslane Tech Pte. Ltd., AGPL-3.0. Source: {FORK_URL}"
 # Tailscale's address ranges, both tailnet-only: IPv4 CGNAT and the IPv6 ULA a
-# MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
-# as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
+# MagicDNS AAAA answer points at. The connect box sends a name Direct IP only when it
+# resolves into them (a tailnet name). No longer a whitelist (ADR 0005).
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
+# The Hosted servers (ADR 0005): our unmodified hbbs + hbbr. The only rendezvous host the app
+# knows; the relay follows it. Their server key's public half is checked in next to this file,
+# the same bytes as boring-remote-servers' keys/id_ed25519.pub, and baked in as RS_PUB_KEY.
+HOSTED = "rs.theboringremote.com"
+SERVER_KEY_FILE = pathlib.Path(__file__).resolve().parent / "server-key.pub"
+RUSTDESK_PUB_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="  # RustDesk's public servers' key
 
 # What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
@@ -44,16 +50,23 @@ UI_KEYS = [
     "Also clear trusted Controllers", SESSION_SET_FAILED, "Trusted Controllers",
     "None yet. A computer connecting for the first time needs a click here.",
 ]
-LANG_KEYS = [NOT_FOUND] + UI_KEYS
+MACHINE_ID_LABEL = "Machine ID"  # the Target's ID on its home page (ticket 07, glossary)
+LANG_KEYS = [NOT_FOUND, MACHINE_ID_LABEL] + UI_KEYS
 # The login to a tailnet name signs the address it resolved to (ticket 06, src/trust_policy.rs).
 NOTE_DIALED = "crate::trust_policy::note_dialed(peer, addr.ip());\n"
 # Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
 # out (check.py derives them from TAILNET and compares).
 TAILNET_RESOLVER = f"""
-// boring-remote: connect by tailnet name. A name (with or without a port) goes
-// through the system resolver, which covers MagicDNS, and connects Direct IP only
-// if every address it resolves to is a Tailscale one. Anything else is refused.
+// boring-remote: connect by Machine ID or tailnet name (ADR 0005). A Machine ID (digits only)
+// goes through the Hosted servers. Any other name (with or without a port) goes through the
+// system resolver, which covers MagicDNS, and connects Direct IP only if every address it
+// resolves to is a Tailscale one. Anything else is refused.
 const BORING_NOT_FOUND: &str = "{NOT_FOUND}";
+
+/// A Machine ID the Hosted servers issue: digits only. Never an address, a name or id@server.
+pub(crate) fn boring_is_machine_id(peer: &str) -> bool {{
+    !peer.is_empty() && peer.len() <= 20 && peer.bytes().all(|b| b.is_ascii_digit())
+}}
 
 pub(crate) fn boring_is_tailnet(addr: SocketAddr) -> bool {{
     match hbb_common::try_into_v4(addr).ip() {{
@@ -82,16 +95,31 @@ async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {{
 
 GUARD = "if true { return; } // boring-remote: stripped"
 GUARD_OK = "if true { return Ok(()); } // boring-remote: stripped"
+GUARD_EMPTY = 'if true { return "".to_owned(); } // boring-remote: no API server (spec slice 2)'
+# First statements of hbb_common's two server getters (ADR 0005): every override (exe name,
+# Settings, PROD_RENDEZVOUS_SERVER, the config file, rendezvous-servers, the serial path)
+# is skipped, so the answer is always the Hosted servers.
+FORCE_SERVERS = ("        if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
+                 " // boring-remote: the Hosted servers only\n")
+FORCE_SERVER = ('        if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
+                " // boring-remote: the Hosted servers only\n")
+# In Client::_start, after the IP branch: a Machine ID falls through to upstream's rendezvous
+# path; anything else is a tailnet name and connects Direct IP (tailnet first: ticket 08).
+MACHINE_ID_GUARD = (
+    "        // boring-remote: a Machine ID goes through the Hosted servers (ADR 0005). Anything\n"
+    "        // else that is not an IP is a tailnet name, never an ID or id@server.\n"
+    "        if !boring_is_machine_id(peer) {\n")
 
 LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows them fixed
-    "whitelist": TAILNET,
-    "direct-server": "Y",
-    "custom-rendezvous-server": "",
-    "relay-server": "",
-    "api-server": "",
+    # Servers (ADR 0005): ours, forced, never blank. "key" (the baked server key) is added by
+    # server_patches(). No whitelist: Machine-ID connections arrive from anywhere.
+    "direct-server": "Y",  # the tailnet path: Direct IP to a tailnet address
+    "custom-rendezvous-server": HOSTED,
+    "relay-server": HOSTED,
+    "api-server": "",  # no API server (spec slice 2); get_api_server_ derives none either
     "allow-auto-update": "N",
     "enable-lan-discovery": "N",  # no answering LAN pings with ID, hostname, user, MAC
-    "rendezvous-servers": "",     # a server list the config file could otherwise carry
+    "rendezvous-servers": HOSTED,  # a server list the config file could otherwise carry
     # ticket 05: permanent password only; no one-time password, no Controller-side config edits
     "verification-method": "use-permanent-password",
     "temporary-password-length": "10",  # moot with the line above; pinned in case it goes
@@ -194,53 +222,40 @@ PATCHES = [
          "LaunchDaemon label (install update)"),
     )
 ] + [
-    # --- servers: none ------------------------------------------------------
+    # --- servers: the Hosted servers only (ADR 0005) ------------------------
     (HBB, 'pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];',
-     "pub const RENDEZVOUS_SERVERS: &[&str] = &[];", "no public rendezvous server"),
+     f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{HOSTED}"];', "the Hosted servers, no public one"),
     ("libs/hbb_common/src/lib.rs", 'const URL: &str = "https://api.rustdesk.com/version/latest";',
      'const URL: &str = "";', "no version check endpoint"),
     ("src/common.rs", '    "https://admin.rustdesk.com".to_owned()\n',
      '    "".to_owned()\n', "no default API server"),
+    ("src/common.rs", "fn get_api_server_(api: String, custom: String) -> String {\n",
+     f"fn get_api_server_(api: String, custom: String) -> String {{\n    {GUARD_EMPTY}\n",
+     "no API server, none derived from the rendezvous server (no audit posts, no account calls)"),
     (HBB, "    pub fn get_rendezvous_servers() -> Vec<String> {\n",
-     "    pub fn get_rendezvous_servers() -> Vec<String> {\n"
-     "        if true { return Vec::new(); } // boring-remote: stripped\n",
-     "no server list from the exe name, rendezvous-servers or the serial path"),
+     "    pub fn get_rendezvous_servers() -> Vec<String> {\n" + FORCE_SERVERS,
+     "server list is ours: not from the exe name, rendezvous-servers or the serial path"),
+    (HBB, "    pub fn get_rendezvous_server() -> String {\n",
+     "    pub fn get_rendezvous_server() -> String {\n" + FORCE_SERVER,
+     "rendezvous server is ours: not from the exe name, Settings, PROD or the config file"),
     (HBB, "            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();\n",
      "            // boring-remote: no rendezvous server from the config file\n",
      "no rendezvous server from the config file"),
-    ("src/client.rs",
-     "            if other_server == PUBLIC_SERVER {\n"
-     "                (\n"
-     "                    check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),\n"
-     "                    RENDEZVOUS_SERVERS[1..]\n"
-     "                        .iter()\n",
-     "            if other_server == PUBLIC_SERVER {\n"
-     "                // boring-remote: the list is empty, so id@public is an error, not a panic\n"
-     "                let Some((first, rest)) = RENDEZVOUS_SERVERS.split_first() else {\n"
-     '                    bail!("Boring Remote has no public server: connect by tailnet address");\n'
-     "                };\n"
-     "                (\n"
-     "                    check_port(*first, RENDEZVOUS_PORT),\n"
-     "                    rest.iter()\n",
-     "id@public peer fails cleanly"),
-    # --- tailnet name: connect box takes a tailnet name, never an ID --------------
+    # --- connect box: a Machine ID through the Hosted servers, else a tailnet name ----
     ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      TAILNET_RESOLVER + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
-     "tailnet name resolver"),
+     "Machine ID test and tailnet name resolver"),
     ("src/client.rs",
      "        // Allow connect to {domain}:{port}\n"
      "        if hbb_common::is_domain_port_str(peer) {\n"
      "            return Ok((\n"
      "                (\n"
      "                    connect_tcp_local(peer, None, CONNECT_TIMEOUT).await?,\n",
-     "        // boring-remote: anything that is not an IP is a tailnet name, never an ID.\n"
-     "        // There is no rendezvous server, so the ID path below can't be reached.\n"
-     "        if true {\n"
-     "            return Ok((\n"
+     MACHINE_ID_GUARD + "            return Ok((\n"
      "                (\n"
      "                    connect_tcp_local(boring_tailnet_addr(peer).await?, None, CONNECT_TIMEOUT)\n"
      "                        .await?,\n",
-     "names connect Direct IP to a tailnet address; no ID/rendezvous path"),
+     "a Machine ID takes the Hosted path; any other name connects Direct IP to a tailnet address"),
     # --- lock bypasses: these write past OVERWRITE_SETTINGS ------------------
     ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n",
      "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n"
@@ -248,11 +263,9 @@ PATCHES = [
      "exe name cannot set the rendezvous, API or relay server"),
     ("src/common.rs", "pub fn read_custom_client(config: &str) {\n",
      f"pub fn read_custom_client(config: &str) {{\n    {GUARD}\n",
-     "custom.txt cannot rewrite OVERWRITE_SETTINGS (whitelist, servers)"),
+     "custom.txt cannot rewrite OVERWRITE_SETTINGS (servers, key)"),
     # --- locked settings ----------------------------------------------------
-    (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
-     "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(LOCKED) + ";",
-     "whitelist, Direct IP, empty servers, no auto update, no LAN discovery"),
+    # OVERWRITE_SETTINGS (LOCKED plus the server key) is in server_patches().
     (HBB, "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(DEFAULTS) + ";",
      "allow-only-conn-window-open off by default"),
@@ -798,7 +811,16 @@ PATCHES += [
 # always get the click.
 # The key is proven against this connection: its challenge, the address it arrived on and the
 # address it came from (both tailnet, or the login has no name to sign and clicks).
-LOGIN_KEY = "crate::trust_policy::login_key(&lr, &self.hash.challenge, self.stream.local_addr().ip(), &self.ip)"
+# The Target's own Machine ID counts as a signed name only on a connection keyed to its signed
+# identity (ticket 07); the Controller signs it only on a session it verified (VERIFY_ON_START).
+LOGIN_KEY = ("crate::trust_policy::login_key(\n"
+             "                            &lr,\n"
+             "                            &self.hash.challenge,\n"
+             "                            self.stream.local_addr().ip(),\n"
+             "                            &self.ip,\n"
+             "                            &Config::get_id(),\n"
+             "                            self.stream.is_secured(),\n"
+             "                        )")
 TRUST_GATE = (
     "                    // boring-remote: a Controller that doesn't prove a trusted key also needs\n"
     "                    // a click on this computer (ticket 06). Every prompt counts against this\n"
@@ -878,8 +900,24 @@ _AUTHORIZE = ("                        ipc::Data::Authorize => {\n"
               "                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);\n")
 _LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n"
           "            if !self.check_login_scope(&lr).await {\n")
-SIGN_LOGIN = ("        // boring-remote: sign this login for the Target's trusted list (ticket 06).\n"
-              "        crate::trust_policy::sign_login(&mut lr, &self.hash.challenge);\n")
+SIGN_LOGIN = ("        // boring-remote: sign this login for the Target's trusted list (tickets 06, 07).\n"
+              "        crate::trust_policy::sign_login(&mut lr, &self.hash.challenge, self.boring_verified_target.as_deref());\n")
+# Ticket 07: every connection records whether it verified the Target's Machine ID against the
+# baked server key (src/trust_policy.rs verified_target); the login signs that ID only then.
+# Cleared first, so a reconnect or a failed connect never keeps an older session's answer.
+VERIFIED_FIELD = ("    pub other_server: Option<(String, String, String)>,\n"
+                  "    /// boring-remote: the Machine ID this connection verified (ticket 07), else None.\n"
+                  "    pub boring_verified_target: Option<String>,\n")
+VERIFY_CLEAR = ("        interface.update_direct(None);\n"
+                "        interface.update_received(false);\n"
+                "        interface.get_lch().write().unwrap().boring_verified_target = None; // boring-remote (ticket 07)\n")
+VERIFY_ON_START = (
+    "            Ok(x) => {\n"
+    "                // boring-remote: sign this Machine ID's login only if this connection verified\n"
+    "                // the Target against the baked server key (ticket 07).\n"
+    "                interface.get_lch().write().unwrap().boring_verified_target =\n"
+    "                    crate::trust_policy::verified_target(peer, key, x.0 .2.as_deref(), x.0 .0.is_secured());\n")
+_START_OK = "            Ok(x) => {\n                // Set x.2 to true only in the connect() function"
 _LOGIN_BUILT = "        };\n        match self.conn_type {\n            ConnType::FILE_TRANSFER => lr.set_file_transfer(FileTransfer {\n"
 # Upstream stores the Target's Hash only after sending the login; the signature needs it first.
 HASH_FIRST_OLD = ("    send_login(lc.clone(), String::new(), String::new(), password, peer).await;\n"
@@ -907,6 +945,15 @@ PATCHES += [
     ("src/client.rs", _LOGIN_BUILT, _LOGIN_BUILT.replace("        match self", SIGN_LOGIN + "        match self", 1),
      "Controller signs each login with its own key"),
     ("src/client.rs", HASH_FIRST_OLD, HASH_FIRST_NEW, "the login knows the Target's challenge before it is built"),
+    ("src/client.rs", VERIFIED_FIELD.split("    /// boring")[0], VERIFIED_FIELD,
+     "the login config remembers the Machine ID its connection verified"),
+    ("src/client.rs", VERIFY_CLEAR.rsplit("        interface.get_lch", 1)[0], VERIFY_CLEAR,
+     "a new connection forgets the last one's verified Machine ID"),
+    ("src/client.rs", _START_OK, _START_OK.replace("            Ok(x) => {\n", VERIFY_ON_START, 1),
+     "a connection that verified the Target against the baked server key records its Machine ID"),
+    (HOME, '                          translate("ID"),\n',
+     f'                          translate("{MACHINE_ID_LABEL}"), // boring-remote (ticket 07)\n',
+     "the Target shows its Machine ID"),
     ("src/server/connection.rs", _PW_OK, TRUST_GATE + _PW_OK,
      "unknown Controller waits for a click after the right password"),
     ("src/server/connection.rs", _AUTHORIZE,
@@ -971,6 +1018,36 @@ def _lang_value(m):
     return m.group(1) + value + m.group(3)
 
 
+def read_server_key(path):
+    """(the Hosted servers' public key as base64, None) or (None, why it can't be baked)."""
+    import base64
+    try:
+        text = pathlib.Path(path).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as e:
+        return None, f"missing or unreadable ({e.__class__.__name__})"
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError:
+        return None, "not base64"
+    if len(raw) != 32 or base64.b64encode(raw).decode() != text:
+        return None, f"not a 32-byte Ed25519 public key ({len(raw)} bytes)"
+    if text == RUSTDESK_PUB_KEY:
+        return None, "RustDesk's public servers' key, not ours"
+    return text, None
+
+
+def server_patches(key):
+    """The patches that bake the server key: RS_PUB_KEY and the locked "key" option."""
+    return [
+        (HBB, f'pub const RS_PUB_KEY: &str = "{RUSTDESK_PUB_KEY}";', f'pub const RS_PUB_KEY: &str = "{key}";',
+         "the Hosted servers' key, baked in (only Boring Remote builds use them)"),
+        (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+         "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = "
+         + _rust_map({**LOCKED, "key": key}) + ";",
+         "servers and key forced to ours, Direct IP, no auto update, no LAN discovery, password + click"),
+    ]
+
+
 def _read(path):
     """(text with LF endings, True if the file uses CRLF), or (None, False) if missing.
 
@@ -1007,7 +1084,10 @@ def plan(root):
     Returns (writes {rel: bytes}, deletes [rel], changed [msg], moved [msg])."""
     root = pathlib.Path(root)
     changed, moved, texts = [], [], {}
-    for rel, old, new, why in PATCHES:
+    key, why_not = read_server_key(SERVER_KEY_FILE)
+    if why_not:
+        moved.append(f"{SERVER_KEY_FILE.name}: server key {why_not}")
+    for rel, old, new, why in PATCHES + server_patches(key or "<no server key>"):
         if rel not in texts:
             texts[rel] = _read(root / rel)
         text, crlf = texts[rel]

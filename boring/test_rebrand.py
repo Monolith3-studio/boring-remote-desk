@@ -6,6 +6,9 @@ Needs git and an initialised libs/hbb_common submodule. Each test exports a
 fresh tree (committed HEAD of the repo and of the submodule) into a temp dir,
 so your working tree is never touched.
 """
+import base64
+import contextlib
+import io
 import pathlib
 import re
 import shutil
@@ -20,11 +23,12 @@ import check  # noqa: E402  (shares the installer-string reader with check.py)
 import rebrand  # noqa: E402
 
 REPO = HERE.parent
-CONNECT_DIRECT = "connect box never reaches the ID/rendezvous path"
+CONNECT_DIRECT = "connect box: only a Machine ID reaches the rendezvous path; names connect Direct IP"
 CONNECT_TAILNET = "names connect Direct IP only to Tailscale addresses, else the plain error"
 NOT_FOUND_TRANSLATED = "plain not-found error is in every translation file"
 REBRAND = HERE / "rebrand.py"
 CHECK = HERE / "check.py"
+WHITELIST_FIRST = "a whitelist the buyer sets is still checked first on incoming connections"
 REMOTE_CONFIG = "allow-remote-config-modification locked off (a UI hint; the session guard holds the settings)"
 HBB = rebrand.HBB
 PROTOCOL = "protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)"
@@ -73,7 +77,7 @@ class RebrandSeam(unittest.TestCase):
     def test_check_fails_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
         self.assertNotEqual(r.returncode, 0)
-        for fact in ("rendezvous servers empty", "whitelist", "app name", "hwcodec",
+        for fact in ("the only rendezvous server is rs.theboringremote.com", "whitelist", "app name", "hwcodec",
                      "MSI product name", "MSI banner art"):
             self.assertIn(fact, r.stdout)
         for fact in ("no RustDesk name or link in the Mac and Windows app's strings",
@@ -208,12 +212,12 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", self.WHITELIST_CALL, "")
         self.edit("src/server/connection.rs", "        self.ip = addr.ip().to_string();\n",
                   "        self.ip = addr.ip().to_string();\n" + self.WHITELIST_CALL)
-        self.assert_check_fails("whitelist is enforced on incoming connections")
+        self.assert_check_fails(WHITELIST_FIRST)
 
     def test_dropping_v4_mapped_normalisation_fails_check(self):
         self.rebrand()
         self.edit("src/server/connection.rs", "        let addr = hbb_common::try_into_v4(addr);\n", "")
-        self.assert_check_fails("whitelist is enforced on incoming connections")
+        self.assert_check_fails(WHITELIST_FIRST)
 
     def test_changed_protocol_file_fails_check(self):
         self.rebrand()
@@ -306,7 +310,7 @@ class RebrandSeam(unittest.TestCase):
     # --- connect by tailnet name ----------------------------------
     def test_domain_port_branch_back_in_connect_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        if true {\n            return Ok((\n                (\n"
+        self.edit("src/client.rs", "        if !boring_is_machine_id(peer) {\n            return Ok((\n                (\n"
                   "                    connect_tcp_local(boring_tailnet_addr(peer).await?",
                   "        if hbb_common::is_domain_port_str(peer) {\n            return Ok((\n                (\n"
                   "                    connect_tcp_local(boring_tailnet_addr(peer).await?")
@@ -314,9 +318,9 @@ class RebrandSeam(unittest.TestCase):
 
     def test_rendezvous_lookup_before_the_tailnet_guard_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        // boring-remote: anything that is not an IP is a tailnet name",
+        self.edit("src/client.rs", "        // boring-remote: a Machine ID goes through the Hosted servers",
                   "        let _ = crate::get_rendezvous_server(1_000).await;\n"
-                  "        // boring-remote: anything that is not an IP is a tailnet name")
+                  "        // boring-remote: a Machine ID goes through the Hosted servers")
         self.assert_check_fails(CONNECT_DIRECT)
 
     def test_non_tailnet_answer_accepted_fails_check(self):
@@ -363,7 +367,7 @@ class RebrandSeam(unittest.TestCase):
     SHOWN_ONCE = "the new password closes only on I've saved it, and Reset asks before replacing"
     CLIPBOARD = "a copied password leaves the clipboard after a minute"
     ONE_TIME_LABEL = "one-time password label hidden when it is off (desktop and mobile)"
-    UI_KEYS = "new UI strings (tickets 05, 06) have a key in every translation file"
+    UI_KEYS = "new UI strings (tickets 05, 06, 07) have a key in every translation file"
 
     def test_password_lock_facts_pass_after_rebrand(self):
         self.rebrand()
@@ -782,8 +786,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_signature_naming_the_claimed_target_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    let target = target_name(arrived_on, from)?;\n",
-                  "    let target = lr.username.clone();\n")
+        self.edit("src/trust_policy.rs", "    target_names(arrived_on, from, own_id, secured)\n        .iter()",
+                  "    [lr.username.clone()]\n        .iter()")
         self.assert_check_fails(self.PROOF)
 
     def test_target_named_by_a_relay_or_lan_arrival_address_fails_check(self):
@@ -795,8 +799,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_gate_key_not_proven_against_this_connection_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", "self.stream.local_addr().ip(), &self.ip)",
-                  'self.stream.local_addr().ip(), "100.64.0.1")')
+        self.edit("src/server/connection.rs", "self.stream.local_addr().ip(),\n                            &self.ip,",
+                  'self.stream.local_addr().ip(),\n                            "100.64.0.1",')
         self.assert_check_fails(self.PROOF)
 
     def test_controller_signing_a_lan_address_fails_check(self):
@@ -895,6 +899,267 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("src/trust_policy.rs", "    trusted\n}\n", "    save(&trusted);\n    trusted\n}\n")
         self.assert_check_fails(self.TRUST_LIST)
+
+    # --- ticket 07: the Hosted path (ADR 0005) ----------------------------------------
+    # Independent of rebrand.py and check.py: the servers' public key as Jason published it
+    # (boring-remote-servers keys/id_ed25519.pub) and the domain from the spec.
+    SERVERS_PUB = "2hUye2snQY5Roz1FXgypyJQwCjUuNcIX08ukFeo6TYk="
+    HOST = "rs.theboringremote.com"
+    ONLY_HOST = "the only rendezvous server is rs.theboringremote.com (ADR 0005)"
+    FORCED = "rendezvous server and list are always ours (exe name, Settings, config file, serial path skipped)"
+    LOCKED_SERVERS = "server settings locked to rs.theboringremote.com (relay follows; no API server)"
+    BAKED = "baked server key is server-key.pub (built-in key and locked key option)"
+    NO_WHITELIST = "no Tailscale whitelist left (ADR 0005)"
+    PUBLIC = "no shipped code names a RustDesk public server or its key"
+    MACHINE_ID = "the Target shows its Machine ID and keeps it across restarts (made once, then read from its config)"
+    HOSTED_SIGNED = ("Controllers sign a Machine-ID login only on a session that verified the Target "
+                     "against the baked server key")
+
+    def locked(self):
+        return check.rust_map((self.root / HBB).read_text(), "OVERWRITE_SETTINGS")
+
+    def test_hosted_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.ONLY_HOST, self.FORCED, self.LOCKED_SERVERS, self.BAKED, self.NO_WHITELIST,
+                     self.PUBLIC, self.MACHINE_ID, self.HOSTED_SIGNED, CONNECT_DIRECT, self.PROOF, self.SIGNED):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_hosted_facts_fail_on_clean_upstream_tree(self):
+        r = run(CHECK, self.root)
+        for fact in (self.ONLY_HOST, self.FORCED, self.LOCKED_SERVERS, self.BAKED, self.MACHINE_ID,
+                     self.HOSTED_SIGNED):
+            self.assertIn(f"FAIL {fact}", r.stdout)
+
+    def test_rendezvous_host_is_exactly_ours(self):
+        self.rebrand()
+        cfg = (self.root / HBB).read_text()
+        self.assertIn(f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{self.HOST}"];', cfg)
+        self.assertNotIn("rs-ny.rustdesk.com", cfg)
+
+    def test_baked_key_equals_the_checked_in_public_key(self):
+        self.rebrand()
+        self.assertEqual((HERE / "server-key.pub").read_text().strip(), self.SERVERS_PUB)
+        cfg = (self.root / HBB).read_text()
+        self.assertIn(f'pub const RS_PUB_KEY: &str = "{self.SERVERS_PUB}";', cfg)
+        self.assertEqual(self.locked().get("key"), self.SERVERS_PUB)
+        self.assertNotIn("OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=", cfg)
+
+    def test_whitelist_is_gone(self):
+        self.rebrand()
+        self.assertNotIn("whitelist", self.locked())
+        self.assertNotIn("100.64.0.0/10", (self.root / HBB).read_text())
+
+    def test_overrides_force_our_values(self):
+        self.rebrand()
+        locked = self.locked()
+        for key in ("custom-rendezvous-server", "relay-server", "rendezvous-servers"):
+            self.assertEqual(locked.get(key), self.HOST, key)
+        self.assertEqual(locked.get("api-server"), "")
+        cfg = (self.root / HBB).read_text()
+        self.assertEqual(check.first_statement(cfg, "pub fn get_rendezvous_server() -> String {"),
+                         'if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
+                         " // boring-remote: the Hosted servers only")
+        self.assertTrue(check.first_statement(cfg, "pub fn get_rendezvous_servers() -> Vec<String> {")
+                        .startswith("if true { return RENDEZVOUS_SERVERS.iter()"))
+        common = (self.root / "src/common.rs").read_text()
+        for sig in ("pub fn read_custom_client(config: &str) {", "fn get_api_server_(api: String, custom: String) -> String {"):
+            self.assertTrue(check.first_statement(common, sig).startswith("if true { return"), sig)
+        self.assertTrue(check.first_statement((self.root / "src/platform/windows.rs").read_text(),
+                        "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {").startswith("if true { bail!"))
+
+    def rebrand_with_key(self, text):
+        """rebrand.py run from a copy of boring/ whose server-key.pub holds `text` (None: missing)."""
+        copy = self.tmp / "boring"
+        shutil.copytree(HERE, copy, ignore=shutil.ignore_patterns("__pycache__"))
+        key = copy / "server-key.pub"
+        key.unlink()
+        if text is not None:
+            key.write_text(text)
+        return run(copy / "rebrand.py", self.root)
+
+    def test_missing_or_malformed_server_key_stops_the_rebrand_and_writes_nothing(self):
+        before = tree_hashes(self.root)
+        for text in (None, "", "not a key", "AAAA", self.SERVERS_PUB[:-4] + "!!!=",
+                     "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="):
+            r = self.rebrand_with_key(text)
+            self.assertEqual(r.returncode, 2, f"{text!r}: {r.stdout}{r.stderr}")
+            self.assertIn("server-key.pub: server key", r.stderr)
+            self.assertEqual(before, tree_hashes(self.root), repr(text))
+            shutil.rmtree(self.tmp / "boring")
+        r = self.rebrand_with_key(self.SERVERS_PUB + "\n")  # a trailing newline is fine
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def check_with_key_file(self, text):
+        saved = check.SERVER_KEY
+        check.SERVER_KEY = self.tmp / "server-key.pub"
+        check.SERVER_KEY.write_text(text)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                check.run_checks(self.root)
+        finally:
+            check.SERVER_KEY = saved
+        return out.getvalue()
+
+    def test_baked_key_differing_from_the_checked_in_file_fails_check(self):
+        self.rebrand()
+        other = base64.b64encode(bytes(range(32))).decode()
+        self.assertIn(f"FAIL {self.BAKED}", self.check_with_key_file(other))
+        self.assertIn(f"FAIL {self.BAKED}", self.check_with_key_file("garbage"))
+        self.assertIn(f"PASS {self.BAKED}", self.check_with_key_file(self.SERVERS_PUB))
+
+    def test_mismatched_built_in_key_fails_check(self):
+        self.rebrand()
+        other = base64.b64encode(bytes(range(32))).decode()
+        self.edit(HBB, f'pub const RS_PUB_KEY: &str = "{self.SERVERS_PUB}";', f'pub const RS_PUB_KEY: &str = "{other}";')
+        self.assert_check_fails(self.BAKED)
+
+    def test_mismatched_locked_key_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, f'("key", "{self.SERVERS_PUB}")', '("key", "")')
+        self.assert_check_fails(self.BAKED)
+
+    def test_tailscale_whitelist_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("direct-server", "Y")', f'("whitelist", "{rebrand.TAILNET}"), ("direct-server", "Y")')
+        self.assert_check_fails(self.NO_WHITELIST)
+
+    def test_default_whitelist_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("allow-only-conn-window-open", "N")',
+                  '("allow-only-conn-window-open", "N"), ("whitelist", "100.64.0.0/10")')
+        self.assert_check_fails(self.NO_WHITELIST)
+
+    def test_public_rustdesk_host_fails_check(self):
+        self.rebrand()
+        for planted in ('const SNEAKY: &str = "rs-ny.rustdesk.com";\n',
+                        'const SNEAKY: &str = "rs-sg.rustdesk.com:21116";\n',
+                        'const SNEAKY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";\n'):
+            path = self.root / "src/trust_policy.rs"
+            saved = path.read_text()
+            path.write_text(saved + planted)
+            self.assert_check_fails(self.PUBLIC)
+            path.write_text(saved)
+
+    def test_second_rendezvous_server_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, f'&["{self.HOST}"]', f'&["{self.HOST}", "rs.example.com"]')
+        self.assert_check_fails(self.ONLY_HOST)
+
+    def test_config_file_server_override_back_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, "        if true { return format!(", "        if false { return format!(")
+        self.assert_check_fails(self.FORCED)
+
+    def test_serial_path_server_list_back_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, "        if true { return RENDEZVOUS_SERVERS.iter()", "        if false { return RENDEZVOUS_SERVERS.iter()")
+        self.assert_check_fails(self.FORCED)
+
+    def test_blank_relay_server_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, f'("relay-server", "{self.HOST}")', '("relay-server", "")')
+        self.assert_check_fails(self.LOCKED_SERVERS)
+
+    def test_api_server_derived_again_fails_check(self):
+        self.rebrand()
+        self.edit("src/common.rs", '    if true { return "".to_owned(); } // boring-remote: no API server (spec slice 2)\n', "")
+        self.assert_check_fails("API server lookup (none derived from the rendezvous server: no audit posts) "
+                                "returns before doing anything")
+
+    def test_id_at_server_taking_the_rendezvous_path_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "peer.bytes().all(|b| b.is_ascii_digit())",
+                  "peer.bytes().all(|b| b.is_ascii_digit() || b == b'@' || b == b'.')")
+        self.assert_check_fails(CONNECT_DIRECT)
+
+    def test_target_hiding_its_machine_id_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, "      if (!isOutgoingOnly) buildIDBoard(context),\n", "")
+        self.assert_check_fails(self.MACHINE_ID)
+
+    def test_machine_id_regenerated_each_start_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, "        let mut id = CONFIG.read().unwrap().id.clone();\n        if id.is_empty() {\n",
+                  "        let mut id = CONFIG.read().unwrap().id.clone();\n        if true {\n")
+        self.assert_check_fails(self.MACHINE_ID)
+
+    def test_machine_id_label_missing_from_a_language_fails_check(self):
+        self.rebrand()
+        self.edit("src/lang/de.rs", '        ("Machine ID", ""),\n', "")
+        self.assert_check_fails(self.UI_KEYS)
+
+    # Controller side: sign a Machine ID only on a session verified against the baked key.
+    def test_signing_on_the_plaintext_fallback_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", " && target_pk.is_some() && secured)", " && target_pk.is_some())")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_signing_without_the_servers_word_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", " && baked && target_pk.is_some() && secured)", " && baked && secured)")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_signing_under_another_servers_key_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    let baked = key.is_empty() || key == hbb_common::config::RS_PUB_KEY;\n",
+                  "    let baked = !key.is_empty();\n")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_signing_a_machine_id_the_session_did_not_verify_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "verified.filter(|v| *v == peer).map(str::to_owned)",
+                  "verified.map(|_| peer.to_owned())")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_verified_machine_id_kept_across_connections_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.VERIFY_CLEAR, rebrand.VERIFY_CLEAR.rsplit("        interface.get_lch", 1)[0])
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_verified_machine_id_set_elsewhere_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        crate::trust_policy::sign_login(",
+                  "        let _ = &self.boring_verified_target;\n        crate::trust_policy::sign_login(")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_login_signed_with_its_own_id_as_verified_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "self.boring_verified_target.as_deref());", "Some(&self.id));")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_stream_keyed_outside_the_verified_branch_fails_check(self):
+        # is_secured() would no longer mean the Target's signed identity checked out.
+        self.rebrand()
+        self.edit("src/client.rs", "                // non-secure path with is_secured() false",
+                  "                conn.set_key(secretbox::gen_key());\n                // non-secure path with is_secured() false")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_target_key_taken_without_the_servers_signature_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "                    if id == peer_id {\n                        sign_pk = Some(sign::PublicKey(pk));",
+                  "                    if true {\n                        sign_pk = Some(sign::PublicKey(pk));")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    # Target side: its Machine ID is a signed name only on a keyed connection.
+    def test_machine_id_name_on_an_unkeyed_connection_fails_check(self):
+        self.rebrand()
+        self.edit("src/trust_policy.rs", "    if secured && crate::client::boring_is_machine_id(own_id) {",
+                  "    if crate::client::boring_is_machine_id(own_id) {")
+        self.assert_check_fails(self.PROOF)
+
+    def test_gate_claiming_every_connection_is_keyed_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                            self.stream.is_secured(),\n",
+                  "                            true,\n")
+        self.assert_check_fails(self.PROOF)
+
+    def test_gate_naming_the_claimed_machine_id_fails_check(self):
+        self.rebrand()
+        self.edit("src/server/connection.rs", "                            &Config::get_id(),\n",
+                  "                            &lr.username,\n")
+        self.assert_check_fails(self.PROOF)
 
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",
