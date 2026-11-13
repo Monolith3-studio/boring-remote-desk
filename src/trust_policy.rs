@@ -927,18 +927,23 @@ mod tests {
     #[test]
     fn a_login_it_cant_bind_or_built_before_the_challenge_is_left_unsigned() {
         // Returns before the key pair is read.
-        for (challenge, dialed, secured) in [
-            ("", TARGET, false),
-            (CHALLENGE, "192.168.1.5", true),
-            (CHALLENGE, MACHINE_ID, false),
-            ("", MACHINE_ID, true),
+        let lan: IpAddr = "192.168.1.5".parse().unwrap();
+        for (challenge, dialed, secured, reached) in [
+            ("", TARGET, false, None),
+            (CHALLENGE, "192.168.1.5", true, None),
+            (CHALLENGE, MACHINE_ID, false, None),
+            ("", MACHINE_ID, true, None),
+            // ticket 08: a tailnet-first stream binds only a Machine ID reached on a tailnet address
+            ("", MACHINE_ID, false, Some(TARGET_IP)),
+            (CHALLENGE, MACHINE_ID, false, Some(lan)),
+            (CHALLENGE, "192.168.1.5", false, Some(lan)),
         ] {
             let mut lr = LoginRequest {
                 my_id: KNOWN.to_owned(),
                 username: dialed.to_owned(),
                 ..Default::default()
             };
-            sign_login(&mut lr, challenge, secured);
+            sign_login(&mut lr, challenge, secured, reached);
             assert!(lr.boring_login_sig.is_empty() && lr.boring_controller_pk.is_empty(), "{dialed}");
         }
     }
