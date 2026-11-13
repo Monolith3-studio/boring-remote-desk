@@ -89,7 +89,7 @@ class MacHome extends StatefulWidget {
   /// 1.8 (ADR 0005, ticket 07): this computer's Machine ID, what another computer types to reach it
   /// through the Hosted servers from anywhere; null or empty hides it. [hostedOn]: it has a
   /// password made in Settings, so the Hosted servers know it (ticket 09).
-  final String? machineId;
+  final Future<String> Function()? machineId;
   final bool hostedOn;
 
   const MacHome({
@@ -278,7 +278,7 @@ class OutsideBuildingSheet extends StatefulWidget {
   final Future<String?> Function() tailscaleAddress;
 
   /// 1.8: this computer's Machine ID (the Hosted servers' way in); null or empty hides it.
-  final String? machineId;
+  final Future<String> Function()? machineId;
   final bool hostedOn;
   const OutsideBuildingSheet({super.key, required this.tailscaleAddress, this.machineId, this.hostedOn = false});
 
@@ -289,10 +289,19 @@ class OutsideBuildingSheet extends StatefulWidget {
 class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
   late Future<String?> _address = widget.tailscaleAddress();
   bool _copied = false, _idCopied = false;
+  String _id = '';
+
+  @override
+  void initState() {
+    super.initState();
+    widget.machineId?.call().then((id) {
+      if (mounted) setState(() => _id = id);
+    });
+  }
 
   /// 1.8: the Machine ID first; Tailscale is the backup path below it.
   List<Widget> _machineId(TextTheme t, String one) {
-    final id = widget.machineId ?? '';
+    final id = _id;
     if (id.isEmpty) return const [];
     return [
       Text('From anywhere, type this $one\'s Machine ID on the other computer:'),

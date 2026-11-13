@@ -1412,7 +1412,7 @@ MAC_HOME_METHOD = (
     "            macs: usedBefore(),\n"
     "            tailscaleAddress: thisTailscaleAddress,\n"
     "            // 1.8 (ADR 0005): this computer's Machine ID, and whether the Hosted servers know it yet.\n"
-    "            machineId: bind.mainGetMyId(),\n"
+    "            machineId: () => bind.mainGetMyId(),\n"
     "            hostedOn: bind.mainGetOptionSync(key: kBoringPasswordGenerated) == 'Y',\n"
     "            lan: lanMacs.macs,\n"
     "            discover: () => bind.mainDiscover(),\n"
@@ -4424,12 +4424,14 @@ PASSWORD_SETUP_BRANCH = (
     "      return _buildBlock(\n"
     "          child: boringSetupPage(passwordOnly: true, onDone: () => setState(() => _boringPasswordSetup = false)));\n"
     "    }\n")
+# Each lands outside t06's own inserted block (before its state line, after its last init line), so
+# a second rebrand still finds t06's text whole and stays a no-op.
 _SETUP_STATE = "  bool _boringSetup = false; // v1.7 t06: first launch shows Setup until it is finished\n"
-_SETUP_T31 = "    // v1.7 t31: macOS's Quit & Reopen killed Setup partway, also when Settings opened it again.\n"
+_SETUP_T31 = "    if (isMacOS && bind.mainGetLocalOption(key: kSetupStepOption).isNotEmpty) _boringSetup = true;\n"
 _SETUP_BRANCH = "    if ((isMacOS || isWindows) && _boringSetup) {\n"
 PATCHES += [
-    (HOME, _SETUP_STATE, _SETUP_STATE + PASSWORD_SETUP_STATE, "first launch on 1.8: password step state"),
-    (HOME, _SETUP_T31, PASSWORD_SETUP_INIT + _SETUP_T31, "first launch on 1.8: no password made here asks for one"),
+    (HOME, _SETUP_STATE, PASSWORD_SETUP_STATE + _SETUP_STATE, "first launch on 1.8: password step state"),
+    (HOME, _SETUP_T31, _SETUP_T31 + PASSWORD_SETUP_INIT, "first launch on 1.8: no password made here asks for one"),
     (HOME, _SETUP_BRANCH, PASSWORD_SETUP_BRANCH + _SETUP_BRANCH, "first launch on 1.8: Setup's password step alone"),
     ("src/rendezvous_mediator.rs", "                let servers = Config::get_rendezvous_servers();\n", HOSTED_GATE,
      "no Hosted registration until a generated Unattended Password is set"),

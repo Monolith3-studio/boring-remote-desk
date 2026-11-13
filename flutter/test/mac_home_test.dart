@@ -438,7 +438,7 @@ void main() {
 
   testWidgets('outside the building: this computer\'s Machine ID first, Tailscale as the backup', (tester) async {
     await tester.pumpWidget(host(MacHome(
-        macs: const [], tailscaleAddress: () async => null, onConnect: (_) {}, machineId: '123456789', hostedOn: false)));
+        macs: const [], tailscaleAddress: () async => null, onConnect: (_) {}, machineId: () async => '123456789', hostedOn: false)));
     await tester.tap(find.text('Connect from outside the building'));
     await tester.pumpAndSettle();
     expect(find.text('123 456 789'), findsOneWidget);
