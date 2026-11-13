@@ -915,7 +915,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_remove_dropping_the_entry_fails_check(self):
         self.rebrand()
-        self.edit("libs/base/src/trust.rs", "                t.removed = true;\n", "")
+        self.edit("libs/base/src/trust.rs", "            t.removed = true;\n        }\n        true\n", "        }\n        true\n")
         self.assert_check_fails(REMOVED_ASKS)
 
     # --- Always ask for password (per Trusted Controller) ------------------------------
@@ -1301,7 +1301,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_any_key_skipping_allow_fails_check(self):
         self.rebrand()
-        self.edit(self.TRUST_RS, "        matches!(self.by_key, Some(ByKey::Trusted(..)))\n", "        self.by_key.is_some()\n")
+        self.edit(self.TRUST_RS, "        self.trusted.is_some() || matches!(self.by_key, Some(ByKey::Trusted(..)))\n",
+                  "        self.trusted.is_some() || self.by_key.is_some()\n")
         self.assert_check_fails(self.TRUST_GATE)
 
     def test_a_key_overriding_the_tokens_verdict_fails_check(self):
@@ -1649,8 +1650,7 @@ class RebrandSeam(unittest.TestCase):
     # decided from that stream at send time (review M1), and refuse unverified ones (S1).
     def test_signing_a_machine_id_on_an_unkeyed_stream_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "(secured && crate::client::boring_is_machine_id(peer))",
-                  "crate::client::boring_is_machine_id(peer)")
+        self.edit("src/trust_policy.rs", "    if !secured {\n        return None;\n    }\n", "")
         self.assert_check_fails(self.HOSTED_SIGNED)
 
     def test_signing_under_another_servers_key_fails_check(self):
@@ -1673,8 +1673,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_login_signed_without_asking_its_stream_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "sign_login(lr, &challenge, peer.is_secured());",
-                  "sign_login(lr, &challenge, true);")
+        self.edit("src/client.rs", "sign_login(lr, &challenge, peer.is_secured(), link);",
+                  "sign_login(lr, &challenge, true, link);")
         self.assert_check_fails(self.SIGNED)
 
     def test_login_signed_where_it_is_built_fails_check(self):
