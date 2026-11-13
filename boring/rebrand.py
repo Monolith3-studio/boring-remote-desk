@@ -167,6 +167,14 @@ PATCHES = [
      "Mac product reference"),
     ("flutter/macos/Runner.xcodeproj/xcshareddata/xcschemes/Runner.xcscheme",
      'BuildableName = "RustDesk.app"', f'BuildableName = "{APP_NAME}.app"', "Mac scheme"),
+    ("flutter/macos/Podfile", "    flutter_additional_macos_build_settings(target)\n",
+     "    flutter_additional_macos_build_settings(target)\n"
+     "    # boring-remote: a pod set below macOS 12 inherits `platform :osx` (Xcode 27 refuses 10.x)\n"
+     "    target.build_configurations.each do |c|\n"
+     "      t = c.build_settings['MACOSX_DEPLOYMENT_TARGET']\n"
+     "      c.build_settings.delete 'MACOSX_DEPLOYMENT_TARGET' if t && Gem::Version.new(t) < Gem::Version.new('12.0')\n"
+     "    end\n",
+     "Mac pods build with current Xcode"),
     ("flutter/macos/Runner/Info.plist",
      "<key>CFBundleName</key>\n\t<string>$(PRODUCT_NAME)</string>",
      f"<key>CFBundleName</key>\n\t<string>{DISPLAY_NAME}</string>\n"
