@@ -241,6 +241,11 @@ PATCHES = [
     (HBB, "            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();\n",
      "            // boring-remote: no rendezvous server from the config file\n",
      "no rendezvous server from the config file"),
+    # upstream's test sets a custom server and expects it back; ours must ignore it
+    ("src/common.rs", '        assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));\n',
+     "        // boring-remote: a server set in Settings never replaces the Hosted servers\n"
+     f'        assert_eq!(get_tcp_proxy_addr(), format!("{HOSTED}:{{RENDEZVOUS_PORT}}"));\n',
+     "upstream's TCP proxy test expects the Hosted server over a custom one"),
     # --- connect box: a Machine ID through the Hosted servers, else a tailnet name ----
     ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      TAILNET_RESOLVER + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
