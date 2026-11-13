@@ -47,6 +47,10 @@ PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
 # knows, and the key file the build bakes. RustDesk's public servers' key never ships.
 HOSTED = "rs.theboringremote.com"
 SERVER_KEY = pathlib.Path(__file__).resolve().parent / "server-key.pub"
+# The Hosted servers' public key itself, pinned: a key swapped in server-key.pub and baked by the
+# rebrand fails here. Where the servers repo sits next to this one, its copy must match too.
+PINNED_KEY = "2hUye2snQY5Roz1FXgypyJQwCjUuNcIX08ukFeo6TYk="
+SERVERS_REPO_KEY = pathlib.Path(__file__).resolve().parents[2] / "boring-remote-servers/keys/id_ed25519.pub"
 RUSTDESK_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="
 FORCE_SERVERS = ("if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
                  " // boring-remote: the Hosted servers only")
@@ -586,7 +590,7 @@ def connect_checks(c):
            and get_id == ("let mut id = CONFIG.read().unwrap().id.clone(); if id.is_empty() { "
                           "if let Some(tmp) = Config::gen_id() { id = tmp; Config::set_id(&id); } } id")
            and "config.store();" in (fn_body(c.read(HBB), "pub fn set_id(id: &str) {") or "")
-           and builtin is not None and builtin.group(1) == "Default::default()",
+           and builtin is not None and rust_map(c.read(HBB), "BUILTIN_SETTINGS") == {"disable-change-id": "Y"},
            f"label {'Machine ID' if rebrand.MACHINE_ID_LABEL in board else 'missing'}, get_id {get_id[:60]!r}")
 
     key = f'("{rebrand.NOT_FOUND}", '
@@ -722,10 +726,20 @@ GATE_KEY = ("crate::trust_policy::login_key(\n                            &lr,\n
             "                            &self.ip,\n                            &Config::get_id(),\n"
             "                            self.stream.is_secured(),\n                        )")
 # Ticket 07, the Controller side: what a connection records and what the login signs with it.
-VERIFIED_AT_START = ("interface.get_lch().write().unwrap().boring_verified_target =\n"
-                     "                    crate::trust_policy::verified_target(peer, key, x.0 .2.as_deref(), x.0 .0.is_secured());")
-VERIFIED_CLEARED = "interface.get_lch().write().unwrap().boring_verified_target = None;"
-SIGN_CALL = "crate::trust_policy::sign_login(&mut lr, &self.hash.challenge, self.boring_verified_target.as_deref());"
+# The login is signed where it is sent, from the stream that carries it (ticket 07).
+SIGN_CALL = ("let challenge = lc.read().unwrap().hash.challenge.clone();\n"
+             "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
+             "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured());\n    }\n"
+             "    allow_err!(peer.send(&msg_out).await);")
+# A Machine ID runs only with the baked key, and an unverified one is refused without a prompt.
+KEY_GUARD = ("if boring_is_machine_id(peer) && !crate::trust_policy::baked_key(key) {\n"
+             '            bail!("Boring Remote checks Machine IDs against its own servers only");\n        }')
+REFUSE_IO = ("if !is_secured && crate::client::boring_is_machine_id(&self.handler.get_id()) {\n"
+             '                    self.handler.msgbox("error", "Connection Error", crate::client::BORING_UNVERIFIED, "");\n'
+             '                    self.send_close_reason(&mut peer, "").await;')
+REFUSE_PF = ("if !stream.is_secured() && crate::client::boring_is_machine_id(id) {\n"
+             "        bail!(crate::client::BORING_UNVERIFIED);\n    }\n"
+             "    if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {")
 # accepted() remembers only a new ID: a trusted one showing another key keeps the stored key.
 REMEMBER_IF = "if password == Password::Right && remember && !trusted.has_id(controller) {"
 TRUSTED_IF = "if password == Password::Right && key.map_or(false, |k| trusted.contains(controller, k)) {"
@@ -865,8 +879,10 @@ def password_lock_checks(c, locked):
            and "translate(showOneTime ? 'One-time Password' : 'Password')," in c.read(rebrand.MOBILE_SERVER))
 
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
-    missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS + [rebrand.MACHINE_ID_LABEL]
-               if p.read_text(encoding="utf-8").count(f'("{k}", ') != 1]
+    # Keys English shows as they are aren't in en.rs (AGENTS.md); every other file has each once.
+    en_only = [rebrand.MACHINE_ID_LABEL, rebrand.UNVERIFIED]
+    missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS + en_only
+               if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" and k in en_only else 1)]
     c.fact("new UI strings (tickets 05, 06, 07) have a key in every translation file", langs and not missing,
            ", ".join(missing[:5]))
 
@@ -934,23 +950,23 @@ def proof_checks(c, conn, trust, wait):
            not why, "; ".join(why))
 
     client = c.read("src/client.rs")
-    built = fn_body(client, "    fn create_login_msg(") or ""
+    built = fn_body(client, "async fn send_login(") or ""
     hash_fn = fn_body(client, "pub async fn handle_hash(") or ""
-    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, verified: Option<&str>) {"))
+    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool) {"))
     message = fn_body(trust, "pub fn login_message(challenge: &str, target: &str, controller: &str) -> Option<Vec<u8>> {") or ""
     resolver = fn_body(client, "async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {") or ""
     lib = c.read("src/lib.rs")
     why = []
-    sign_at, sent_at = built.find(rebrand.SIGN_LOGIN), built.find("msg_out.set_login_request(lr);")
+    sign_at, sent_at = built.find(rebrand.SIGN_LOGIN), built.find("allow_err!(peer.send(&msg_out).await);")
     if not 0 <= sign_at < sent_at:
-        why.append("create_login_msg doesn't sign before sending")
+        why.append("send_login doesn't sign before sending")
     if rebrand.HASH_FIRST_NEW.split("    true\n")[0] not in hash_fn:
         why.append("handle_hash sends the login before it stores the challenge")
     dialed = squash(fn_body(trust, "pub fn dialed_target(peer: &str) -> Option<String> {"))
     if dialed != ("let ip = match ip_in(peer) { Some(ip) => ip, None => DIALED.lock().unwrap().iter()"
                   ".find(|(p, _)| p == peer)?.1, }; is_tailnet(ip).then(|| ip.to_string())"):
         why.append("the Controller signs a target other than a tailnet address it connected to")
-    want = ('let Some(target) = signed_target(&lr.username, verified) else { return; }; '
+    want = ('let Some(target) = signed_target(&lr.username, secured) else { return; }; '
             'if login_message(challenge, &target, &lr.my_id).is_none() { return; } '
             '#[cfg(any(target_os = "android", target_os = "ios"))] let pair = Some(Config::get_key_pair()); '
             '#[cfg(not(any(target_os = "android", target_os = "ios")))] let pair = Config::get_existing_key_pair(); '
@@ -959,8 +975,8 @@ def proof_checks(c, conn, trust, wait):
             'lr.boring_login_sig = sig.into(); }')
     if signing != want:
         why.append("sign_login isn't the service's key pair over (challenge, dialed Target, own ID)")
-    if SIGN_CALL not in built:
-        why.append("the login isn't signed with this connection's verified Machine ID")
+    if SIGN_CALL not in built or "sign_login(" in (fn_body(client, "    fn create_login_msg(") or ""):
+        why.append("the login isn't signed from the stream that carries it")
     if not re.search(r'const LOGIN_DOMAIN: &\[u8\] = b"\\0[^"]*";', trust):
         why.append("the signed login has no zero-led domain (could read as a SignedId)")
     if not re.search(r"let challenge_ok = !challenge\.is_empty\(\)\s*&& challenge\.len\(\) <= 64\s*"
@@ -977,25 +993,30 @@ def proof_checks(c, conn, trust, wait):
 
 
 def hosted_signing_checks(c, client, trust, squash):
-    """Ticket 07: a Machine-ID login is signed only on a session that verified the Target against
-    the baked server key: the servers' word on its key checked out under that key, and the
-    Target signed this session's key exchange (upstream's plaintext fallback never counts)."""
+    """Ticket 07: a Machine-ID login is signed only over a stream that verified the Target against
+    the baked server key (the servers' word on its key checked out under that key, and the Target
+    signed this connection's key exchange), decided from that stream when the login is sent. A
+    Machine ID never runs with another key, and an unverified one is refused, no Continue."""
     why = []
-    verified = squash(fn_body(trust, "pub fn verified_target(peer: &str, key: &str, target_pk: Option<&[u8]>, secured: bool) -> Option<String> {"))
-    if verified != ("let baked = key.is_empty() || key == hbb_common::config::RS_PUB_KEY; "
-                    "(crate::client::boring_is_machine_id(peer) && baked && target_pk.is_some() && secured) "
-                    ".then(|| peer.to_owned())"):
-        why.append(f"verified_target is {verified[:90]!r}")
-    signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, verified: Option<&str>) -> Option<String> {"))
-    if signed != "dialed_target(peer).or_else(|| verified.filter(|v| *v == peer).map(str::to_owned))":
+    if squash(fn_body(trust, "pub fn baked_key(key: &str) -> bool {")) != \
+            "key.is_empty() || key == hbb_common::config::RS_PUB_KEY":
+        why.append("baked_key accepts another key")
+    signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, secured: bool) -> Option<String> {"))
+    if signed != ("dialed_target(peer).or_else(|| (secured && crate::client::boring_is_machine_id(peer))"
+                  ".then(|| peer.to_owned()))"):
         why.append(f"signed_target is {signed[:90]!r}")
     code = strip_tests_and_comments(client)
     start = fn_body(code, "    pub async fn start(\n") or ""
-    clear, run, record = start.find(VERIFIED_CLEARED), start.find("Self::_start("), start.find(VERIFIED_AT_START)
-    if not (0 <= clear < run < record and start[run:record].count("Ok(x) => {") == 1):
-        why.append("Client::start doesn't clear, then record, the verified Machine ID on each connection")
-    if code.count("boring_verified_target =") != 2 or code.count(".boring_verified_target") != 3:
-        why.append("the verified Machine ID is written or read somewhere else")
+    if not 0 <= start.find(KEY_GUARD) < start.find("Self::_start("):
+        why.append("Client::start lets a Machine ID run with a key that isn't the baked one")
+    if "boring_verified_target" in code or "verified_target(" in trust:
+        why.append("a verified flag is kept per session again (shared by its connections)")
+    io_loop = strip_tests_and_comments(c.read("src/client/io_loop.rs"))
+    pf = strip_tests_and_comments(c.read("src/port_forward.rs"))
+    io_refuse, io_prompt = io_loop.find(REFUSE_IO), io_loop.find("client::confirm_insecure_connection(")
+    if not (0 <= io_refuse < io_prompt and io_loop.count("confirm_insecure_connection(") == 1
+            and pf.count(REFUSE_PF) == pf.count("confirm_insecure_connection(") == 2):
+        why.append("an unverified Machine-ID session can still be continued past the insecure prompt")
     secure = fn_body(code, "    async fn secure_connection(\n") or ""
     vouched = re.search(r"let rs_pk = get_rs_pk\(if key\.is_empty\(\) \{\s*config::RS_PUB_KEY\s*\} else \{\s*key\s*\}\);", secure)
     target_key = re.search(r"if let Ok\(\(id, pk\)\) = decode_id_pk\(&signed_id_pk, &rs_pk\) \{\s*if id == peer_id \{\s*"
@@ -1139,6 +1160,10 @@ def baked_key():
         return None, f"{SERVER_KEY.name} is not a 32-byte Ed25519 public key"
     if text == RUSTDESK_KEY:
         return None, f"{SERVER_KEY.name} is RustDesk's public servers' key"
+    if text != PINNED_KEY:
+        return None, f"{SERVER_KEY.name} isn't the pinned Hosted servers' key (check.py PINNED_KEY)"
+    if SERVERS_REPO_KEY.is_file() and SERVERS_REPO_KEY.read_text(encoding="ascii").strip() != text:
+        return None, f"{SERVER_KEY.name} differs from {SERVERS_REPO_KEY}"
     return text, None
 
 
@@ -1167,10 +1192,67 @@ def hosted_checks(c, cfg, locked):
     c.fact(f"baked server key is {SERVER_KEY.name} (built-in key and locked key option)", key and not why, why)
 
     tailnet = set(rebrand.TAILNET.split(","))
-    maps = {name: rust_map(cfg, name) for name in ("OVERWRITE_SETTINGS", "DEFAULT_SETTINGS")}
+    maps = {name: rust_map(cfg, name) for name in ("OVERWRITE_SETTINGS", "DEFAULT_SETTINGS", "BUILTIN_SETTINGS",
+                                                   "HARD_SETTINGS", "OVERWRITE_LOCAL_SETTINGS",
+                                                   "DEFAULT_LOCAL_SETTINGS")}
     left = [f"{name} {k}" for name, m in maps.items() for k, v in m.items()
             if k == "whitelist" or tailnet & set(v.split(","))]
     c.fact("no Tailscale whitelist left (ADR 0005)", not left, ", ".join(left))
+    exposure_checks(c, cfg)
+
+
+ICE_URL = re.compile(r"\b(?:stun|stuns|turn|turns):(?://)?([\w.-]+)")
+RELAY_OURS = "let relay_server = boring_relay(&relay_server)?;"
+BORING_RELAY = ('let ours = hbb_common::config::Config::get_option("relay-server"); if ours.is_empty() '
+                '{ bail!("no relay server"); } if !advertised.is_empty() && advertised != ours '
+                '&& !advertised.starts_with(&format!("{ours}:")) { log::warn!("relay {advertised} named by the peer '
+                'ignored, using {ours}"); } Ok(ours)')
+DIRECT_ONLY_TAILNET = ('log::info!("direct access from {}", addr);\n'
+                       "                // boring-remote: Direct IP is the tailnet path only (ADR 0005, ticket 07).\n"
+                       "                if !crate::client::boring_is_tailnet(addr) {\n                    continue;\n                }\n")
+
+
+def exposure_checks(c, cfg):
+    """Ticket 07: what the Hosted path newly exposes stays shut. The Controller's relay is ours,
+    nothing reaches a third-party STUN server, 21118 answers tailnet addresses only, and the
+    Machine ID can't be changed."""
+    squash = lambda t: re.sub(r"\s+", " ", t or "").strip()
+    client = strip_tests_and_comments(c.read("src/client.rs"))
+    relay = fn_body(client, "    async fn create_relay(\n") or ""
+    c.fact("the Controller's relay is always the locked relay-server, never a host the peer names",
+           relay.lstrip().startswith(RELAY_OURS) and squash(fn_body(client, "fn boring_relay(advertised: &str) -> ResultType<String> {")) == BORING_RELAY
+           and client.count("check_port(relay_server, RELAY_PORT)") == 1, relay.lstrip()[:120])
+
+    local = rust_map(cfg, "OVERWRITE_LOCAL_SETTINGS")
+    med = c.read("src/rendezvous_mediator.rs")
+    stun = []
+    for rel, text in shipped_files(c, (".rs", ".dart")):
+        code = strip_tests_and_comments(text) if rel.endswith(".rs") else text
+        stun += [f"{rel}: {h}" for h in ICE_URL.findall(code) if h != HOSTED]
+    why = [f"{k} not locked N" for k in ("enable-webrtc", "enable-ipv6-punch", "enable-udp-punch") if local.get(k) != "N"]
+    if "        let webrtc_viable = false\n" not in med:
+        why.append("the Target answers WebRTC offers")
+    if first_statement(med, "    slot: Option<PunchSlot>,\n) -> bytes::Bytes {") != \
+            "if true { return Default::default(); } // boring-remote: no IPv6 punch (ticket 07)":
+        why.append("the Target starts IPv6 punches (STUN probes)")
+    c.fact("no WebRTC, IPv6 or UDP punch, and no third-party STUN or TURN host ships",
+           not why and not stun, "; ".join(why + stun[:6]))
+
+    accept = med.find("if let Ok(Ok((stream, addr))) = hbb_common::timeout(1000, l.accept()).await {")
+    c.fact("Direct IP (21118) answers tailnet addresses only",
+           accept >= 0 and med.count(DIRECT_ONLY_TAILNET) == 1
+           and 0 <= med.find(DIRECT_ONLY_TAILNET, accept) < med.find("crate::server::create_tcp_connection(", accept))
+
+    ui = c.read("src/ui_interface.rs")
+    first = first_statement(ui, "pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {")
+    settings, mobile = c.read(rebrand.SETTINGS), c.read(rebrand.MOBILE_SERVER)
+    c.fact("Change ID is off: hidden on desktop and mobile, refused if called (the Machine ID never changes)",
+           rust_map(cfg, "BUILTIN_SETTINGS").get("disable-change-id") == "Y"
+           and first is not None and first.startswith("if true { return INVALID_FORMAT; }")
+           and "if (!isChangeIdDisabled())\n                  _Card(title: 'ID', children: [changeId()])," in settings
+           and "            if (!isChangeIdDisabled())\n" in mobile
+           and "bind.mainGetBuildinOption(key: kOptionDisableChangeId) == 'Y'" in c.read("flutter/lib/common.dart"),
+           f"change_id_shared_ starts {first!r}")
 
 
 def run_checks(root):
