@@ -12,8 +12,10 @@ no GitHub Actions workflow, no hwcodec/vram in any build invocation, Mac build w
 file copy-paste, the Windows MSI (name, exe, art sizes, license, icon, no RustDesk text), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
 translations, app metadata, every logo slot; one AGPL line on the About page), that
 the connect box sends a Machine ID through the Hosted servers and any other name Direct IP
-to a tailnet address, that the Target shows its Machine ID, and that the protocol files are
-upstream's. It only reads the tree.
+to a tailnet address, that the Target shows its Machine ID, that a saved Machine ID tries its
+tailnet address first and then the Hosted servers (ticket 08), that the protocol files are
+upstream's, that a Target without a Permanent password stays off the Hosted servers and is
+asked to set one at launch, and that the Update keeps 1.7.x's config (ticket 09). It only reads the tree.
 Idempotence is proved by test_rebrand.py and build-mac's second-run step.
 
 Prints one PASS/FAIL line per fact, then
@@ -52,6 +54,15 @@ SERVER_KEY = pathlib.Path(__file__).resolve().parent / "server-key.pub"
 PINNED_KEY = "2hUye2snQY5Roz1FXgypyJQwCjUuNcIX08ukFeo6TYk="
 SERVERS_REPO_KEY = pathlib.Path(__file__).resolve().parents[2] / "boring-remote-servers/keys/id_ed25519.pub"
 RUSTDESK_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="
+# Ticket 09, pinned here (not taken from rebrand.py): what 1.7.x shipped. The config (saved
+# machines, settings, trusted list) lives in ~/Library/Preferences/<ORG>.<APP_NAME> on Mac and
+# %APPDATA%\<APP_NAME> on Windows; the License key is a local option. Change any and the
+# 1.8.0 Update starts from an empty config.
+SHIPPED_ORG, SHIPPED_APP, SHIPPED_KEY_OPTION = "io.boringlabs", "BoringRemote", "boring-license-key"
+# Calls that clear saved machines or settings in bulk; nothing we add may make them.
+CONFIG_WIPE = re.compile(r"PeerConfig::remove\(|\b(?:Config|Config2|LocalConfig)::set\(|set_options\(\s*"
+                         r"(?:HashMap::new\(\)|Default::default\(\))|Config::path\(|mainRemovePeer|mainForgetPassword")
+CONFIG_PATH = re.compile(r"Preferences|AppData|\.toml\b")
 FORCE_SERVERS = ("if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
                  " // boring-remote: the Hosted servers only")
 FORCE_SERVER = ('if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
@@ -729,7 +740,8 @@ GATE_KEY = ("crate::trust_policy::login_key(\n                            &lr,\n
 # The login is signed where it is sent, from the stream that carries it (ticket 07).
 SIGN_CALL = ("let challenge = lc.read().unwrap().hash.challenge.clone();\n"
              "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
-             "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured());\n    }\n"
+             "        let reached = crate::trust_policy::take_tailnet_stream(peer.local_addr());\n"
+             "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), reached);\n    }\n"
              "    allow_err!(peer.send(&msg_out).await);")
 # A Machine ID runs only with the baked key, and an unverified one is refused without a prompt.
 KEY_GUARD = ("if boring_is_machine_id(peer) && !crate::trust_policy::baked_key(key) {\n"
@@ -883,7 +895,7 @@ def password_lock_checks(c, locked):
     en_only = [rebrand.MACHINE_ID_LABEL, rebrand.UNVERIFIED]
     missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS + en_only
                if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" and k in en_only else 1)]
-    c.fact("new UI strings (tickets 05, 06, 07) have a key in every translation file", langs and not missing,
+    c.fact("new UI strings (tickets 05, 06, 07, 09) have a key in every translation file", langs and not missing,
            ", ".join(missing[:5]))
 
 
@@ -952,7 +964,7 @@ def proof_checks(c, conn, trust, wait):
     client = c.read("src/client.rs")
     built = fn_body(client, "async fn send_login(") or ""
     hash_fn = fn_body(client, "pub async fn handle_hash(") or ""
-    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool) {"))
+    signing = squash(fn_body(trust, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool, reached: Option<IpAddr>) {"))
     message = fn_body(trust, "pub fn login_message(challenge: &str, target: &str, controller: &str) -> Option<Vec<u8>> {") or ""
     resolver = fn_body(client, "async fn boring_tailnet_addr(peer: &str) -> ResultType<SocketAddr> {") or ""
     lib = c.read("src/lib.rs")
@@ -966,7 +978,8 @@ def proof_checks(c, conn, trust, wait):
     if dialed != ("let ip = match ip_in(peer) { Some(ip) => ip, None => DIALED.lock().unwrap().iter()"
                   ".find(|(p, _)| p == peer)?.1, }; is_tailnet(ip).then(|| ip.to_string())"):
         why.append("the Controller signs a target other than a tailnet address it connected to")
-    want = ('let Some(target) = signed_target(&lr.username, secured) else { return; }; '
+    want = ('let Some(target) = signed_target(&lr.username, secured).or_else(|| reached_target(&lr.username, reached)) '
+            'else { return; }; '
             'if login_message(challenge, &target, &lr.my_id).is_none() { return; } '
             '#[cfg(any(target_os = "android", target_os = "ios"))] let pair = Some(Config::get_key_pair()); '
             '#[cfg(not(any(target_os = "android", target_os = "ios")))] let pair = Config::get_existing_key_pair(); '
@@ -1031,6 +1044,125 @@ def hosted_signing_checks(c, client, trust, squash):
                    "under the servers' word (is_secured() would not mean verified)")
     c.fact("Controllers sign a Machine-ID login only on a session that verified the Target against the baked server key",
            not why, "; ".join(why))
+
+
+# Ticket 08, pinned here (not taken from rebrand.py).
+TAILNET_FIRST = (
+    "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {\n"
+    "            return Ok(((stream, true, None, None, \"TCP\"), (0, \"\".to_owned()), false));\n"
+    "        }\n")
+TAILNET_DIAL = ("if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) { return None; } "
+                "let options = PeerConfig::load(peer).options; "
+                "let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) }; "
+                "let reach = Reach { tailnet_up: crate::connect_plan::own_tailnet_addr().is_some(), relay_only }; "
+                "for attempt in plan(&record, reach) { let Attempt::Tailnet(addr) = attempt else { break }; "
+                "let Ok(ip) = addr.parse::<std::net::IpAddr>() else { break }; "
+                "match connect_tcp_local(check_port(&addr, RELAY_PORT + 1), None, TAILNET_TIMEOUT_MS).await { "
+                "Ok(stream) => { crate::trust_policy::note_tailnet_stream(stream.local_addr(), ip); return Some(stream); }")
+TAILNET_PLAN = ("if !crate::client::boring_is_machine_id(peer.id) { return vec![Attempt::DirectIp(peer.id.to_owned())]; } "
+                "let mut attempts = Vec::new(); "
+                "let saved = peer.tailnet.and_then(|a| a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip)); "
+                "if let Some(ip) = saved { if reach.tailnet_up && !reach.relay_only { "
+                "attempts.push(Attempt::Tailnet(ip.to_string())); } } "
+                "attempts.push(Attempt::Hosted(peer.id.to_owned())); attempts")
+TAILNET_EXEMPT = "let is_secured = is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());"
+REACHED = ("reached .filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer)) "
+           ".map(|ip| canonical(ip).to_string())")
+NOTED = ("if !is_tailnet(reached) { return; } let mut streams = TAILNET_STREAMS.lock().unwrap(); "
+         "streams.retain(|(l, _)| *l != local);")
+REMEMBERED = ("crate::connect_plan::save_reported_tailnet(\n                            &self.handler.get_id(),\n"
+              "                            peer.is_secured(),\n                            &pi.platform_additions,\n"
+              "                        );")
+TAILNET_REMEMBER_IF = "if !verified || !crate::client::boring_is_machine_id(id) {"
+HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
+               " connection, or connect by Tailscale name or IP.")
+HOSTED_DOWN_MAP = ("let mut socket = socket.map_err(|err| {\n"
+                   '            log::warn!("Hosted servers unreachable: {err}");\n'
+                   "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n        })?;")
+PATH_LABEL = "let stream_type = crate::connect_plan::stream_label(stream_type, direct, peer.local_addr().ip());"
+
+
+def tailnet_first_checks(c):
+    """Ticket 08 (spec slice 3): a saved Machine ID tries its tailnet address first (~3 s), then the
+    Hosted servers; the login sent over that stream signs the address it reached, decided from the
+    stream at send time (never per session); the address is learned only over a verified stream;
+    a plain error when the Hosted servers are down; the session shows tailnet direct / direct /
+    relayed."""
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    client, plan_rs = c.read("src/client.rs"), c.read("src/connect_plan.rs")
+    trust = strip_tests_and_comments(c.read("src/trust_policy.rs"))
+    code = strip_tests_and_comments(client)
+    plan_code = strip_tests_and_comments(plan_rs)
+    io_loop = strip_tests_and_comments(c.read("src/client/io_loop.rs"))
+    body = fn_body(client, "    async fn _start(\n") or ""
+    guard = body.find(TAILNET_GUARD)
+    first, rendezvous = body.find(TAILNET_FIRST), body.find("let other_server = interface.get_lch()")
+    why = []
+    if "mod connect_plan;" not in c.read("src/lib.rs"):
+        why.append("no connect_plan module")
+    if not (0 <= guard < first < rendezvous):
+        why.append("_start doesn't try the tailnet address after the typed-name branch and before the Hosted servers")
+    elif strip_tests_and_comments(body[guard:rendezvous]).count("return Ok((") != 2:
+        why.append("something else returns between the tailnet attempt and the Hosted servers")
+    dial = squash(fn_body(code, "async fn boring_tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) -> Option<Stream> {"))
+    if TAILNET_DIAL not in dial:
+        why.append(f"boring_tailnet_first isn't Direct IP to the plan's tailnet address only: {dial[:80]!r}")
+    if squash(fn_body(plan_code, "pub fn plan(peer: &PeerRecord, reach: Reach) -> Vec<Attempt> {")) != TAILNET_PLAN:
+        why.append("plan isn't: typed names Direct IP only; a Machine ID's saved tailnet address, then the Hosted servers")
+    if "pub const TAILNET_TIMEOUT_MS: u64 = 3_000;" not in plan_code:
+        why.append("the tailnet attempt isn't ~3 s")
+    c.fact("a saved Machine ID tries its tailnet address first (~3 s), then the Hosted servers (ticket 08)",
+           not why, "; ".join(why))
+
+    why = []
+    if squash(fn_body(trust, "pub fn reached_target(peer: &str, reached: Option<IpAddr>) -> Option<String> {")) != REACHED:
+        why.append("reached_target signs something other than a Machine ID's tailnet address")
+    if not squash(fn_body(trust, "pub fn note_tailnet_stream(local: SocketAddr, reached: IpAddr) {")).startswith(NOTED):
+        why.append("note_tailnet_stream records a non-tailnet address or more than one entry per stream")
+    if "Some(streams.remove(i).1)" not in (fn_body(trust, "pub fn take_tailnet_stream(local: SocketAddr) -> Option<IpAddr> {") or ""):
+        why.append("the reached address isn't consumed when the login is sent")
+    if code.count("note_tailnet_stream(") != 1 or code.count("take_tailnet_stream(") != 1 \
+            or (code + io_loop).count("is_tailnet_stream(") != 1:
+        why.append("the tailnet-first stream is recorded, read or consumed somewhere else")
+    refuse = io_loop.find(REFUSE_IO)
+    if not 0 <= io_loop.find(TAILNET_EXEMPT) < refuse:
+        why.append("a tailnet-first stream isn't told apart before 07's unverified Machine-ID refusal")
+    if "boring_tailnet_target" in code or "boring_verified_target" in code:
+        why.append("a per-session field is back")
+    c.fact("a tailnet-first login signs only the address its own stream reached, at send time (ticket 08)",
+           not why, "; ".join(why))
+
+    remember = squash(fn_body(plan_code, "pub fn remember_tailnet("))
+    save = squash(fn_body(plan_code, "pub fn save_reported_tailnet(id: &str, secured: bool, additions: &str) {"))
+    peer_info = io_loop[io_loop.find("Some(login_response::Union::PeerInfo(pi)) => {"):]
+    conn = c.read("src/server/connection.rs")
+    reported = conn.find("crate::connect_plan::add_own_tailnet(&mut platform_additions);")
+    c.fact("a saved Machine ID records a tailnet address only from its verified Target (ticket 08)",
+           0 <= peer_info.find(REMEMBERED) < peer_info.find("self.set_peer_info(&pi);")
+           and f"{squash(TAILNET_REMEMBER_IF)} return; }}" in remember
+           and save.startswith("if !(secured && crate::client::boring_is_machine_id(id)) { return; }")
+           and plan_code.count("TAILNET_OPTION.to_owned()") == 1 and code.count("TAILNET_OPTION") == 2
+           and 0 <= reported < conn.find("pi.platform_additions = serde_json::to_string(&platform_additions)"),
+           remember[:80])
+
+    inner = fn_body(code, "    async fn _start_inner(\n") or ""
+    langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
+    missing = [p.name for p in langs for k in (HOSTED_DOWN, rebrand.TAILNET_LABEL)
+               if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" else 1)]
+    c.fact(f"Hosted servers unreachable: a plain error naming {HOSTED} (ticket 08)",
+           HOSTED_DOWN_MAP in inner and "socket?;" not in inner and HOSTED in HOSTED_DOWN
+           and f'pub const HOSTED_DOWN: &str = "{HOSTED_DOWN}";' in plan_code and rebrand.HOSTED_DOWN == HOSTED_DOWN
+           and bool(langs) and not missing, ", ".join(missing[:5]))
+
+    label = squash(fn_body(plan_code, "pub fn stream_label(stream_type: &'static str, direct: bool, local: IpAddr) -> &'static str {"))
+    dart = fn_body(c.read(rebrand.DART_COMMON), "String getConnectionText(bool secure, bool direct, String streamType) {") or ""
+    c.fact("the session shows tailnet direct, direct or relayed (ticket 08)",
+           0 <= io_loop.find(PATH_LABEL) < io_loop.find(".set_connection_type(is_secured, direct, stream_type);")
+           and label == "if direct && is_tailnet(local) { TAILNET_STREAM } else { stream_type }"
+           and 'pub const TAILNET_STREAM: &str = "Tailnet";' in plan_code
+           and dart.lstrip("\n ").split("\n")[1:3] == ["  if (streamType == 'Tailnet') {",
+                                                     f"    return translate('{rebrand.TAILNET_LABEL}');"],
+           label[:60])
 
 
 def trust_checks(c, locked):
@@ -1255,6 +1387,83 @@ def exposure_checks(c, cfg):
            f"change_id_shared_ starts {first!r}")
 
 
+def first_launch_checks(c):
+    """Ticket 09: a Target with no Permanent password stays off the Hosted servers (its Machine ID
+    is never registered) while Direct IP over the tailnet keeps working."""
+    med = c.read("src/rendezvous_mediator.rs")
+    lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
+    body = fn_body(med, "pub async fn start_all() {") or ""
+    gate = re.search(r"let servers = crate::password_lock::hosted_servers\(\s*Config::get_rendezvous_servers\(\),"
+                     r"\s*Config::has_permanent_password\(\),\s*\);", body)
+    helper = re.sub(r"\s+", "", fn_body(lock, "pub fn hosted_servers(servers: Vec<String>, password_set: bool)"
+                                            " -> Vec<String> {") or "")
+    spawn = re.search(r"let server_cloned = server\.clone\(\);\s*tokio::spawn\(async move \{\s*"
+                      r"direct_server\(server_cloned\)\.await;\s*\}\);", body)
+    loop = body.find("for host in servers.clone() {")
+    c.fact("no Permanent password, no Hosted servers: the Target registers its Machine ID only once a password "
+           "is set; Direct IP keeps listening (ticket 09)",
+           gate is not None and 0 <= gate.end() < loop and body.count("Config::get_rendezvous_servers()") == 1
+           and med.count("Self::start(server, host)") == 1 and helper == "ifpassword_set{servers}else{Vec::new()}"
+           and spawn is not None and spawn.start() < body.find("\n        loop {\n"),
+           f"gate {gate is not None}, helper {helper!r}, Direct IP ungated {spawn is not None}")
+    remove = re.search(r"updated = Config::set_permanent_password\(&value\);\s*(?://[^\n]*\s*)?"
+                       r"if updated && !Config::has_permanent_password\(\) \{\s*crate::RendezvousMediator::restart\(\);"
+                       r"\s*\}", c.read("src/ipc.rs"))
+    c.fact("removing the Permanent password drops the Hosted registration (ticket 09)", remove is not None)
+
+    home, setup = c.read(rebrand.HOME), c.read("flutter/lib/desktop/widgets/password_setup.dart")
+    init = fn_body(home[home.find("class _DesktopHomePageState"):], "void initState() {") or ""
+    ask = fn_body(setup, "Future<void> showPasswordSetupIfNeeded() async {") or ""
+    is_set = re.sub(r"\s+", "", fn_body(setup, "Future<bool> permanentPasswordSet() async {") or "")
+    order = [ask.find(s) for s in ("if (await permanentPasswordSet()) return;", "gFFI.dialogManager.show(",
+                                   "final pass = await bind.mainGeneratePermanentPassword();",
+                                   "if (pass.isEmpty) {", "close();", "showGeneratedPasswordOnce(pass);")]
+    c.fact("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs the "
+           "generator and shows the password once; never again once one is set (ticket 09)",
+           "addPostFrameCallback((_) => showPasswordSetupIfNeeded());" in init
+           and "import 'package:flutter_hbb/desktop/widgets/password_setup.dart';" in home
+           and is_set == 'return(awaitbind.mainGetCommon(key:"permanent-password-set"))=="true";'
+           and -1 not in order and order == sorted(order),
+           f"hooked {'showPasswordSetupIfNeeded' in init}, set check {is_set!r}, order {order}")
+
+
+def our_code(c):
+    """The Rust and Dart we add: our own modules and widgets, and the text rebrand.py inserts."""
+    files, inserted = set(), []
+    for rel, old, new, _ in rebrand.PATCHES:
+        if not isinstance(old, str):
+            continue
+        added = new.replace(old, "", 1) if old in new else new
+        if rel.endswith((".rs", ".dart")):
+            inserted.append(added)
+        if rel == "src/lib.rs":
+            files |= {f"src/{m}.rs" for m in re.findall(r"\bmod (\w+);", added)}
+        files |= {f"flutter/lib/desktop/widgets/{w}.dart"
+                  for w in re.findall(r"package:flutter_hbb/desktop/widgets/(\w+)\.dart", added)}
+    texts = {rel: strip_tests_and_comments(c.read(rel)) for rel in sorted(files)}
+    texts["rebrand.py inserted text"] = "\n".join(inserted)
+    return texts
+
+
+def config_kept_checks(c, cfg):
+    """Ticket 09: the 1.8.0 Update starts from the 1.7.x config, untouched."""
+    org = re.search(r'static ref ORG: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    app = re.search(r'static ref APP_NAME: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    key = re.search(r'pub const KEY_OPTION: &str = "([^"]*)";', c.read("src/license_key.rs"))
+    same = ((org and org.group(1), app and app.group(1), key and key.group(1))
+            == (SHIPPED_ORG, SHIPPED_APP, SHIPPED_KEY_OPTION))
+    script = c.read("src/platform/privileges_scripts/install-update.sh")
+    removed = set(re.findall(r'\brm -r?f "([^"]+)"', script))
+    script_ok = (script and not CONFIG_PATH.search(script)
+                 and removed <= {"$STAGE", "$PREV", "$APP", "$f", "$SUPPORT/update-pending"})
+    wipes = [f"{rel}: {m.group(0)}" for rel, text in our_code(c).items() for m in CONFIG_WIPE.finditer(text)]
+    c.fact("the 1.8.0 Update keeps 1.7.x's config: same config dir and License key option, the update script "
+           "never touches it, and nothing we add clears saved machines or settings (ticket 09)",
+           same and script_ok and not wipes,
+           f"identity {org and org.group(1)}.{app and app.group(1)} / {key and key.group(1)}, "
+           f"script removes {sorted(removed)}, wipes {wipes[:5]}")
+
+
 def run_checks(root):
     c = Check(root)
     workflow_guard(c)
@@ -1315,6 +1524,8 @@ def run_checks(root):
            "'allow-only-conn-window-open'" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
     password_lock_checks(c, locked)
     trust_checks(c, locked)
+    first_launch_checks(c)
+    config_kept_checks(c, cfg)
 
     # sync, NAT test, updater
     for rel, sig, what in (
@@ -1412,6 +1623,7 @@ def run_checks(root):
     msi_checks(c)
     branding_checks(c)
     connect_checks(c)
+    tailnet_first_checks(c)
 
     # protocol: every .proto in the tree is upstream's, byte for byte, except our two LoginRequest fields
     c.fact("protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)",

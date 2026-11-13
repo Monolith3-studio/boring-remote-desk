@@ -14,7 +14,9 @@
 //!
 //! "The Target it dialed" is one of two names, each one only this Target can answer to:
 //! - a tailnet address: the one the Controller connected to (dialed as an address, or the
-//!   address a tailnet name resolved to; `dialed_target`), which has to be the address the
+//!   address a tailnet name resolved to; `dialed_target`; or, ticket 08, the saved tailnet
+//!   address a Machine ID's tailnet-first stream reached, `reached_target`, signed once per
+//!   stream: a password retry on it clicks), which has to be the address the
 //!   connection arrived on here, from a tailnet address (`target_name`). WireGuard means only
 //!   this Target answers at its tailnet address.
 //! - its Machine ID (ticket 07): signed only over a stream that verified the Target against the
@@ -394,13 +396,57 @@ pub fn signed_target(peer: &str, secured: bool) -> Option<String> {
     dialed_target(peer).or_else(|| (secured && crate::client::boring_is_machine_id(peer)).then(|| peer.to_owned()))
 }
 
+// --- ticket 08: a saved Machine ID's tailnet-first connection ---------------------------
+
+/// Streams `boring_tailnet_first` (client.rs) connected Direct IP to a saved Machine ID's
+/// tailnet address, by the stream's local address (unique while it is open), with the address
+/// each reached. Per connection: never shared by a session's other connections.
+static TAILNET_STREAMS: Mutex<Vec<(SocketAddr, IpAddr)>> = Mutex::new(Vec::new());
+
+/// The stream whose local end is `local` reached `reached`, a tailnet address.
+pub fn note_tailnet_stream(local: SocketAddr, reached: IpAddr) {
+    if !is_tailnet(reached) {
+        return;
+    }
+    let mut streams = TAILNET_STREAMS.lock().unwrap();
+    streams.retain(|(l, _)| *l != local);
+    if streams.len() >= 64 {
+        streams.remove(0);
+    }
+    streams.push((local, canonical(reached)));
+}
+
+/// This stream is a saved Machine ID's tailnet-first connection: Direct IP across the tailnet
+/// (WireGuard), like a typed tailnet address. Not a Hosted connection that failed to verify.
+pub fn is_tailnet_stream(local: SocketAddr) -> bool {
+    TAILNET_STREAMS.lock().unwrap().iter().any(|(l, _)| *l == local)
+}
+
+/// The tailnet address this stream reached, taken when its login is sent: that login signs it.
+pub fn take_tailnet_stream(local: SocketAddr) -> Option<IpAddr> {
+    let mut streams = TAILNET_STREAMS.lock().unwrap();
+    let i = streams.iter().position(|(l, _)| *l == local)?;
+    Some(streams.remove(i).1)
+}
+
+/// What a Machine ID's login signs on its tailnet-first stream (`reached`, from
+/// `take_tailnet_stream`): the tailnet address that stream connected to, as for a typed one.
+/// None for anything else.
+pub fn reached_target(peer: &str, reached: Option<IpAddr>) -> Option<String> {
+    reached
+        .filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer))
+        .map(|ip| canonical(ip).to_string())
+}
+
 /// Sign this login with the Controller's own key pair, for the Target's trusted list. Left
-/// unsigned (the Target then asks) for a Target it can't bind (`signed_target`), a challenge no
-/// Target makes, or no key pair. `secured`: the stream this login goes out on is keyed. On
+/// unsigned (the Target then asks) for a Target it can't bind (`signed_target`, or ticket 08's
+/// `reached_target`), a challenge no Target makes, or no key pair. `secured`: the stream this
+/// login goes out on is keyed; `reached`: the tailnet address that stream connected to, if it
+/// is a tailnet-first one. On
 /// desktop it takes the key pair the service made and never makes one: a key made by this UI
 /// process could differ from the service's or race it. Mobile runs both sides in one process.
-pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool) {
-    let Some(target) = signed_target(&lr.username, secured) else {
+pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool, reached: Option<IpAddr>) {
+    let Some(target) = signed_target(&lr.username, secured).or_else(|| reached_target(&lr.username, reached)) else {
         return;
     };
     if login_message(challenge, &target, &lr.my_id).is_none() {
@@ -827,6 +873,45 @@ mod tests {
         assert_eq!(target_decides(&lr, CHALLENGE, &list), Decision::Allow);
         // A name this Controller never resolved (or typed differently) isn't signed.
         assert!(c.login(CHALLENGE, "never-dialed.tail1.ts.net:21118").boring_login_sig.is_empty());
+    }
+
+    #[test]
+    fn saved_machine_id_reached_on_its_tailnet_address_signs_that_address() {
+        // Ticket 08: the login sent over a tailnet-first stream signs the address it reached.
+        let c = controller(KNOWN);
+        let list = trusted(&[(KNOWN, &c.pk)]);
+        let target = reached_target(MACHINE_ID, Some(TARGET_IP)).unwrap();
+        assert_eq!(target, TARGET);
+        let lr = LoginRequest {
+            my_id: KNOWN.to_owned(),
+            username: MACHINE_ID.to_owned(),
+            boring_controller_pk: c.pk.to_vec().into(),
+            boring_login_sig: signature(CHALLENGE, &target, KNOWN, &c.sk.0).unwrap().into(),
+            ..Default::default()
+        };
+        assert_eq!(decides_on(&lr, CHALLENGE, &list, TARGET_IP, FROM), Decision::Allow);
+        // Relayed or punched (not arriving on the tailnet address), it binds nothing: a click.
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        assert_eq!(decides_on(&lr, CHALLENGE, &list, lan, "203.0.113.7"), Decision::Ask);
+        // Never a non-tailnet address, never for a typed name, never without a tailnet-first stream.
+        assert_eq!(reached_target(MACHINE_ID, Some(lan)), None);
+        assert_eq!(reached_target("studio.tail1.ts.net", Some(TARGET_IP)), None);
+        assert_eq!(reached_target(MACHINE_ID, None), None);
+    }
+
+    #[test]
+    fn a_tailnet_first_stream_is_known_by_its_own_local_address_and_signed_once() {
+        let mine: SocketAddr = "100.70.0.9:50001".parse().unwrap();
+        let other: SocketAddr = "100.70.0.9:50002".parse().unwrap();
+        note_tailnet_stream(mine, TARGET_IP);
+        assert!(is_tailnet_stream(mine));
+        assert!(!is_tailnet_stream(other));
+        assert_eq!(take_tailnet_stream(other), None);
+        assert_eq!(take_tailnet_stream(mine), Some(TARGET_IP));
+        assert_eq!(take_tailnet_stream(mine), None);
+        // A non-tailnet address is never recorded.
+        note_tailnet_stream(other, "192.168.1.20".parse().unwrap());
+        assert!(!is_tailnet_stream(other));
     }
 
     #[test]

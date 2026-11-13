@@ -11,6 +11,10 @@
 //!   Settings window can't loosen them. Out of scope: a Controller that runs its own code as
 //!   the logged-in user can talk to the daemon directly; nothing here stops that.
 //!
+//! - `hosted_servers`: a Target with no permanent password registers with no rendezvous server,
+//!   so the Hosted servers never learn its Machine ID and nobody reaches it by ID (ticket 09).
+//!   Direct IP over the tailnet is a separate listener and keeps working.
+//!
 //! The decisions are pure; `generate_and_set` and `authed_sessions` are the thin wiring.
 use base::config::keys;
 use hbb_common::{
@@ -98,6 +102,15 @@ pub fn guard_options(
         };
     }
     incoming
+}
+
+/// The rendezvous servers to register with: none until a permanent password is set.
+pub fn hosted_servers(servers: Vec<String>, password_set: bool) -> Vec<String> {
+    if password_set {
+        servers
+    } else {
+        Vec::new()
+    }
 }
 
 /// Authorised connections of any kind (remote, file transfer, terminal, port forward).
@@ -219,5 +232,17 @@ mod tests {
     fn options_pass_through_with_no_session() {
         let incoming = map(&[("approve-mode", "click"), ("theme", "light")]);
         assert_eq!(guard_options(incoming.clone(), &HashMap::new(), 0), incoming);
+    }
+
+    #[test]
+    fn no_password_registers_with_no_server() {
+        let hosted = vec!["rs.theboringremote.com".to_owned()];
+        assert!(hosted_servers(hosted, false).is_empty());
+    }
+
+    #[test]
+    fn a_password_registers_with_the_hosted_servers() {
+        let hosted = vec!["rs.theboringremote.com".to_owned()];
+        assert_eq!(hosted_servers(hosted.clone(), true), hosted);
     }
 }
