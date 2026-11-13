@@ -40,7 +40,7 @@ RUSTDESK_PUB_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="  # RustDesk's 
 
 # What the connect box says when a name doesn't resolve to a tailnet
 # address. It is also the translation key (src/lang/*.rs, English everywhere).
-NOT_FOUND = "Couldn't find that machine. Type its Tailscale name or IP."
+NOT_FOUND = "Couldn't find that machine. Type its Machine ID, tailnet name or IP."
 # New UI strings (tickets 05, 06). Each is its own translation key: English text, "" in every
 # language file until translated (AGENTS.md, Localization).
 SESSION_SET_FAILED = "Couldn't set the password. If a remote session is open, end it and try again."
@@ -49,14 +49,22 @@ UI_KEYS = [
     "I've saved it", "Replace", "Replace the password?", "Every Controller will need the new password.",
     "Also clear trusted Controllers", SESSION_SET_FAILED, "Trusted Controllers",
     "None yet. A computer connecting for the first time needs a click here.",
+    # ticket 09: the 1.8.0 first-launch setup screen (flutter/lib/desktop/widgets/password_setup.dart)
+    "Set a Permanent password", "Later",
+    "Connecting by Machine ID stays off on this computer until it has a Permanent password. "
+    "Tailscale connections keep working.",
 ]
 MACHINE_ID_LABEL = "Machine ID"  # the Target's ID on its home page (ticket 07, glossary)
+# A Machine-ID connection that didn't verify the Target against the baked server key (ticket 07).
+UNVERIFIED = "Couldn't verify this machine through the Boring Remote servers, so it wasn't connected."
 # Ticket 08: the session's path label and the Hosted-down error (src/connect_plan.rs HOSTED_DOWN).
 TAILNET_LABEL = "Tailnet direct connection"
 HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
                " connection, or connect by Tailscale name or IP.")
 PATH_KEYS = [TAILNET_LABEL, HOSTED_DOWN]
-LANG_KEYS = [NOT_FOUND, MACHINE_ID_LABEL] + UI_KEYS + PATH_KEYS
+LANG_KEYS = [NOT_FOUND, MACHINE_ID_LABEL, UNVERIFIED] + UI_KEYS + PATH_KEYS
+# English shows these keys as they are, so en.rs doesn't list them (AGENTS.md, Localization).
+NOT_IN_EN = [MACHINE_ID_LABEL, UNVERIFIED] + PATH_KEYS
 # The login to a tailnet name signs the address it resolved to (ticket 06, src/trust_policy.rs).
 NOTE_DIALED = "crate::trust_policy::note_dialed(peer, addr.ip());\n"
 # Goes in src/client.rs before `impl Client`. The ranges are TAILNET's, written
@@ -68,9 +76,24 @@ TAILNET_RESOLVER = f"""
 // resolves to is a Tailscale one. Anything else is refused.
 const BORING_NOT_FOUND: &str = "{NOT_FOUND}";
 
+pub(crate) const BORING_UNVERIFIED: &str = "{UNVERIFIED}";
+
 /// A Machine ID the Hosted servers issue: digits only. Never an address, a name or id@server.
 pub(crate) fn boring_is_machine_id(peer: &str) -> bool {{
     !peer.is_empty() && peer.len() <= 20 && peer.bytes().all(|b| b.is_ascii_digit())
+}}
+
+/// The relay a Controller connects to: always the locked relay-server (the Hosted servers),
+/// never a host the Target or the rendezvous path names (ticket 07).
+fn boring_relay(advertised: &str) -> ResultType<String> {{
+    let ours = hbb_common::config::Config::get_option("relay-server");
+    if ours.is_empty() {{
+        bail!("no relay server");
+    }}
+    if !advertised.is_empty() && advertised != ours && !advertised.starts_with(&format!("{{ours}}:")) {{
+        log::warn!("relay {{advertised}} named by the peer ignored, using {{ours}}");
+    }}
+    Ok(ours)
 }}
 
 pub(crate) fn boring_is_tailnet(addr: SocketAddr) -> bool {{
@@ -108,6 +131,13 @@ FORCE_SERVERS = ("        if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.t
                  " // boring-remote: the Hosted servers only\n")
 FORCE_SERVER = ('        if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
                 " // boring-remote: the Hosted servers only\n")
+RELAY_OURS = ("        // boring-remote: always the Hosted relay (ticket 07).\n"
+              "        let relay_server = boring_relay(&relay_server)?;\n")
+DIRECT_TAILNET_ONLY = (
+    "                // boring-remote: Direct IP is the tailnet path only (ADR 0005, ticket 07).\n"
+    "                if !crate::client::boring_is_tailnet(addr) {\n"
+    "                    continue;\n"
+    "                }\n")
 # In Client::_start, after the IP branch: a Machine ID falls through to upstream's rendezvous
 # path; anything else is a tailnet name and connects Direct IP (tailnet first: ticket 08).
 MACHINE_ID_GUARD = (
@@ -140,6 +170,16 @@ DEFAULTS = {  # DEFAULT_SETTINGS: user can change
 }
 LOCKED_LOCAL = {  # OVERWRITE_LOCAL_SETTINGS
     "enable-check-update": "N",
+    # Ticket 07: no WebRTC, IPv6 or UDP punch. They reach third-party STUN servers (Google,
+    # Cloudflare...) and hand ICE candidates to whoever asks; TCP punch and the relay remain.
+    "enable-webrtc": "N",
+    "enable-ipv6-punch": "N",
+    "enable-udp-punch": "N",
+}
+# BUILTIN_SETTINGS (ticket 07): the Machine ID never changes, so saved machines and the Hosted
+# path keep working (custom IDs aren't Machine IDs). Hides Change ID on desktop and mobile.
+BUILTIN = {
+    "disable-change-id": "Y",
 }
 
 
@@ -246,6 +286,36 @@ PATCHES = [
     (HBB, "            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();\n",
      "            // boring-remote: no rendezvous server from the config file\n",
      "no rendezvous server from the config file"),
+    (HBB, "pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+     "pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(BUILTIN) + ";",
+     "Change ID off: the Machine ID never changes"),
+    ("src/ui_interface.rs", "pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {\n",
+     "pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {\n"
+     "    if true { return INVALID_FORMAT; } // boring-remote: the Machine ID never changes (ticket 07)\n",
+     "no ID change, whatever calls it"),
+    # --- ticket 07: the relay is ours, no third-party STUN, 21118 tailnet-only ---------
+    ("src/client.rs",
+     "    ) -> ResultType<Stream> {\n        let mut conn = connect_tcp(\n"
+     "            ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),\n",
+     "    ) -> ResultType<Stream> {\n" + RELAY_OURS + "        let mut conn = connect_tcp(\n"
+     "            ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),\n",
+     "the Controller's relay is the locked relay-server, never one the peer names"),
+    ("libs/hbb_common/src/webrtc.rs", re.compile(
+        r'static DEFAULT_ICE_SERVERS: \[&str; 4\] = \[\n(?:    "stun:[^"]*",\n){4}\];'),
+     f'static DEFAULT_ICE_SERVERS: [&str; 1] = ["stun:{HOSTED}:3478"]; // boring-remote: no third-party STUN',
+     "no third-party STUN servers"),
+    ("src/rendezvous_mediator.rs", "        let webrtc_viable = !ph.webrtc_sdp_offer.is_empty()\n",
+     "        // boring-remote: never answer a WebRTC offer (third-party STUN, ICE candidates; ticket 07)\n"
+     "        let webrtc_viable = false\n            && !ph.webrtc_sdp_offer.is_empty()\n",
+     "the Target answers no WebRTC offer"),
+    ("src/rendezvous_mediator.rs",
+     "    slot: Option<PunchSlot>,\n) -> bytes::Bytes {\n",
+     "    slot: Option<PunchSlot>,\n) -> bytes::Bytes {\n"
+     "    if true { return Default::default(); } // boring-remote: no IPv6 punch (ticket 07)\n",
+     "the Target starts no IPv6 punch (it would probe STUN servers)"),
+    ("src/rendezvous_mediator.rs", '                log::info!("direct access from {}", addr);\n',
+     '                log::info!("direct access from {}", addr);\n' + DIRECT_TAILNET_ONLY,
+     "Direct IP (21118) answers tailnet addresses only"),
     # --- connect box: a Machine ID through the Hosted servers, else a tailnet name ----
     ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      TAILNET_RESOLVER + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
@@ -905,25 +975,50 @@ _AUTHORIZE = ("                        ipc::Data::Authorize => {\n"
               "                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);\n")
 _LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n"
           "            if !self.check_login_scope(&lr).await {\n")
-SIGN_LOGIN = ("        // boring-remote: sign this login for the Target's trusted list (tickets 06, 07).\n"
-              "        crate::trust_policy::sign_login(&mut lr, &self.hash.challenge, self.boring_verified_target.as_deref());\n")
-# Ticket 07: every connection records whether it verified the Target's Machine ID against the
-# baked server key (src/trust_policy.rs verified_target); the login signs that ID only then.
-# Cleared first, so a reconnect or a failed connect never keeps an older session's answer.
-VERIFIED_FIELD = ("    pub other_server: Option<(String, String, String)>,\n"
-                  "    /// boring-remote: the Machine ID this connection verified (ticket 07), else None.\n"
-                  "    pub boring_verified_target: Option<String>,\n")
-VERIFY_CLEAR = ("        interface.update_direct(None);\n"
-                "        interface.update_received(false);\n"
-                "        interface.get_lch().write().unwrap().boring_verified_target = None; // boring-remote (ticket 07)\n")
-VERIFY_ON_START = (
-    "            Ok(x) => {\n"
-    "                // boring-remote: sign this Machine ID's login only if this connection verified\n"
-    "                // the Target against the baked server key (ticket 07).\n"
-    "                interface.get_lch().write().unwrap().boring_verified_target =\n"
-    "                    crate::trust_policy::verified_target(peer, key, x.0 .2.as_deref(), x.0 .0.is_secured());\n")
-_START_OK = "            Ok(x) => {\n                // Set x.2 to true only in the connect() function"
-_LOGIN_BUILT = "        };\n        match self.conn_type {\n            ConnType::FILE_TRANSFER => lr.set_file_transfer(FileTransfer {\n"
+# The login is signed where it is sent, from the stream that carries it: a Machine ID only when
+# that stream is keyed, which with the baked key (KEY_GUARD) means this connection verified the
+# Target through the Hosted servers (ticket 07). Nothing is shared between a session's connections.
+SIGN_LOGIN = ("    // boring-remote: sign this login for the Target's trusted list, a Machine ID only over a\n"
+              "    // stream keyed to the Target this connection verified (tickets 06, 07), or the tailnet\n"
+              "    // address this stream reached for a saved Machine ID (ticket 08).\n"
+              "    let challenge = lc.read().unwrap().hash.challenge.clone();\n"
+              "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
+              "        let reached = crate::trust_policy::take_tailnet_stream(peer.local_addr());\n"
+              "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), reached);\n"
+              "    }\n")
+_SEND_LOGIN = ("    let msg_out = lc\n        .read()\n        .unwrap()\n"
+               "        .create_login_msg(os_username, os_password, password);\n"
+               "    allow_err!(peer.send(&msg_out).await);\n")
+SEND_LOGIN_SIGNED = _SEND_LOGIN.replace("    let msg_out", "    let mut msg_out", 1).replace(
+    "    allow_err!", SIGN_LOGIN + "    allow_err!", 1)
+# A Machine ID is checked only against the baked server key: whatever key a session was handed
+# (config, IPC), a keyed stream to a Machine ID then means the Hosted servers vouched for it.
+KEY_GUARD = ("        // boring-remote: a Machine ID is verified against the baked server key only (ticket 07).\n"
+             "        if boring_is_machine_id(peer) && !crate::trust_policy::baked_key(key) {\n"
+             '            bail!("Boring Remote checks Machine IDs against its own servers only");\n'
+             "        }\n")
+_START_HEAD = "        interface.update_direct(None);\n        interface.update_received(false);\n"
+# A Machine-ID session that didn't verify the Target is an attack or a fault: refused, no Continue.
+REFUSE_UNVERIFIED = (
+    "                // boring-remote: a Machine ID that didn't verify the Target against the baked\n"
+    "                // server key is refused, no Continue (ticket 07).\n"
+    "                if !is_secured && crate::client::boring_is_machine_id(&self.handler.get_id()) {\n"
+    '                    self.handler.msgbox("error", "Connection Error", crate::client::BORING_UNVERIFIED, "");\n'
+    '                    self.send_close_reason(&mut peer, "").await;\n'
+    "                    if kcp.is_some() {\n"
+    "                        tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;\n"
+    "                    }\n"
+    "                    self.handle_disconnected(round);\n"
+    "                    return;\n"
+    "                }\n")
+_INSECURE_PROMPT = ("                if !is_secured\n"
+                    "                    && !crate::common::is_direct_ip_access(&self.handler.get_id())\n")
+REFUSE_UNVERIFIED_PF = (
+    "    // boring-remote: a Machine ID that didn't verify the Target is refused, no Continue (ticket 07).\n"
+    "    if !stream.is_secured() && crate::client::boring_is_machine_id(id) {\n"
+    "        bail!(crate::client::BORING_UNVERIFIED);\n"
+    "    }\n")
+_PF_PROMPT = "    if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {\n"
 # Upstream stores the Target's Hash only after sending the login; the signature needs it first.
 HASH_FIRST_OLD = ("    send_login(lc.clone(), String::new(), String::new(), password, peer).await;\n"
                   "    lc.write().unwrap().hash = hash;\n    true\n}\n")
@@ -947,15 +1042,15 @@ PATCHES += [
      "mod trust_policy; // boring-remote: trusted Controllers (ticket 06); iOS Controllers sign too\n",
      "trust policy module (Controllers on every platform sign their logins)"),
     PROTO_PATCH,
-    ("src/client.rs", _LOGIN_BUILT, _LOGIN_BUILT.replace("        match self", SIGN_LOGIN + "        match self", 1),
-     "Controller signs each login with its own key"),
+    ("src/client.rs", _SEND_LOGIN, SEND_LOGIN_SIGNED,
+     "Controller signs each login with its own key, from the stream that carries it"),
     ("src/client.rs", HASH_FIRST_OLD, HASH_FIRST_NEW, "the login knows the Target's challenge before it is built"),
-    ("src/client.rs", VERIFIED_FIELD.split("    /// boring")[0], VERIFIED_FIELD,
-     "the login config remembers the Machine ID its connection verified"),
-    ("src/client.rs", VERIFY_CLEAR.rsplit("        interface.get_lch", 1)[0], VERIFY_CLEAR,
-     "a new connection forgets the last one's verified Machine ID"),
-    ("src/client.rs", _START_OK, _START_OK.replace("            Ok(x) => {\n", VERIFY_ON_START, 1),
-     "a connection that verified the Target against the baked server key records its Machine ID"),
+    ("src/client.rs", _START_HEAD, _START_HEAD + KEY_GUARD,
+     "a Machine ID is verified against the baked server key only"),
+    ("src/client/io_loop.rs", _INSECURE_PROMPT, REFUSE_UNVERIFIED + _INSECURE_PROMPT,
+     "an unverified Machine-ID session is refused, no Continue"),
+    ("src/port_forward.rs", _PF_PROMPT, REFUSE_UNVERIFIED_PF + _PF_PROMPT,
+     "an unverified Machine-ID port forward is refused, no Continue"),
     (HOME, '                          translate("ID"),\n',
      f'                          translate("{MACHINE_ID_LABEL}"), // boring-remote (ticket 07)\n',
      "the Target shows its Machine ID"),
@@ -988,23 +1083,31 @@ PATCHES += [
 ]
 
 # --- ticket 08: tailnet first, the Hosted servers as fallback (src/connect_plan.rs) ---------------
-# A saved Machine ID with a tailnet address gets Direct IP to it first; on success the login signs
-# that address (as a typed tailnet address does), per connection: _start hands it to start in
-# boring_tailnet_target, which start clears before every attempt and moves into the login's signed
-# name after 07's verified_target.
+# A saved Machine ID with a tailnet address gets Direct IP to it first. That stream is recorded by
+# its own local address (trust_policy::note_tailnet_stream): io_loop lets it past 07's unverified
+# Machine-ID refusal (it is Direct IP across the tailnet, like a typed address), and send_login
+# signs the address it reached, from that stream, at send time (SIGN_LOGIN). Nothing per session.
 TAILNET_FIRST_FN = """
 // boring-remote: tailnet first, then the Hosted servers (ticket 08, src/connect_plan.rs). A saved
 // Machine ID with a tailnet address gets Direct IP to it for TAILNET_TIMEOUT_MS. None: the plan has
-// no tailnet attempt, or it didn't answer; the caller goes on to the Hosted servers.
-async fn boring_tailnet_first(peer: &str, relay_only: bool) -> Option<(Stream, String)> {
+// no tailnet attempt, or it didn't answer; the caller goes on to the Hosted servers. Port forwards
+// keep the Hosted path (their verify gate has no tailnet exemption).
+async fn boring_tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) -> Option<Stream> {
     use crate::connect_plan::{plan, Attempt, PeerRecord, Reach, TAILNET_OPTION, TAILNET_TIMEOUT_MS};
+    if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) {
+        return None;
+    }
     let options = PeerConfig::load(peer).options;
     let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) };
     let reach = Reach { tailnet_up: crate::connect_plan::own_tailnet_addr().is_some(), relay_only };
     for attempt in plan(&record, reach) {
         let Attempt::Tailnet(addr) = attempt else { break };
+        let Ok(ip) = addr.parse::<std::net::IpAddr>() else { break };
         match connect_tcp_local(check_port(&addr, RELAY_PORT + 1), None, TAILNET_TIMEOUT_MS).await {
-            Ok(stream) => return Some((stream, addr)),
+            Ok(stream) => {
+                crate::trust_policy::note_tailnet_stream(stream.local_addr(), ip);
+                return Some(stream);
+            }
             Err(err) => log::info!("tailnet path didn't answer in time ({err}); trying the Hosted servers"),
         }
     }
@@ -1013,35 +1116,24 @@ async fn boring_tailnet_first(peer: &str, relay_only: bool) -> Option<(Stream, S
 """
 TAILNET_FIRST = (
     "        // boring-remote: a saved Machine ID tries its tailnet address first (ticket 08).\n"
-    "        if let Some((stream, addr)) = boring_tailnet_first(peer, interface.is_force_relay()).await {\n"
-    "            interface.get_lch().write().unwrap().boring_tailnet_target = Some(addr);\n"
+    "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {\n"
     "            return Ok(((stream, true, None, None, \"TCP\"), (0, \"\".to_owned()), false));\n"
     "        }\n")
 _OTHER_SERVER = "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n"
-TAILNET_FIELD = ("    pub boring_verified_target: Option<String>,\n"
-                 "    /// boring-remote: the tailnet address this connection reached Direct IP for a saved Machine\n"
-                 "    /// ID (ticket 08), until `Client::start` hands it to the login.\n"
-                 "    pub boring_tailnet_target: Option<String>,\n")
-TAILNET_CLEAR = ("        interface.get_lch().write().unwrap().boring_verified_target = None; // boring-remote (ticket 07)\n"
-                 "        interface.get_lch().write().unwrap().boring_tailnet_target = None; // boring-remote (ticket 08)\n")
-_START_DONE = "                Ok((x.0, x.1))\n"  # end of Client::start's Ok arm, after 07's record
-TAILNET_SIGNED = (
-    "                // boring-remote: or the tailnet address it reached Direct IP, which the login signs\n"
-    "                // instead (ticket 08): this connection's own, never another session's.\n"
-    "                let tailnet = interface.get_lch().write().unwrap().boring_tailnet_target.take();\n"
-    "                if tailnet.is_some() {\n"
-    "                    interface.get_lch().write().unwrap().boring_verified_target = tailnet;\n"
-    "                }\n")
+TAILNET_EXEMPT = (
+    "                // boring-remote: a saved Machine ID's tailnet-first stream is Direct IP across the\n"
+    "                // tailnet (WireGuard), like a typed tailnet address: no refusal, no prompt (ticket 08).\n"
+    "                let is_secured = is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());\n")
+_REFUSE_HEAD = "                // boring-remote: a Machine ID that didn't verify the Target against the baked\n"
 REMEMBER_TAILNET = (
-    "        // boring-remote: a saved Machine ID keeps the tailnet address its verified Target reports\n"
-    "        // (ticket 08).\n"
-    "        crate::connect_plan::remember_tailnet(\n"
-    "            &mut config.options,\n"
-    "            &self.id,\n"
-    "            self.boring_verified_target.as_deref(),\n"
-    "            &pi.platform_additions,\n"
-    "        );\n")
-_PEER_RELAY = "        // peer_relay only — see `initialize`: neither the proxy"
+    "                        // boring-remote: a saved Machine ID keeps the tailnet address its Target\n"
+    "                        // reports over a verified stream (ticket 08).\n"
+    "                        crate::connect_plan::save_reported_tailnet(\n"
+    "                            &self.handler.get_id(),\n"
+    "                            peer.is_secured(),\n"
+    "                            &pi.platform_additions,\n"
+    "                        );\n")
+_PEER_INFO_IN = "                        let peer_platform = pi.platform.clone();\n                        self.set_peer_info(&pi);\n"
 REPORT_TAILNET = (
     "        // boring-remote: this Target's tailnet address, for a Controller's tailnet-first path (ticket 08).\n"
     '        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]\n'
@@ -1058,8 +1150,6 @@ _SET_TYPE = ("                self.handler\n"
              "                    .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready\n")
 PATH_LABEL = ("                // boring-remote: the session shows its path: tailnet direct, direct or relayed (ticket 08).\n"
               "                let stream_type = crate::connect_plan::stream_label(stream_type, direct, peer.local_addr().ip());\n")
-_INSECURE = "                    && !crate::common::is_direct_ip_access(&self.handler.get_id())\n"
-INSECURE_SKIP = "                    && stream_type != crate::connect_plan::TAILNET_STREAM // boring-remote: WireGuard (ticket 08)\n"
 _CONN_TEXT = "String getConnectionText(bool secure, bool direct, String streamType) {\n"
 TAILNET_TEXT = ("  // boring-remote: a direct path across the tailnet (ticket 08, connect_plan.rs TAILNET_STREAM)\n"
                 "  if (streamType == 'Tailnet') {\n"
@@ -1074,22 +1164,48 @@ PATCHES += [
      TAILNET_FIRST_FN + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME", "a saved Machine ID's tailnet attempt"),
     ("src/client.rs", _OTHER_SERVER, TAILNET_FIRST + _OTHER_SERVER,
      "a saved Machine ID tries its tailnet address before the Hosted servers"),
-    ("src/client.rs", TAILNET_FIELD.split("    /// boring")[0], TAILNET_FIELD,
-     "the login config carries the tailnet address its connection reached"),
-    ("src/client.rs", TAILNET_CLEAR.rsplit("        interface.get_lch", 1)[0], TAILNET_CLEAR,
-     "a new connection forgets the last one's tailnet address"),
-    ("src/client.rs", _START_DONE, TAILNET_SIGNED + _START_DONE,
-     "a tailnet-first connection's login signs the address it reached"),
-    ("src/client.rs", _PEER_RELAY, REMEMBER_TAILNET + _PEER_RELAY,
+    ("src/client/io_loop.rs", _REFUSE_HEAD, TAILNET_EXEMPT + _REFUSE_HEAD,
+     "a tailnet-first stream is Direct IP across the tailnet, not an unverified Hosted one"),
+    ("src/client/io_loop.rs", _PEER_INFO_IN, _PEER_INFO_IN.replace(
+        "                        self.set_peer_info", REMEMBER_TAILNET + "                        self.set_peer_info", 1),
      "a saved Machine ID records the tailnet address its verified Target reports"),
     ("src/client.rs", "        let mut socket = socket?;\n", HOSTED_DOWN_ERR,
      "Hosted servers unreachable: a plain error naming them"),
     ("src/server/connection.rs", _ADDITIONS_OUT, REPORT_TAILNET + _ADDITIONS_OUT,
      "the Target reports its tailnet address after login"),
     ("src/client/io_loop.rs", _SET_TYPE, PATH_LABEL + _SET_TYPE, "the session's path label"),
-    ("src/client/io_loop.rs", _INSECURE, _INSECURE + INSECURE_SKIP,
-     "no end-to-end prompt on a direct tailnet path (WireGuard), as for a typed address"),
     (DART_COMMON, _CONN_TEXT, _CONN_TEXT + TAILNET_TEXT, "tailnet direct shown on the session"),
+]
+
+# --- 1.8.0 first launch: a Permanent password before Hosted access (ticket 09) --------
+# A Target with no Permanent password registers with no rendezvous server, so the Hosted
+# servers never learn its Machine ID (src/password_lock.rs hosted_servers). The Direct IP
+# listener is spawned before this loop and is never gated: the tailnet keeps working. The loop
+# re-reads the password every pass (CONNECT_TIMEOUT), so setting one turns Hosted on in seconds.
+HOSTED_GATE = (
+    "                let servers = crate::password_lock::hosted_servers(\n"
+    "                    Config::get_rendezvous_servers(),\n"
+    "                    Config::has_permanent_password(),\n"
+    "                ); // boring-remote: no Permanent password, no Hosted servers (ticket 09)\n")
+HOSTED_OFF_ON_REMOVE = (
+    "                        // boring-remote: no Permanent password, no Hosted registration (ticket 09).\n"
+    "                        if updated && !Config::has_permanent_password() {\n"
+    "                            crate::RendezvousMediator::restart();\n"
+    "                        }\n")
+# The home page asks a Target with no Permanent password to generate one (password_setup.dart).
+SETUP_HOOK = ("    // boring-remote: no Permanent password yet, ask for one (ticket 09).\n"
+              "    WidgetsBinding.instance.addPostFrameCallback((_) => showPasswordSetupIfNeeded());\n")
+_UNILINKS = "    _uniLinksSubscription = listenUniLinks();\n"
+_SET_PW = "                        updated = Config::set_permanent_password(&value);\n"
+PATCHES += [
+    ("src/rendezvous_mediator.rs", "                let servers = Config::get_rendezvous_servers();\n", HOSTED_GATE,
+     "no Hosted registration until a Permanent password is set"),
+    ("src/ipc.rs", _SET_PW, _SET_PW + HOSTED_OFF_ON_REMOVE, "removing the password drops the Hosted registration"),
+    (HOME, "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n",
+     "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n"
+     "import 'package:flutter_hbb/desktop/widgets/password_setup.dart';\n",
+     "password setup import (home)"),
+    (HOME, _UNILINKS, _UNILINKS + SETUP_HOOK, "first launch asks for a Permanent password"),
 ]
 
 COPIES = [
@@ -1219,12 +1335,13 @@ def plan(root):
             texts[rel] = _read(p)
         text, crlf = texts[rel]
         text2 = LANG_VALUE.sub(_lang_value, text)
-        missing = "".join(f'        ("{k}", ""),\n' for k in LANG_KEYS if f'("{k}", ' not in text2)
+        keys = [k for k in LANG_KEYS if not (p.name == "en.rs" and k in NOT_IN_EN)]
+        missing = "".join(f'        ("{k}", ""),\n' for k in keys if f'("{k}", ' not in text2)
         if missing:
             text2 = LANG_END.sub(lambda m: "),\n" + missing + m.group(1), text2, count=1)
         if text2 != text:
             texts[rel] = (text2, crlf)
-            changed.append(f"{rel}: translations say {DISPLAY_NAME}, new keys (not-found error, tickets 05/06)")
+            changed.append(f"{rel}: translations say {DISPLAY_NAME}, new keys (not-found error, tickets 05/06/09)")
     writes, deletes = {}, []
     for rel, (text, crlf) in texts.items():
         if text is not None:

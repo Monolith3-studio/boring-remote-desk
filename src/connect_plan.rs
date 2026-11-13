@@ -1,7 +1,7 @@
 //! Connect plan (ticket 08, spec slice 3): tailnet first, the Hosted servers as fallback.
 //!
 //! A saved machine is its Machine ID plus, when known, its tailnet address. The address is
-//! learned only from a session that verified the Target against the baked server key
+//! learned only over a stream that verified the Target against the baked server key
 //! (`remember_tailnet`): the Target reports it, after login, in `PeerInfo.platform_additions`.
 //! Connect order for a saved Machine ID: Direct IP to the tailnet address (`TAILNET_TIMEOUT_MS`),
 //! then the Machine ID through the Hosted servers (RustDesk's punch-through, relay last). A typed
@@ -78,12 +78,14 @@ pub fn stream_label(stream_type: &'static str, direct: bool, local: IpAddr) -> &
     }
 }
 
-/// After login: a Machine ID keeps the tailnet address its Target reports, only on a session
-/// that verified that Target against the baked server key (`verified`, ticket 07). Nothing else
-/// writes the option, so a typed name or an unverified session can't point a saved machine at
-/// another address. A verified Target that reports none (off its tailnet, or older) clears it.
-pub fn remember_tailnet(options: &mut HashMap<String, String>, id: &str, verified: Option<&str>, additions: &str) {
-    if verified != Some(id) || !crate::client::boring_is_machine_id(id) {
+/// After login: a Machine ID keeps the tailnet address its Target reports, only over a stream
+/// that verified that Target against the baked server key (`verified`: the stream is keyed, and
+/// `Client::start` runs a Machine ID with the baked key only; ticket 07). Nothing else writes the
+/// option, so a typed name, a tailnet-first stream or an unverified one can't point a saved
+/// machine at another address. A verified Target that reports none (off its tailnet, or older)
+/// clears it.
+pub fn remember_tailnet(options: &mut HashMap<String, String>, id: &str, verified: bool, additions: &str) {
+    if !verified || !crate::client::boring_is_machine_id(id) {
         return;
     }
     let reported = serde_json::from_str::<serde_json::Value>(additions)
@@ -94,6 +96,20 @@ pub fn remember_tailnet(options: &mut HashMap<String, String>, id: &str, verifie
         Some(ip) => options.insert(TAILNET_OPTION.to_owned(), ip.to_string()),
         None => options.remove(TAILNET_OPTION),
     };
+}
+
+/// `remember_tailnet` on the saved machine `id`, from the stream that carried its login
+/// (`secured`). Before `handle_peer_info`, which loads the config it saves.
+pub fn save_reported_tailnet(id: &str, secured: bool, additions: &str) {
+    if !(secured && crate::client::boring_is_machine_id(id)) {
+        return;
+    }
+    let mut config = hbb_common::config::PeerConfig::load(id);
+    let before = config.options.get(TAILNET_OPTION).cloned();
+    remember_tailnet(&mut config.options, id, secured, additions);
+    if config.options.get(TAILNET_OPTION) != before.as_ref() {
+        config.store(id);
+    }
 }
 
 /// This computer's tailnet address, if Tailscale is up: the local address the system picks to
@@ -174,7 +190,7 @@ mod tests {
         assert!(!HOSTED_DOWN.starts_with("Failed"), "start() would append 'Please try later'");
     }
 
-    fn remembered(verified: Option<&str>, additions: &str) -> Option<String> {
+    fn remembered(verified: bool, additions: &str) -> Option<String> {
         let mut options = HashMap::from([(TAILNET_OPTION.to_owned(), "100.64.0.1".to_owned())]);
         remember_tailnet(&mut options, ID, verified, additions);
         options.get(TAILNET_OPTION).cloned()
@@ -183,15 +199,17 @@ mod tests {
     #[test]
     fn a_verified_target_records_its_tailnet_address() {
         let reported = r#"{"boring_tailnet":"100.101.102.103"}"#;
-        assert_eq!(remembered(Some(ID), reported).as_deref(), Some("100.101.102.103"));
-        assert_eq!(remembered(Some(ID), "{}"), None);
-        assert_eq!(remembered(Some(ID), r#"{"boring_tailnet":"192.168.1.20"}"#), None);
+        assert_eq!(remembered(true, reported).as_deref(), Some("100.101.102.103"));
+        assert_eq!(remembered(true, "{}"), None);
+        assert_eq!(remembered(true, r#"{"boring_tailnet":"192.168.1.20"}"#), None);
     }
 
     #[test]
-    fn an_unverified_session_changes_nothing() {
+    fn an_unverified_or_tailnet_first_stream_changes_nothing() {
         let reported = r#"{"boring_tailnet":"100.101.102.103"}"#;
-        assert_eq!(remembered(None, reported).as_deref(), Some("100.64.0.1"));
-        assert_eq!(remembered(Some("100.101.102.103"), reported).as_deref(), Some("100.64.0.1"));
+        assert_eq!(remembered(false, reported).as_deref(), Some("100.64.0.1"));
+        let mut options = HashMap::new();
+        remember_tailnet(&mut options, "studio.tail1.ts.net", true, reported);
+        assert!(options.is_empty());
     }
 }

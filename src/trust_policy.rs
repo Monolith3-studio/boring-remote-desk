@@ -15,15 +15,20 @@
 //! "The Target it dialed" is one of two names, each one only this Target can answer to:
 //! - a tailnet address: the one the Controller connected to (dialed as an address, or the
 //!   address a tailnet name resolved to; `dialed_target`; or, ticket 08, the saved tailnet
-//!   address a Machine ID's tailnet-first attempt reached), which has to be the address the
+//!   address a Machine ID's tailnet-first stream reached, `reached_target`, signed once per
+//!   stream: a password retry on it clicks), which has to be the address the
 //!   connection arrived on here, from a tailnet address (`target_name`). WireGuard means only
 //!   this Target answers at its tailnet address.
-//! - its Machine ID (ticket 07): signed only on a session whose Target identity verified against
-//!   the server key baked into the app (`verified_target`): the Hosted servers vouched for the
-//!   Target's key under that server key, the Target signed this session's key exchange with it,
-//!   and the session is encrypted to it. The Target accepts its own Machine ID only on a
-//!   connection whose key exchange completed (`secured`). The signature travels inside that
-//!   encrypted session, so nobody between the two can read it and pass it on.
+//! - its Machine ID (ticket 07): signed only over a stream that verified the Target against the
+//!   server key baked into the app (`signed_target`, called with the stream that carries the
+//!   login): the Hosted servers vouched for the Target's key under that server key (`Client::start`
+//!   refuses a Machine ID with any other key), the Target signed this connection's key exchange
+//!   with it, and the stream is encrypted to it. The signature travels inside that stream, so
+//!   nobody between the two can read it and pass it on. A Machine-ID connection that doesn't
+//!   verify is refused outright, no Continue. The Target takes its own Machine ID as a name only
+//!   on a connection whose key exchange completed (`secured`). That is defense in depth only:
+//!   anyone can complete a key exchange with a Target, so it says nothing about who the
+//!   Controller is. What makes the name safe is the Controller's check.
 //! A Target the Controller logs in to can't pass the signature on to another one.
 //!
 //! A Controller without a signature (1.7 and older, stock RustDesk) gets a click every time and
@@ -44,12 +49,25 @@
 //!   (`id@server` isn't a storable ID and never takes the Hosted path), a tailnet name typed
 //!   differently from the one that resolved (`note_dialed` is keyed by the exact text), and a
 //!   Controller UI that has no key pair yet (it never makes one; the service does).
-//! - The Machine-ID name is only as good as the Hosted servers' word. Whoever holds the server's
-//!   private key (it lives on the Hosted box and in Keychain) can vouch a key of their own for a
-//!   Target's Machine ID, sit between a trusted Controller and that Target, and relay the
-//!   Controller's signed login; they still need the Target's password. Stock `hbbs` binds an ID
-//!   to the key that registered it first (its UUID check), so a machine taking over an ID there
-//!   can do the same. The key is not per-buyer until stage 1-2 (ADR 0005).
+//! - The Machine-ID name is only as good as the Hosted servers' word on which key belongs to a
+//!   Machine ID. Three ways that word can be wrong, each letting an attacker sit between a
+//!   trusted Controller and that Target and relay the Controller's signed login (no click; the
+//!   Target's password is still needed):
+//!   - whoever holds the server's private key (on the Hosted box and in Keychain) can vouch any
+//!     key for any Machine ID;
+//!   - stock `hbbs` lets a Machine ID's key change when the registration carries the same UUID
+//!     from the same IP (RegisterPk is plaintext UDP; the UUID is the machine UID, readable by
+//!     any local user and visible on the path), so someone behind the Target's own NAT who has
+//!     its UUID can re-bind its key.
+//!   Closing the second needs an `hbbs` that never lets a registered key change: a server
+//!   change, so Jason's call. Separately, squatting a MAC-derived ID before the Target first
+//!   registers gives the Target a new ID (`update_id`), so Controllers dialing the old one reach
+//!   the squatter: phishing, not a bypass (the squatter can't log in as the Controller).
+//! - The server's public key is not access control. It ships in every app, and stock `hbbs`
+//!   checks it only on punch and relay requests, not on registration: a stock RustDesk client
+//!   can register with the Hosted servers and be dialed. It can't get a trusted no-click login
+//!   (no Boring Controller key on any Target's list). Per-buyer checks wait for stage 1-2
+//!   (ADR 0005).
 //! - Tailscale addresses are unique only per tailnet: a Controller logged in to the attacker's
 //!   tailnet, dialing the address its trusted Target has on its own tailnet, could be relayed.
 //! - The port isn't bound: another listener on the Target's own tailnet address could relay a
@@ -252,10 +270,10 @@ pub fn target_name(arrived_on: IpAddr, from: &str) -> Option<String> {
 }
 
 /// Every name a Controller may have signed as this Target on this connection: its tailnet
-/// address (`target_name`) and, once this connection's key exchange with the Target's signed
-/// identity completed (`secured`), its own Machine ID (`own_id`, ticket 07). A Controller signs
-/// a Machine ID only inside a session it verified against the baked server key
-/// (`verified_target`), so only this Target can read that signature.
+/// address (`target_name`) and, once this connection's key exchange completed (`secured`), its
+/// own Machine ID (`own_id`, ticket 07). `secured` is defense in depth, not proof of who the
+/// Controller is: a Controller signs a Machine ID only over a stream it verified against the
+/// baked server key (`signed_target`), so only this Target can read that signature.
 pub fn target_names(arrived_on: IpAddr, from: &str, own_id: &str, secured: bool) -> Vec<String> {
     let mut names: Vec<String> = target_name(arrived_on, from).into_iter().collect();
     if secured && crate::client::boring_is_machine_id(own_id) {
@@ -362,37 +380,73 @@ pub fn dialed_target(peer: &str) -> Option<String> {
     is_tailnet(ip).then(|| ip.to_string())
 }
 
-/// The Machine ID this session verified (ticket 07), for `sign_login`. `Client::start` asks
-/// on every connection: `peer` when it is a Machine ID, the key the session checked the Hosted
-/// servers' word with is the baked server key (`key`, "" meaning the built-in one), their word
-/// on the Target's key checked out under it (`target_pk`, what `secure_connection` returns) and
-/// the session is encrypted to that key (`secured`: the Target signed this key exchange). None
-/// otherwise, including upstream's plaintext fallback when the Target's signature doesn't check
-/// out, so that login goes unsigned and clicks.
-pub fn verified_target(peer: &str, key: &str, target_pk: Option<&[u8]>, secured: bool) -> Option<String> {
-    let baked = key.is_empty() || key == hbb_common::config::RS_PUB_KEY;
-    (crate::client::boring_is_machine_id(peer) && baked && target_pk.is_some() && secured)
-        .then(|| peer.to_owned())
+/// The key a connection checks the Hosted servers' word with is the baked server key ("" means
+/// the built-in one). `Client::start` refuses a Machine ID with any other key (ticket 07).
+pub fn baked_key(key: &str) -> bool {
+    key.is_empty() || key == hbb_common::config::RS_PUB_KEY
 }
 
 /// What this Controller signs as the Target: a tailnet address it connected to
-/// (`dialed_target`), or the Machine ID this session verified (`verified`, from
-/// `verified_target`) when that is the Target this login is for, or (ticket 08) the tailnet
-/// address this session reached Direct IP for a saved Machine ID (`verified`, which
-/// `Client::start` sets from that connection only). None for anything else.
-pub fn signed_target(peer: &str, verified: Option<&str>) -> Option<String> {
-    dialed_target(peer)
-        .or_else(|| verified.filter(|v| *v == peer).map(str::to_owned))
-        .or_else(|| verified.and_then(ip_in).filter(|ip| is_tailnet(*ip)).map(|ip| ip.to_string()))
+/// (`dialed_target`), or `peer`'s Machine ID when the stream carrying this login is keyed
+/// (`secured`, ticket 07). On a Machine-ID connection, a keyed stream means `secure_connection`
+/// checked the Hosted servers' word on the Target's key under the baked key (`baked_key`) and
+/// the Target signed this key exchange with that key; upstream's plaintext fallback leaves it
+/// unkeyed. None for anything else, so that login goes unsigned and clicks.
+pub fn signed_target(peer: &str, secured: bool) -> Option<String> {
+    dialed_target(peer).or_else(|| (secured && crate::client::boring_is_machine_id(peer)).then(|| peer.to_owned()))
+}
+
+// --- ticket 08: a saved Machine ID's tailnet-first connection ---------------------------
+
+/// Streams `boring_tailnet_first` (client.rs) connected Direct IP to a saved Machine ID's
+/// tailnet address, by the stream's local address (unique while it is open), with the address
+/// each reached. Per connection: never shared by a session's other connections.
+static TAILNET_STREAMS: Mutex<Vec<(SocketAddr, IpAddr)>> = Mutex::new(Vec::new());
+
+/// The stream whose local end is `local` reached `reached`, a tailnet address.
+pub fn note_tailnet_stream(local: SocketAddr, reached: IpAddr) {
+    if !is_tailnet(reached) {
+        return;
+    }
+    let mut streams = TAILNET_STREAMS.lock().unwrap();
+    streams.retain(|(l, _)| *l != local);
+    if streams.len() >= 64 {
+        streams.remove(0);
+    }
+    streams.push((local, canonical(reached)));
+}
+
+/// This stream is a saved Machine ID's tailnet-first connection: Direct IP across the tailnet
+/// (WireGuard), like a typed tailnet address. Not a Hosted connection that failed to verify.
+pub fn is_tailnet_stream(local: SocketAddr) -> bool {
+    TAILNET_STREAMS.lock().unwrap().iter().any(|(l, _)| *l == local)
+}
+
+/// The tailnet address this stream reached, taken when its login is sent: that login signs it.
+pub fn take_tailnet_stream(local: SocketAddr) -> Option<IpAddr> {
+    let mut streams = TAILNET_STREAMS.lock().unwrap();
+    let i = streams.iter().position(|(l, _)| *l == local)?;
+    Some(streams.remove(i).1)
+}
+
+/// What a Machine ID's login signs on its tailnet-first stream (`reached`, from
+/// `take_tailnet_stream`): the tailnet address that stream connected to, as for a typed one.
+/// None for anything else.
+pub fn reached_target(peer: &str, reached: Option<IpAddr>) -> Option<String> {
+    reached
+        .filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer))
+        .map(|ip| canonical(ip).to_string())
 }
 
 /// Sign this login with the Controller's own key pair, for the Target's trusted list. Left
-/// unsigned (the Target then asks) for a Target it can't bind (`signed_target`), a challenge no
-/// Target makes, or no key pair. On desktop it takes the key pair the service made and never
-/// makes one: a key made by this UI process could differ from the service's or race it. Mobile
-/// runs both sides in one process.
-pub fn sign_login(lr: &mut LoginRequest, challenge: &str, verified: Option<&str>) {
-    let Some(target) = signed_target(&lr.username, verified) else {
+/// unsigned (the Target then asks) for a Target it can't bind (`signed_target`, or ticket 08's
+/// `reached_target`), a challenge no Target makes, or no key pair. `secured`: the stream this
+/// login goes out on is keyed; `reached`: the tailnet address that stream connected to, if it
+/// is a tailnet-first one. On
+/// desktop it takes the key pair the service made and never makes one: a key made by this UI
+/// process could differ from the service's or race it. Mobile runs both sides in one process.
+pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool, reached: Option<IpAddr>) {
+    let Some(target) = signed_target(&lr.username, secured).or_else(|| reached_target(&lr.username, reached)) else {
         return;
     };
     if login_message(challenge, &target, &lr.my_id).is_none() {
@@ -551,17 +605,17 @@ mod tests {
         /// The LoginRequest this Controller sends after dialing `dialed` (unsigned where
         /// `dialed_target` has nothing to bind, as `sign_login` does).
         fn login(&self, challenge: &str, dialed: &str) -> LoginRequest {
-            self.login_verified(challenge, dialed, None)
+            self.login_over(challenge, dialed, false)
         }
 
-        /// The same, on a session `verified_target` vouched for (`verified`).
-        fn login_verified(&self, challenge: &str, dialed: &str, verified: Option<&str>) -> LoginRequest {
+        /// The same, sent over a stream that is keyed (`secured`) or not.
+        fn login_over(&self, challenge: &str, dialed: &str, secured: bool) -> LoginRequest {
             let mut lr = LoginRequest {
                 my_id: self.id.to_owned(),
                 username: dialed.to_owned(),
                 ..Default::default()
             };
-            if let Some(target) = signed_target(dialed, verified) {
+            if let Some(target) = signed_target(dialed, secured) {
                 let sig = signature(challenge, &target, self.id, &self.sk.0).unwrap();
                 lr.boring_controller_pk = self.pk.to_vec().into();
                 lr.boring_login_sig = sig.into();
@@ -606,11 +660,6 @@ mod tests {
     fn machine_id_decides(lr: &LoginRequest, challenge: &str, list: &Trusted) -> Decision {
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
         hosted_decides(lr, challenge, list, lan, "203.0.113.7", (MACHINE_ID, true))
-    }
-
-    /// What `Client::start` records for a session that verified `MACHINE_ID` (ticket 07).
-    fn verified_session() -> Option<String> {
-        verified_target(MACHINE_ID, hbb_common::config::RS_PUB_KEY, Some(&[7u8; 32][..]), true)
     }
 
     /// The same, for Direct IP across the tailnet.
@@ -718,40 +767,38 @@ mod tests {
         let c = controller(KNOWN);
         assert!(c.login(CHALLENGE, MACHINE_ID).boring_login_sig.is_empty());
         assert_eq!(dialed_target(MACHINE_ID), None);
-        assert_eq!(signed_target(MACHINE_ID, None), None);
-        // A session that verified another Machine ID doesn't sign this one.
-        assert!(c.login_verified(CHALLENGE, MACHINE_ID, Some("111222333")).boring_login_sig.is_empty());
+        assert_eq!(signed_target(MACHINE_ID, false), None);
     }
 
     // --- Machine ID through the Hosted servers (ticket 07) ---
 
     #[test]
-    fn a_session_counts_as_verified_only_against_the_baked_server_key() {
-        let pk = [7u8; 32];
-        let baked = hbb_common::config::RS_PUB_KEY;
-        assert_eq!(verified_session(), Some(MACHINE_ID.to_owned()));
-        // "" is what a session without a configured key checks with: the built-in one.
-        assert_eq!(verified_target(MACHINE_ID, "", Some(&pk[..]), true), Some(MACHINE_ID.to_owned()));
-        // Another server's key (id@server?key=, a config key that isn't ours) never counts.
-        let other = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        assert_ne!(other, baked);
-        assert_eq!(verified_target(MACHINE_ID, other, Some(&pk[..]), true), None);
-        // The servers' word on the Target's key didn't check out: nothing to bind to.
-        assert_eq!(verified_target(MACHINE_ID, baked, None, true), None);
-        // Upstream's plaintext fallback: the Target's signature didn't check out, so the
-        // session isn't keyed to it.
-        assert_eq!(verified_target(MACHINE_ID, baked, Some(&pk[..]), false), None);
-        // Only a plain Machine ID: never an address, a name or an id@server.
-        for peer in [TARGET, "studio.tail1.ts.net", "555666777@rs.example.com", "", "55 66"] {
-            assert_eq!(verified_target(peer, baked, Some(&pk[..]), true), None, "{peer:?}");
+    fn only_the_baked_server_key_counts() {
+        // "" is what a connection without a configured key checks with: the built-in one.
+        assert!(baked_key(""));
+        assert!(baked_key(hbb_common::config::RS_PUB_KEY));
+        // Another server's key (id@server?key=, a config or IPC key that isn't ours) never does.
+        assert!(!baked_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    }
+
+    #[test]
+    fn a_machine_id_is_signed_only_over_a_keyed_stream() {
+        assert_eq!(signed_target(MACHINE_ID, true), Some(MACHINE_ID.to_owned()));
+        // Upstream's plaintext fallback leaves the stream unkeyed: never signed.
+        assert_eq!(signed_target(MACHINE_ID, false), None);
+        // A keyed stream never makes an address, a name or id@server a Machine ID.
+        for peer in ["192.168.1.5", "studio.tail1.ts.net", "555666777@rs.example.com", "", "55 66"] {
+            assert_eq!(signed_target(peer, true), None, "{peer:?}");
         }
+        // A tailnet address is still signed as before, keyed or not.
+        assert_eq!(signed_target(TARGET, true), Some(TARGET.to_owned()));
     }
 
     #[test]
     fn machine_id_login_on_a_verified_session_is_trusted() {
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        let lr = c.login_verified(CHALLENGE, MACHINE_ID, verified_session().as_deref());
+        let lr = c.login_over(CHALLENGE, MACHINE_ID, true);
         assert!(!lr.boring_login_sig.is_empty());
         assert_eq!(machine_id_decides(&lr, CHALLENGE, &list), Decision::Allow);
     }
@@ -761,7 +808,7 @@ mod tests {
         // A connection whose key exchange didn't complete could be anyone's: no Machine ID name.
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        let lr = c.login_verified(CHALLENGE, MACHINE_ID, verified_session().as_deref());
+        let lr = c.login_over(CHALLENGE, MACHINE_ID, true);
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
         assert_eq!(hosted_decides(&lr, CHALLENGE, &list, lan, "203.0.113.7", (MACHINE_ID, false)), Decision::Ask);
     }
@@ -771,11 +818,11 @@ mod tests {
         // Signed for 555666777, presented to a Target whose Machine ID is another one.
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        let lr = c.login_verified(CHALLENGE, MACHINE_ID, verified_session().as_deref());
+        let lr = c.login_over(CHALLENGE, MACHINE_ID, true);
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
         assert_eq!(hosted_decides(&lr, CHALLENGE, &list, lan, "203.0.113.7", ("111222333", true)), Decision::Ask);
         // ...or over another challenge.
-        let other = c.login_verified("other7", MACHINE_ID, verified_session().as_deref());
+        let other = c.login_over("other7", MACHINE_ID, true);
         assert_eq!(machine_id_decides(&other, CHALLENGE, &list), Decision::Ask);
     }
 
@@ -830,16 +877,41 @@ mod tests {
 
     #[test]
     fn saved_machine_id_reached_on_its_tailnet_address_signs_that_address() {
-        // Ticket 08: Client::start hands the login the tailnet address this connection reached.
+        // Ticket 08: the login sent over a tailnet-first stream signs the address it reached.
         let c = controller(KNOWN);
         let list = trusted(&[(KNOWN, &c.pk)]);
-        let lr = c.login_verified(CHALLENGE, MACHINE_ID, Some(TARGET));
+        let target = reached_target(MACHINE_ID, Some(TARGET_IP)).unwrap();
+        assert_eq!(target, TARGET);
+        let lr = LoginRequest {
+            my_id: KNOWN.to_owned(),
+            username: MACHINE_ID.to_owned(),
+            boring_controller_pk: c.pk.to_vec().into(),
+            boring_login_sig: signature(CHALLENGE, &target, KNOWN, &c.sk.0).unwrap().into(),
+            ..Default::default()
+        };
         assert_eq!(decides_on(&lr, CHALLENGE, &list, TARGET_IP, FROM), Decision::Allow);
         // Relayed or punched (not arriving on the tailnet address), it binds nothing: a click.
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
         assert_eq!(decides_on(&lr, CHALLENGE, &list, lan, "203.0.113.7"), Decision::Ask);
-        // A non-tailnet address is never signed.
-        assert!(c.login_verified(CHALLENGE, MACHINE_ID, Some("192.168.1.20")).boring_login_sig.is_empty());
+        // Never a non-tailnet address, never for a typed name, never without a tailnet-first stream.
+        assert_eq!(reached_target(MACHINE_ID, Some(lan)), None);
+        assert_eq!(reached_target("studio.tail1.ts.net", Some(TARGET_IP)), None);
+        assert_eq!(reached_target(MACHINE_ID, None), None);
+    }
+
+    #[test]
+    fn a_tailnet_first_stream_is_known_by_its_own_local_address_and_signed_once() {
+        let mine: SocketAddr = "100.70.0.9:50001".parse().unwrap();
+        let other: SocketAddr = "100.70.0.9:50002".parse().unwrap();
+        note_tailnet_stream(mine, TARGET_IP);
+        assert!(is_tailnet_stream(mine));
+        assert!(!is_tailnet_stream(other));
+        assert_eq!(take_tailnet_stream(other), None);
+        assert_eq!(take_tailnet_stream(mine), Some(TARGET_IP));
+        assert_eq!(take_tailnet_stream(mine), None);
+        // A non-tailnet address is never recorded.
+        note_tailnet_stream(other, "192.168.1.20".parse().unwrap());
+        assert!(!is_tailnet_stream(other));
     }
 
     #[test]
@@ -855,20 +927,18 @@ mod tests {
     #[test]
     fn a_login_it_cant_bind_or_built_before_the_challenge_is_left_unsigned() {
         // Returns before the key pair is read.
-        let verified = verified_session();
-        for (challenge, dialed, session) in [
-            ("", TARGET, None),
-            (CHALLENGE, "192.168.1.5", None),
-            (CHALLENGE, MACHINE_ID, None),
-            ("", MACHINE_ID, verified.as_deref()),
-            (CHALLENGE, "111222333", verified.as_deref()),
+        for (challenge, dialed, secured) in [
+            ("", TARGET, false),
+            (CHALLENGE, "192.168.1.5", true),
+            (CHALLENGE, MACHINE_ID, false),
+            ("", MACHINE_ID, true),
         ] {
             let mut lr = LoginRequest {
                 my_id: KNOWN.to_owned(),
                 username: dialed.to_owned(),
                 ..Default::default()
             };
-            sign_login(&mut lr, challenge, session);
+            sign_login(&mut lr, challenge, secured);
             assert!(lr.boring_login_sig.is_empty() && lr.boring_controller_pk.is_empty(), "{dialed}");
         }
     }

@@ -367,7 +367,7 @@ class RebrandSeam(unittest.TestCase):
     SHOWN_ONCE = "the new password closes only on I've saved it, and Reset asks before replacing"
     CLIPBOARD = "a copied password leaves the clipboard after a minute"
     ONE_TIME_LABEL = "one-time password label hidden when it is off (desktop and mobile)"
-    UI_KEYS = "new UI strings (tickets 05, 06, 07) have a key in every translation file"
+    UI_KEYS = "new UI strings (tickets 05, 06, 07, 09) have a key in every translation file"
 
     def test_password_lock_facts_pass_after_rebrand(self):
         self.rebrand()
@@ -1090,44 +1090,55 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/lang/de.rs", '        ("Machine ID", ""),\n', "")
         self.assert_check_fails(self.UI_KEYS)
 
-    # Controller side: sign a Machine ID only on a session verified against the baked key.
-    def test_signing_on_the_plaintext_fallback_fails_check(self):
+    # Controller side: sign a Machine ID only over a stream verified against the baked key,
+    # decided from that stream at send time (review M1), and refuse unverified ones (S1).
+    def test_signing_a_machine_id_on_an_unkeyed_stream_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", " && target_pk.is_some() && secured)", " && target_pk.is_some())")
-        self.assert_check_fails(self.HOSTED_SIGNED)
-
-    def test_signing_without_the_servers_word_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", " && baked && target_pk.is_some() && secured)", " && baked && secured)")
+        self.edit("src/trust_policy.rs", "(secured && crate::client::boring_is_machine_id(peer))",
+                  "crate::client::boring_is_machine_id(peer)")
         self.assert_check_fails(self.HOSTED_SIGNED)
 
     def test_signing_under_another_servers_key_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    let baked = key.is_empty() || key == hbb_common::config::RS_PUB_KEY;\n",
-                  "    let baked = !key.is_empty();\n")
+        self.edit("src/trust_policy.rs", "    key.is_empty() || key == hbb_common::config::RS_PUB_KEY\n",
+                  "    !key.is_empty()\n")
         self.assert_check_fails(self.HOSTED_SIGNED)
 
-    def test_signing_a_machine_id_the_session_did_not_verify_fails_check(self):
+    def test_machine_id_running_with_another_key_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "verified.filter(|v| *v == peer).map(str::to_owned)",
-                  "verified.map(|_| peer.to_owned())")
+        self.edit("src/client.rs", rebrand.KEY_GUARD, "")
         self.assert_check_fails(self.HOSTED_SIGNED)
 
-    def test_verified_machine_id_kept_across_connections_fails_check(self):
+    def test_verified_flag_kept_per_session_fails_check(self):
+        # review M1: a session's connections share its LoginConfigHandler.
         self.rebrand()
-        self.edit("src/client.rs", rebrand.VERIFY_CLEAR, rebrand.VERIFY_CLEAR.rsplit("        interface.get_lch", 1)[0])
+        self.edit("src/client.rs", "    pub other_server: Option<(String, String, String)>,\n",
+                  "    pub other_server: Option<(String, String, String)>,\n    pub boring_verified_target: Option<String>,\n")
         self.assert_check_fails(self.HOSTED_SIGNED)
 
-    def test_verified_machine_id_set_elsewhere_fails_check(self):
+    def test_login_signed_without_asking_its_stream_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        crate::trust_policy::sign_login(",
-                  "        let _ = &self.boring_verified_target;\n        crate::trust_policy::sign_login(")
-        self.assert_check_fails(self.HOSTED_SIGNED)
-
-    def test_login_signed_with_its_own_id_as_verified_fails_check(self):
-        self.rebrand()
-        self.edit("src/client.rs", "self.boring_verified_target.as_deref());", "Some(&self.id));")
+        self.edit("src/client.rs", "sign_login(lr, &challenge, peer.is_secured(), reached);",
+                  "sign_login(lr, &challenge, true, reached);")
         self.assert_check_fails(self.SIGNED)
+
+    def test_login_signed_where_it_is_built_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        match self.conn_type {\n            ConnType::FILE_TRANSFER",
+                  "        crate::trust_policy::sign_login(&mut lr, &self.hash.challenge, true);\n"
+                  "        match self.conn_type {\n            ConnType::FILE_TRANSFER")
+        self.assert_check_fails(self.SIGNED)
+
+    def test_unverified_machine_id_session_continued_fails_check(self):
+        # review S1: no Continue past the insecure prompt for a Machine ID.
+        self.rebrand()
+        self.edit("src/client/io_loop.rs", rebrand.REFUSE_UNVERIFIED, "")
+        self.assert_check_fails(self.HOSTED_SIGNED)
+
+    def test_unverified_machine_id_port_forward_continued_fails_check(self):
+        self.rebrand()
+        self.edit("src/port_forward.rs", rebrand.REFUSE_UNVERIFIED_PF, "")
+        self.assert_check_fails(self.HOSTED_SIGNED)
 
     def test_stream_keyed_outside_the_verified_branch_fails_check(self):
         # is_secured() would no longer mean the Target's signed identity checked out.
@@ -1141,6 +1152,106 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/client.rs", "                    if id == peer_id {\n                        sign_pk = Some(sign::PublicKey(pk));",
                   "                    if true {\n                        sign_pk = Some(sign::PublicKey(pk));")
         self.assert_check_fails(self.HOSTED_SIGNED)
+
+    # Review S2-S6: what the Hosted path newly exposes.
+    RELAY = "the Controller's relay is always the locked relay-server, never a host the peer names"
+    NO_STUN = "no WebRTC, IPv6 or UDP punch, and no third-party STUN or TURN host ships"
+    DIRECT_TAILNET = "Direct IP (21118) answers tailnet addresses only"
+    NO_CHANGE_ID = "Change ID is off: hidden on desktop and mobile, refused if called (the Machine ID never changes)"
+
+    def test_exposure_facts_pass_after_rebrand_and_fail_upstream(self):
+        upstream = run(CHECK, self.root).stdout
+        self.rebrand()
+        rebranded = run(CHECK, self.root).stdout
+        for fact in (self.RELAY, self.NO_STUN, self.DIRECT_TAILNET, self.NO_CHANGE_ID):
+            self.assertIn(f"FAIL {fact}", upstream)
+            self.assertIn(f"PASS {fact}", rebranded)
+
+    def test_relay_named_by_the_peer_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", rebrand.RELAY_OURS, "")
+        self.assert_check_fails(self.RELAY)
+
+    def test_relay_helper_returning_the_advertised_host_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "    Ok(ours)\n}\n", "    Ok(advertised.to_owned())\n}\n")
+        self.assert_check_fails(self.RELAY)
+
+    def test_webrtc_or_punch_unlocked_fails_check(self):
+        for key in ("enable-webrtc", "enable-ipv6-punch", "enable-udp-punch"):
+            with self.subTest(key=key):
+                self.rebrand()
+                self.edit(HBB, f'("{key}", "N")', f'("{key}", "Y")')
+                self.assert_check_fails(self.NO_STUN)
+                self.edit(HBB, f'("{key}", "Y")', f'("{key}", "N")')
+
+    def test_target_answering_webrtc_fails_check(self):
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", "        let webrtc_viable = false\n            && ",
+                  "        let webrtc_viable = ")
+        self.assert_check_fails(self.NO_STUN)
+
+    def test_target_ipv6_punch_fails_check(self):
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs",
+                  "    if true { return Default::default(); } // boring-remote: no IPv6 punch (ticket 07)\n", "")
+        self.assert_check_fails(self.NO_STUN)
+
+    def test_third_party_stun_host_fails_check(self):
+        self.rebrand()
+        self.edit("libs/hbb_common/src/webrtc.rs", f'["stun:{self.HOST}:3478"]', '["stun:stun.l.google.com:19302"]')
+        self.assert_check_fails(self.NO_STUN)
+
+    def test_direct_ip_from_any_address_fails_check(self):
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", rebrand.DIRECT_TAILNET_ONLY, "")
+        self.assert_check_fails(self.DIRECT_TAILNET)
+
+    def test_change_id_back_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, '("disable-change-id", "Y")', '("disable-change-id", "N")')
+        self.assert_check_fails(self.NO_CHANGE_ID)
+
+    def test_change_id_callable_fails_check(self):
+        self.rebrand()
+        self.edit("src/ui_interface.rs",
+                  "    if true { return INVALID_FORMAT; } // boring-remote: the Machine ID never changes (ticket 07)\n", "")
+        self.assert_check_fails(self.NO_CHANGE_ID)
+
+    def test_whitelist_in_builtin_or_hard_settings_fails_check(self):
+        self.rebrand()
+        self.edit(HBB, "pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+                  'pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = '
+                  'RwLock::new([("whitelist", "100.64.0.0/10")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());')
+        self.assert_check_fails(self.NO_WHITELIST)
+
+    def test_swapped_key_baked_by_the_rebrand_fails_check(self):
+        # review S5: swap server-key.pub, rebrand with it, check: the pin catches it.
+        other = base64.b64encode(bytes(range(1, 33))).decode()
+        r = self.rebrand_with_key(other)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f'pub const RS_PUB_KEY: &str = "{other}";', (self.root / HBB).read_text())
+        self.assertIn(f"FAIL {self.BAKED}", self.check_with_key_file(other))
+
+    def test_key_differing_from_the_servers_repo_fails_check(self):
+        self.rebrand()
+        saved = check.SERVERS_REPO_KEY
+        check.SERVERS_REPO_KEY = self.tmp / "servers-id_ed25519.pub"
+        check.SERVERS_REPO_KEY.write_text(base64.b64encode(bytes(range(32))).decode())
+        try:
+            out = self.check_with_key_file(self.SERVERS_PUB)
+        finally:
+            check.SERVERS_REPO_KEY = saved
+        self.assertIn(f"FAIL {self.BAKED}", out)
+
+    def test_machine_id_label_listed_in_english_fails_check(self):
+        # review N5: English shows the key as it is, so en.rs doesn't list it.
+        self.rebrand()
+        self.assertNotIn('("Machine ID", ', (self.root / "src/lang/en.rs").read_text())
+        path = self.root / "src/lang/en.rs"
+        text = path.read_text()
+        path.write_text(rebrand.LANG_END.sub(lambda m: '),\n        ("Machine ID", ""),\n' + m.group(1), text, count=1))
+        self.assert_check_fails(self.UI_KEYS)
 
     # Target side: its Machine ID is a signed name only on a keyed connection.
     def test_machine_id_name_on_an_unkeyed_connection_fails_check(self):
@@ -1163,7 +1274,7 @@ class RebrandSeam(unittest.TestCase):
 
     # --- ticket 08: tailnet first, the Hosted servers as fallback -----------------------
     FIRST = "a saved Machine ID tries its tailnet address first (~3 s), then the Hosted servers (ticket 08)"
-    TAILNET_SIGNED = "a tailnet-first login signs only the address its own connection reached (ticket 08)"
+    TAILNET_SIGNED = "a tailnet-first login signs only the address its own stream reached, at send time (ticket 08)"
     LEARNED = "a saved Machine ID records a tailnet address only from its verified Target (ticket 08)"
     DOWN = "Hosted servers unreachable: a plain error naming rs.theboringremote.com (ticket 08)"
     PATH = "the session shows tailnet direct, direct or relayed (ticket 08)"
@@ -1179,8 +1290,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_tailnet_attempt_before_the_hosted_servers_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        if let Some((stream, addr)) = boring_tailnet_first(peer, interface.is_force_relay()).await {",
-                  "        if let Some((stream, addr)) = None::<(Stream, String)> {")
+        self.edit("src/client.rs", "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {",
+                  "        if let Some(stream) = None::<Stream> {")
         self.assert_check_fails(self.FIRST)
 
     def test_slow_tailnet_attempt_fails_check(self):
@@ -1201,27 +1312,33 @@ class RebrandSeam(unittest.TestCase):
                   "        let _ = Attempt::DirectIp(peer.id.to_owned());\n")
         self.assert_check_fails(self.FIRST)
 
-    def test_tailnet_address_kept_across_connections_fails_check(self):
+    def test_reached_address_kept_after_the_login_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs",
-                  "        interface.get_lch().write().unwrap().boring_tailnet_target = None; // boring-remote (ticket 08)\n", "")
+        self.edit("src/trust_policy.rs", "    Some(streams.remove(i).1)\n", "    Some(streams[i].1)\n")
         self.assert_check_fails(self.TAILNET_SIGNED)
 
-    def test_tailnet_address_read_elsewhere_fails_check(self):
+    def test_tailnet_stream_read_elsewhere_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        crate::trust_policy::sign_login(",
-                  "        let _ = &self.boring_tailnet_target;\n        crate::trust_policy::sign_login(")
+        self.edit("src/client.rs", "        let reached = crate::trust_policy::take_tailnet_stream(",
+                  "        let _ = crate::trust_policy::is_tailnet_stream(peer.local_addr());\n"
+                  "        let reached = crate::trust_policy::take_tailnet_stream(")
         self.assert_check_fails(self.TAILNET_SIGNED)
 
     def test_controller_signing_a_saved_lan_address_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", ".filter(|ip| is_tailnet(*ip)).map(|ip| ip.to_string()))",
-                  ".map(|ip| ip.to_string()))")
-        self.assert_check_fails(self.HOSTED_SIGNED)
+        self.edit("src/trust_policy.rs", ".filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer))",
+                  ".filter(|_| crate::client::boring_is_machine_id(peer))")
+        self.assert_check_fails(self.TAILNET_SIGNED)
+
+    def test_every_unverified_machine_id_let_through_fails_check(self):
+        self.rebrand()
+        self.edit("src/client/io_loop.rs", "is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());",
+                  "true;")
+        self.assert_check_fails(self.TAILNET_SIGNED)
 
     def test_unverified_session_recording_a_tailnet_address_fails_check(self):
         self.rebrand()
-        self.edit("src/connect_plan.rs", "    if verified != Some(id) || !crate::client::boring_is_machine_id(id) {",
+        self.edit("src/connect_plan.rs", "    if !verified || !crate::client::boring_is_machine_id(id) {",
                   "    if !crate::client::boring_is_machine_id(id) {")
         self.assert_check_fails(self.LEARNED)
 
@@ -1249,11 +1366,104 @@ class RebrandSeam(unittest.TestCase):
         self.rebrand()
         self.edit("flutter/lib/common.dart", "  if (streamType == 'Tailnet') {\n", "  if (false) {\n")
         self.assert_check_fails(self.PATH)
+    # --- ticket 09: 1.8.0 first launch sets a Permanent password ---------------------
+    HOSTED_GATE = ("no Permanent password, no Hosted servers: the Target registers its Machine ID only once "
+                   "a password is set; Direct IP keeps listening (ticket 09)")
+    HOSTED_OFF_ON_REMOVE = "removing the Permanent password drops the Hosted registration (ticket 09)"
 
-    def test_insecure_prompt_skipped_for_every_stream_fails_check(self):
+    def test_hosted_gate_facts_pass_after_rebrand(self):
         self.rebrand()
-        self.edit("src/client/io_loop.rs", "&& stream_type != crate::connect_plan::TAILNET_STREAM", "&& false")
-        self.assert_check_fails(self.PATH)
+        r = run(CHECK, self.root)
+        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_hosted_gate_facts_fail_on_clean_upstream_tree(self):
+        r = run(CHECK, self.root)
+        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+            self.assertIn(f"FAIL {fact}", r.stdout)
+
+    def test_registering_without_a_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", rebrand.HOSTED_GATE, "                let servers = Config::get_rendezvous_servers();\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_gate_helper_ignoring_the_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "    if password_set {\n", "    if true {\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_direct_ip_behind_the_password_gate_fails_check(self):
+        # The tailnet path keeps working while setup is pending: Direct IP is never gated.
+        self.rebrand()
+        med = "src/rendezvous_mediator.rs"
+        spawn = "        tokio::spawn(async move {\n            direct_server(server_cloned).await;\n        });\n"
+        self.edit(med, spawn, "        if Config::has_permanent_password() {\n" + spawn + "        }\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_password_removal_keeping_the_registration_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", rebrand.HOSTED_OFF_ON_REMOVE, "")
+        self.assert_check_fails(self.HOSTED_OFF_ON_REMOVE)
+
+    SETUP_SCREEN = ("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs "
+                    "the generator and shows the password once; never again once one is set (ticket 09)")
+    SETUP = "flutter/lib/desktop/widgets/password_setup.dart"
+
+    def test_setup_screen_fact_passes_after_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {self.SETUP_SCREEN}", run(CHECK, self.root).stdout)
+
+    def test_setup_screen_fact_fails_on_clean_upstream_tree(self):
+        self.assertIn(f"FAIL {self.SETUP_SCREEN}", run(CHECK, self.root).stdout)
+
+    def test_setup_screen_not_wired_into_the_home_page_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, rebrand.SETUP_HOOK, "")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_shown_with_a_password_already_set_fails_check(self):
+        self.rebrand()
+        self.edit(self.SETUP, "  if (await permanentPasswordSet()) return;\n", "")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_not_showing_the_password_once_fails_check(self):
+        self.rebrand()
+        self.edit(self.SETUP, "showGeneratedPasswordOnce(pass);", "showToast(pass);")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    KEPT = ("the 1.8.0 Update keeps 1.7.x's config: same config dir and License key option, the update script "
+            "never touches it, and nothing we add clears saved machines or settings (ticket 09)")
+
+    def test_config_kept_fact_passes_after_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {self.KEPT}", run(CHECK, self.root).stdout)
+
+    def test_config_kept_fact_fails_on_clean_upstream_tree(self):
+        self.assertIn(f"FAIL {self.KEPT}", run(CHECK, self.root).stdout)
+
+    def test_moved_config_dir_fails_check(self):
+        # A new org or app name is a new, empty config dir: every saved machine gone.
+        self.rebrand()
+        self.edit(HBB, '"io.boringlabs".to_owned()', '"io.boringlabs.remote".to_owned()')
+        self.assert_check_fails(self.KEPT)
+
+    def test_renamed_license_key_option_fails_check(self):
+        self.rebrand()
+        self.edit("src/license_key.rs", '"boring-license-key"', '"boring-license"')
+        self.assert_check_fails(self.KEPT)
+
+    def test_migration_clearing_saved_machines_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "pub fn generate() -> String {\n",
+                  "pub fn migrate() {\n    for (id, _, _) in PeerConfig::peers(None) {\n"
+                  "        PeerConfig::remove(&id);\n    }\n}\n\npub fn generate() -> String {\n")
+        self.assert_check_fails(self.KEPT)
+
+    def test_update_script_touching_the_config_fails_check(self):
+        self.rebrand()
+        self.edit("src/platform/privileges_scripts/install-update.sh", 'rm -rf "$PREV"\n',
+                  'rm -rf "$PREV"\nrm -rf "$ROOT/Library/Preferences/io.boringlabs.BoringRemote"\n')
+        self.assert_check_fails(self.KEPT)
 
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",
