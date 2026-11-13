@@ -58,6 +58,7 @@ class KitArt(unittest.TestCase):
             self.assertIn(kit["coral"], px, name)
 
 
+@unittest.skipUnless(WORKFLOW.exists(), "no workflow (ticket 10); the Windows release script and its smoke test come with ticket 11")
 class FirewallRuleInCI(unittest.TestCase):
     """The MSI smoke test proves the app rule that lets other computers reach Direct Link."""
 

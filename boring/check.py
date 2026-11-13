@@ -1643,16 +1643,20 @@ def tailnet_dart():
 
 
 def home_checks(c):
-    """v1.7 review: Home, Settings and copy. Outside the building is Tailscale (ADR 0004): Home's
-    sheet gives this computer's Tailscale address, never the numeric ID."""
+    """v1.7 review: Home, Settings and copy. 1.8 (ADR 0005 hosted): outside the building is this
+    computer's Machine ID first, from the service, with its Tailscale address as the backup path."""
     home = fn_body(c.read(rebrand.HOME), "  Widget buildBoringHome(BuildContext context) {") or ""
     kit = c.read("flutter/lib/desktop/kit/tailscale.dart")
+    sheet = c.read("flutter/lib/desktop/kit/mac_home.dart")
     why = []
     if "MacHome(" not in home or "tailscaleAddress: thisTailscaleAddress," not in home:
         why.append("buildBoringHome does not hand MacHome this computer's Tailscale address")
-    why += [f"buildBoringHome still reads the ID ({n})" for n in ("serverId", "myId") if n in home]
+    if "machineId: () => bind.mainGetMyId()," not in home or "serverId" in home:
+        why.append("the Machine ID isn't the service's own")
+    if not 0 <= sheet.find("..._machineId(t, one),") < sheet.find("if (snap.connectionState != ConnectionState.done)"):
+        why.append("the sheet doesn't lead with the Machine ID")
     why += [f"tailscale.dart range is not rebrand.TAILNET: {e}" for e in tailnet_dart() if e not in kit]
-    c.fact("Home's outside-the-building sheet gives this computer's Tailscale address, never the ID (ADR 0004)",
+    c.fact("Home's outside-the-building sheet gives this computer's Machine ID, then its Tailscale address (ADR 0005)",
            not why, "; ".join(why))
 
     # Ticket 05 follow-up: the Quality pick names High Efficiency while it is on, and a hand pick

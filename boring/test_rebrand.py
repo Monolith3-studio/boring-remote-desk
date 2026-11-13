@@ -253,7 +253,9 @@ class RebrandSeam(unittest.TestCase):
         self.assert_check_fails(WHITELIST_FIRST)
 
     # --- ADR 0003: private LAN allowed, LAN Discovery on ---------------------
-    WHITELIST_FACT = "whitelist locked to Tailscale + private LAN, nothing public (ADR 0003)"
+    # 1.8 (ADR 0005): no global whitelist (Hosted connections arrive relayed); the Direct Link
+    # listener keeps the Tailscale + private-LAN rule as its own hook.
+    WHITELIST_FACT = "the Direct Link (21118) answers Tailscale and private-LAN addresses only, with no global whitelist"
     LAN_LISTENER = "LAN discovery listener answers pings (ADR 0003)"
     LAN_UNLOCKED = "LAN discovery not locked off (ADR 0003)"
 
@@ -265,7 +267,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_public_range_in_whitelist_fails_check(self):
         self.rebrand()
-        self.edit(rebrand.HBB, "192.168.0.0/16", "192.168.0.0/16,8.8.8.0/24")
+        self.edit("src/rendezvous_mediator.rs", "                if !base::lan::is_allowed(addr.ip()) {\n",
+                  "                if false && !base::lan::is_allowed(addr.ip()) {\n")
         self.assert_check_fails(self.WHITELIST_FACT)
 
     def test_lan_listener_stripped_again_fails_check(self):
@@ -941,7 +944,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_always_ask_entry_changed_by_a_sign_in_fails_check(self):
         self.rebrand()
-        self.edit("libs/base/src/trust.rs", "        if self.always_ask.is_some() {\n            return false;\n        }\n", "")
+        self.edit("libs/base/src/trust.rs", "        if self.always_ask() {\n            return false;\n        }\n", "")
         self.assert_check_fails(ALWAYS_ASK)
 
     def test_always_ask_switched_without_the_typed_password_fails_check(self):
@@ -1055,7 +1058,7 @@ class RebrandSeam(unittest.TestCase):
 
     # --- ticket 05: permanent password only ---------------------------------------
     PERMANENT_ONLY = "one-time password off: only the permanent password is accepted"
-    NO_PASSWORD = "no permanent password: no unattended access, only a click on the Target (not remembered)"
+    NO_PASSWORD = "no Unattended Password: no unattended access, only Allow on the Target, for that session only"
     THROTTLED = "wrong passwords are still throttled before and after every password check"
     IPC_GUARDED = "a remote session can't change the password, PIN or security options"
     GENERATOR = "generated password: OS RNG, 16+ characters, no look-alike characters, wired to Set Password"
@@ -1071,7 +1074,7 @@ class RebrandSeam(unittest.TestCase):
         r = run(CHECK, self.root)
         for fact in (self.PERMANENT_ONLY, self.NO_PASSWORD, self.THROTTLED, self.IPC_GUARDED, self.GENERATOR,
                      REMOTE_CONFIG, self.SYNC_GUARDED, self.TYPED_16, self.SHOWN_ONCE, self.CLIPBOARD,
-                     self.ONE_TIME_LABEL, self.UI_KEYS, "one-time password length pinned"):
+                     self.ONE_TIME_LABEL, self.UI_KEYS):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_password_lock_facts_fail_on_clean_upstream_tree(self):
@@ -1135,8 +1138,9 @@ class RebrandSeam(unittest.TestCase):
 
     def test_failed_password_not_counted_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs",
-                  "                    self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n", "")
+        wrong = ("                if !self.validate_password(allow_logon_screen_password) {\n"
+                 "                    self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n")
+        self.edit("src/server/connection.rs", wrong, wrong.splitlines(True)[0])
         self.assert_check_fails(self.THROTTLED)
 
     def test_lockout_message_removed_fails_check(self):
@@ -1241,7 +1245,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_ui_string_missing_from_a_language_fails_check(self):
         self.rebrand()
-        self.edit("src/lang/de.rs", '        ("Trusted Controllers", ""),\n', "")
+        self.edit("src/lang/de.rs", '        ("Generate", ""),\n', "")
         self.assert_check_fails(self.UI_KEYS)
 
     # --- ticket 06 on 1.7's one Trusted list (option B: the Controller proves its key) ----------
@@ -1522,6 +1526,7 @@ class RebrandSeam(unittest.TestCase):
         """rebrand.py run from a copy of boring/ whose server-key.pub holds `text` (None: missing)."""
         copy = self.tmp / "boring"
         shutil.copytree(HERE, copy, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy(HERE.parent / "LICENCE", self.tmp / "LICENCE")  # COPIES takes ../LICENCE (ticket 32)
         key = copy / "server-key.pub"
         key.unlink()
         if text is not None:
@@ -1668,8 +1673,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_login_signed_without_asking_its_stream_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "sign_login(lr, &challenge, peer.is_secured(), reached);",
-                  "sign_login(lr, &challenge, true, reached);")
+        self.edit("src/client.rs", "sign_login(lr, &challenge, peer.is_secured());",
+                  "sign_login(lr, &challenge, true);")
         self.assert_check_fails(self.SIGNED)
 
     def test_login_signed_where_it_is_built_fails_check(self):
@@ -1806,20 +1811,20 @@ class RebrandSeam(unittest.TestCase):
     # Target side: its Machine ID is a signed name only on a keyed connection.
     def test_machine_id_name_on_an_unkeyed_connection_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    if secured && crate::client::boring_is_machine_id(own_id) {",
-                  "    if crate::client::boring_is_machine_id(own_id) {")
+        self.edit("src/trust_policy.rs", "    if !secured || !crate::client::boring_is_machine_id(own_id) {",
+                  "    if !crate::client::boring_is_machine_id(own_id) {")
         self.assert_check_fails(self.PROOF)
 
     def test_gate_claiming_every_connection_is_keyed_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", "                            self.stream.is_secured(),\n",
-                  "                            true,\n")
+        self.edit("src/server/connection.rs", "                    self.stream.is_secured(),\n                ),\n                &base::trust::Trusted::load(),",
+                  "                    true,\n                ),\n                &base::trust::Trusted::load(),")
         self.assert_check_fails(self.PROOF)
 
     def test_gate_naming_the_claimed_machine_id_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", "                            &Config::get_id(),\n",
-                  "                            &lr.username,\n")
+        self.edit("src/server/connection.rs", "                    &self.hash.challenge,\n                    &Config::get_id(),\n",
+                  "                    &self.hash.challenge,\n                    &lr.username,\n")
         self.assert_check_fails(self.PROOF)
 
     # --- ticket 08 on 1.7's Direct Link: a Machine ID's Direct Link first, Hosted after -----------
@@ -2065,12 +2070,12 @@ class RebrandSeam(unittest.TestCase):
         self.assertIn("rebrand: 0 changed, 0 moved", self.rebrand().stdout)
 
     # --- v1.7 review: Home, Settings, copy -------------------------------------------
-    HOME_OUTSIDE = "Home's outside-the-building sheet gives this computer's Tailscale address, never the ID (ADR 0004)"
+    HOME_OUTSIDE = "Home's outside-the-building sheet gives this computer's Machine ID, then its Tailscale address (ADR 0005)"
 
-    def test_numeric_id_back_in_the_outside_sheet_fails_check(self):
+    def test_machine_id_from_a_ui_copy_in_the_outside_sheet_fails_check(self):
         self.rebrand()
-        self.edit(rebrand.HOME, "tailscaleAddress: thisTailscaleAddress,",
-                  "tailscaleAddress: () async => gFFI.serverModel.serverId.text,")
+        self.edit(rebrand.HOME, "machineId: () => bind.mainGetMyId(),",
+                  "machineId: () async => gFFI.serverModel.serverId.text,")
         self.assert_check_fails(self.HOME_OUTSIDE)
 
     def test_tailscale_range_drifting_from_the_tailnet_fails_check(self):
