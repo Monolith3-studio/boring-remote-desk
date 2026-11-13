@@ -263,4 +263,27 @@ void main() {
     expect(find.byType(TextField), findsOneWidget);
     expect(find.text('Install update'), findsNothing);
   });
+  // --- The home page's left pane is 200 px wide (desktop_home_page.dart) ---
+  Widget narrow(UpdateNoticeBanner b) => MaterialApp(
+      home: Scaffold(body: Align(alignment: Alignment.topLeft, child: SizedBox(width: 200, child: b))));
+
+  for (final (name, banner) in [
+    ('no key', noKey((_) async => 'valid')),
+    ('with key', withKey()),
+    ('live session', withKey(live: true)),
+    ('rolled back', UpdateNoticeBanner(
+      check: () async => UpdateNotice.fromBridge('{"failed":"1.6.0","running":"1.5.0"}'),
+      isEnabled: () => true,
+      openUrl: (_) async {},
+    )),
+  ]) {
+    testWidgets('$name: fits the 200 px left pane, text is not squeezed', (tester) async {
+      await tester.pumpWidget(narrow(banner));
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      final text = find.textContaining(RegExp(r"is out\.|didn't take"));
+      expect(text, findsOneWidget);
+      expect(tester.getSize(text).width, greaterThanOrEqualTo(120));
+    });
+  }
 }
