@@ -290,6 +290,11 @@ PATCHES = [
      "        // boring-remote: a server set in Settings never replaces the Hosted servers\n"
      f'        assert_eq!(get_tcp_proxy_addr(), format!("{HOSTED}:{{RENDEZVOUS_PORT}}"));\n',
      "upstream's TCP proxy test expects the Hosted server over a custom one"),
+    # upstream's test maps ports from servers set in Settings; ours can't be set
+    ("libs/hbb_common/src/websocket.rs", "    #[test]\n    fn test_check_ws() {\n",
+     '    #[test]\n    #[ignore = "boring-remote: servers are locked to the Hosted servers"]\n'
+     "    fn test_check_ws() {\n",
+     "upstream's websocket port test needs settable servers"),
     (HBB, "pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(BUILTIN) + ";",
      "Change ID off: the Machine ID never changes"),
