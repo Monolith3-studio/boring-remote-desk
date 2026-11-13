@@ -1290,8 +1290,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_tailnet_attempt_before_the_hosted_servers_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {",
-                  "        if let Some(stream) = None::<Stream> {")
+        self.edit("src/client.rs", "            crate::connect_plan::tailnet_first(peer, conn_type, interface.is_force_relay()).await\n",
+                  "            None::<(Stream, std::net::IpAddr)>\n")
         self.assert_check_fails(self.FIRST)
 
     def test_slow_tailnet_attempt_fails_check(self):
@@ -1312,16 +1312,41 @@ class RebrandSeam(unittest.TestCase):
                   "        let _ = Attempt::DirectIp(peer.id.to_owned());\n")
         self.assert_check_fails(self.FIRST)
 
+    def test_tailnet_attempt_through_a_socks_proxy_fails_check(self):
+        # review S1: through a proxy, whatever the proxy reaches at that 100.x answers.
+        self.rebrand()
+        self.edit("src/connect_plan.rs", " || Config::get_socks().is_some()", "")
+        self.assert_check_fails(self.FIRST)
+
+    def test_tailnet_stream_kept_off_the_tailnet_fails_check(self):
+        # review S1: a SYN that left by the default route (carrier CGNAT, another tailnet) isn't WireGuard.
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "Ok(stream) if is_tailnet(stream.local_addr().ip()) => return Some((stream, ip)),",
+                  "Ok(stream) => return Some((stream, ip)),")
+        self.assert_check_fails(self.FIRST)
+
+    def test_tailnet_dial_injected_into_client_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n",
+                  "        let _ = connect_tcp_local(\"100.64.0.1:21118\", None, 3000).await;\n"
+                  "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n")
+        self.assert_check_fails(self.FIRST)
+
     def test_reached_address_kept_after_the_login_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    Some(streams.remove(i).1)\n", "    Some(streams[i].1)\n")
+        self.edit("src/trust_policy.rs", "            *slot = None;\n", "")
         self.assert_check_fails(self.TAILNET_SIGNED)
 
-    def test_tailnet_stream_read_elsewhere_fails_check(self):
+    def test_reached_address_signed_on_another_stream_fails_check(self):
+        # review S2: the slot counts only for the stream it names.
         self.rebrand()
-        self.edit("src/client.rs", "        let reached = crate::trust_policy::take_tailnet_stream(",
-                  "        let _ = crate::trust_policy::is_tailnet_stream(peer.local_addr());\n"
-                  "        let reached = crate::trust_policy::take_tailnet_stream(")
+        self.edit("src/trust_policy.rs", "        Some((l, ip)) if l == local => {", "        Some((_, ip)) => {")
+        self.assert_check_fails(self.TAILNET_SIGNED)
+
+    def test_tailnet_mark_set_elsewhere_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", '        let mut socket = socket?;\n',
+                  '        let mut socket = socket?;\n        let _ = (crate::connect_plan::TAILNET_STREAM);\n')
         self.assert_check_fails(self.TAILNET_SIGNED)
 
     def test_controller_signing_a_saved_lan_address_fails_check(self):
@@ -1332,8 +1357,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_every_unverified_machine_id_let_through_fails_check(self):
         self.rebrand()
-        self.edit("src/client/io_loop.rs", "is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());",
-                  "true;")
+        self.edit("src/client/io_loop.rs", "let is_secured = is_secured || tailnet_first;", "let is_secured = true;")
         self.assert_check_fails(self.TAILNET_SIGNED)
 
     def test_unverified_session_recording_a_tailnet_address_fails_check(self):
@@ -1349,7 +1373,12 @@ class RebrandSeam(unittest.TestCase):
 
     def test_rendezvous_error_passed_through_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n", "            err\n")
+        self.edit("src/client.rs", "        let socket = socket.map_err(crate::connect_plan::hosted_down);", "")
+        self.assert_check_fails(self.DOWN)
+
+    def test_relay_failure_passed_through_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "                let err = crate::connect_plan::hosted_error(err);", "")
         self.assert_check_fails(self.DOWN)
 
     def test_hosted_down_error_not_naming_our_servers_fails_check(self):

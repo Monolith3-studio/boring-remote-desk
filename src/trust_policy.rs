@@ -72,6 +72,16 @@
 //!   tailnet, dialing the address its trusted Target has on its own tailnet, could be relayed.
 //! - The port isn't bound: another listener on the Target's own tailnet address could relay a
 //!   Controller that dials that port. The challenge is ~30 bits, fresh per connection.
+//! - A saved Machine ID's tailnet-first stream (ticket 08, `connect_plan::tailnet_first`) is
+//!   bound to the tailnet address, not to the Machine ID: it is Direct IP, unkeyed (WireGuard is
+//!   the only encryption) and carries no signed identity, because the Target's 21118 listener
+//!   can't send one without breaking 1.7.x Controllers and typed addresses, which never read it.
+//!   So a saved address now held by another machine on this tailnet reaches that machine
+//!   (it answers "offline" to the wrong Machine ID; no Hosted fallback once TCP connects), and
+//!   whoever once passed a Hosted verify as that Machine ID (see the `hbbs` rebind above) can
+//!   report a tailnet address it holds, which later connects dial first until a verified
+//!   session reports another. Only a stream whose local end is a tailnet address counts, and
+//!   never through a SOCKS proxy; a carrier-CGNAT 100.64/10 interface still counts as one.
 //!
 //! No Permanent password set on the Target (a 1.7 Target before setup): no unattended access,
 //! but someone at the Target can still click Accept, so tailnet access keeps working while
@@ -252,7 +262,7 @@ fn ip_in(peer: &str) -> Option<IpAddr> {
 }
 
 /// Tailscale's ranges: the connect box's own test (`boring_is_tailnet` in `client.rs`).
-fn is_tailnet(ip: IpAddr) -> bool {
+pub(crate) fn is_tailnet(ip: IpAddr) -> bool {
     crate::client::boring_is_tailnet(SocketAddr::new(ip, 0))
 }
 
@@ -398,39 +408,22 @@ pub fn signed_target(peer: &str, secured: bool) -> Option<String> {
 
 // --- ticket 08: a saved Machine ID's tailnet-first connection ---------------------------
 
-/// Streams `boring_tailnet_first` (client.rs) connected Direct IP to a saved Machine ID's
-/// tailnet address, by the stream's local address (unique while it is open), with the address
-/// each reached. Per connection: never shared by a session's other connections.
-static TAILNET_STREAMS: Mutex<Vec<(SocketAddr, IpAddr)>> = Mutex::new(Vec::new());
-
-/// The stream whose local end is `local` reached `reached`, a tailnet address.
-pub fn note_tailnet_stream(local: SocketAddr, reached: IpAddr) {
-    if !is_tailnet(reached) {
-        return;
+/// The tailnet address a connection's login signs, when that connection is a saved Machine ID's
+/// tailnet-first stream. `slot` is what `Client::_start` wrote for the stream it returned (its
+/// local address and the address it reached); it counts only for the stream that carries this
+/// login (`local`), and once: a password retry on that stream clicks.
+pub fn take_reached(slot: &mut Option<(SocketAddr, IpAddr)>, local: SocketAddr) -> Option<IpAddr> {
+    match *slot {
+        Some((l, ip)) if l == local => {
+            *slot = None;
+            Some(ip)
+        }
+        _ => None,
     }
-    let mut streams = TAILNET_STREAMS.lock().unwrap();
-    streams.retain(|(l, _)| *l != local);
-    if streams.len() >= 64 {
-        streams.remove(0);
-    }
-    streams.push((local, canonical(reached)));
-}
-
-/// This stream is a saved Machine ID's tailnet-first connection: Direct IP across the tailnet
-/// (WireGuard), like a typed tailnet address. Not a Hosted connection that failed to verify.
-pub fn is_tailnet_stream(local: SocketAddr) -> bool {
-    TAILNET_STREAMS.lock().unwrap().iter().any(|(l, _)| *l == local)
-}
-
-/// The tailnet address this stream reached, taken when its login is sent: that login signs it.
-pub fn take_tailnet_stream(local: SocketAddr) -> Option<IpAddr> {
-    let mut streams = TAILNET_STREAMS.lock().unwrap();
-    let i = streams.iter().position(|(l, _)| *l == local)?;
-    Some(streams.remove(i).1)
 }
 
 /// What a Machine ID's login signs on its tailnet-first stream (`reached`, from
-/// `take_tailnet_stream`): the tailnet address that stream connected to, as for a typed one.
+/// `take_reached`): the tailnet address that stream connected to, as for a typed one.
 /// None for anything else.
 pub fn reached_target(peer: &str, reached: Option<IpAddr>) -> Option<String> {
     reached
@@ -900,18 +893,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tailnet_first_stream_is_known_by_its_own_local_address_and_signed_once() {
+    fn a_tailnet_first_address_is_signed_only_on_its_own_stream_and_once() {
         let mine: SocketAddr = "100.70.0.9:50001".parse().unwrap();
         let other: SocketAddr = "100.70.0.9:50002".parse().unwrap();
-        note_tailnet_stream(mine, TARGET_IP);
-        assert!(is_tailnet_stream(mine));
-        assert!(!is_tailnet_stream(other));
-        assert_eq!(take_tailnet_stream(other), None);
-        assert_eq!(take_tailnet_stream(mine), Some(TARGET_IP));
-        assert_eq!(take_tailnet_stream(mine), None);
-        // A non-tailnet address is never recorded.
-        note_tailnet_stream(other, "192.168.1.20".parse().unwrap());
-        assert!(!is_tailnet_stream(other));
+        let mut slot = Some((mine, TARGET_IP));
+        assert_eq!(take_reached(&mut slot, other), None);
+        assert_eq!(take_reached(&mut slot, mine), Some(TARGET_IP));
+        assert_eq!(take_reached(&mut slot, mine), None);
+        assert_eq!(take_reached(&mut None, mine), None);
     }
 
     #[test]
@@ -938,7 +927,7 @@ mod tests {
                 username: dialed.to_owned(),
                 ..Default::default()
             };
-            sign_login(&mut lr, challenge, secured);
+            sign_login(&mut lr, challenge, secured, None);
             assert!(lr.boring_login_sig.is_empty() && lr.boring_controller_pk.is_empty(), "{dialed}");
         }
     }

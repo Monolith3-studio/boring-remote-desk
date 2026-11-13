@@ -983,7 +983,7 @@ SIGN_LOGIN = ("    // boring-remote: sign this login for the Target's trusted li
               "    // address this stream reached for a saved Machine ID (ticket 08).\n"
               "    let challenge = lc.read().unwrap().hash.challenge.clone();\n"
               "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
-              "        let reached = crate::trust_policy::take_tailnet_stream(peer.local_addr());\n"
+              "        let reached = crate::trust_policy::take_reached(&mut lc.write().unwrap().boring_tailnet_stream, peer.local_addr());\n"
               "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), reached);\n"
               "    }\n")
 _SEND_LOGIN = ("    let msg_out = lc\n        .read()\n        .unwrap()\n"
@@ -1083,47 +1083,30 @@ PATCHES += [
 ]
 
 # --- ticket 08: tailnet first, the Hosted servers as fallback (src/connect_plan.rs) ---------------
-# A saved Machine ID with a tailnet address gets Direct IP to it first. That stream is recorded by
-# its own local address (trust_policy::note_tailnet_stream): io_loop lets it past 07's unverified
-# Machine-ID refusal (it is Direct IP across the tailnet, like a typed address), and send_login
-# signs the address it reached, from that stream, at send time (SIGN_LOGIN). Nothing per session.
-TAILNET_FIRST_FN = """
-// boring-remote: tailnet first, then the Hosted servers (ticket 08, src/connect_plan.rs). A saved
-// Machine ID with a tailnet address gets Direct IP to it for TAILNET_TIMEOUT_MS. None: the plan has
-// no tailnet attempt, or it didn't answer; the caller goes on to the Hosted servers. Port forwards
-// keep the Hosted path (their verify gate has no tailnet exemption).
-async fn boring_tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) -> Option<Stream> {
-    use crate::connect_plan::{plan, Attempt, PeerRecord, Reach, TAILNET_OPTION, TAILNET_TIMEOUT_MS};
-    if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) {
-        return None;
-    }
-    let options = PeerConfig::load(peer).options;
-    let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) };
-    let reach = Reach { tailnet_up: crate::connect_plan::own_tailnet_addr().is_some(), relay_only };
-    for attempt in plan(&record, reach) {
-        let Attempt::Tailnet(addr) = attempt else { break };
-        let Ok(ip) = addr.parse::<std::net::IpAddr>() else { break };
-        match connect_tcp_local(check_port(&addr, RELAY_PORT + 1), None, TAILNET_TIMEOUT_MS).await {
-            Ok(stream) => {
-                crate::trust_policy::note_tailnet_stream(stream.local_addr(), ip);
-                return Some(stream);
-            }
-            Err(err) => log::info!("tailnet path didn't answer in time ({err}); trying the Hosted servers"),
-        }
-    }
-    None
-}
-"""
+# A saved Machine ID with a tailnet address gets Direct IP to it first (connect_plan::tailnet_first,
+# one hook in _start). That connection comes back marked TAILNET_STREAM, so io_loop lets it past
+# 07's unverified Machine-ID refusal (Direct IP across the tailnet, like a typed address), and the
+# login sent over that stream signs the address it reached (SIGN_LOGIN, take_reached: the slot
+# counts only for the stream whose local address it names, and once).
 TAILNET_FIRST = (
     "        // boring-remote: a saved Machine ID tries its tailnet address first (ticket 08).\n"
-    "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {\n"
-    "            return Ok(((stream, true, None, None, \"TCP\"), (0, \"\".to_owned()), false));\n"
+    "        if let Some((stream, reached)) =\n"
+    "            crate::connect_plan::tailnet_first(peer, conn_type, interface.is_force_relay()).await\n"
+    "        {\n"
+    "            interface.get_lch().write().unwrap().boring_tailnet_stream = Some((stream.local_addr(), reached));\n"
+    "            return Ok(((stream, true, None, None, crate::connect_plan::TAILNET_STREAM), (0, \"\".to_owned()), false));\n"
     "        }\n")
 _OTHER_SERVER = "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n"
+TAILNET_FIELD = ("    pub other_server: Option<(String, String, String)>,\n"
+                 "    /// boring-remote: the tailnet-first stream `_start` returned (its local address) and the\n"
+                 "    /// tailnet address it reached (ticket 08); its login signs that address once (`take_reached`).\n"
+                 "    pub boring_tailnet_stream: Option<(SocketAddr, std::net::IpAddr)>,\n")
 TAILNET_EXEMPT = (
-    "                // boring-remote: a saved Machine ID's tailnet-first stream is Direct IP across the\n"
-    "                // tailnet (WireGuard), like a typed tailnet address: no refusal, no prompt (ticket 08).\n"
-    "                let is_secured = is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());\n")
+    "                // boring-remote: a saved Machine ID's tailnet-first stream (marked by _start) is Direct\n"
+    "                // IP across the tailnet (WireGuard), like a typed tailnet address: no refusal, no\n"
+    "                // prompt (ticket 08).\n"
+    "                let tailnet_first = stream_type == crate::connect_plan::TAILNET_STREAM;\n")
+TAILNET_EXEMPT_USE = "                let is_secured = is_secured || tailnet_first; // boring-remote (ticket 08)\n"
 _REFUSE_HEAD = "                // boring-remote: a Machine ID that didn't verify the Target against the baked\n"
 REMEMBER_TAILNET = (
     "                        // boring-remote: a saved Machine ID keeps the tailnet address its Target\n"
@@ -1140,12 +1123,12 @@ REPORT_TAILNET = (
     "        crate::connect_plan::add_own_tailnet(&mut platform_additions);\n")
 _ADDITIONS_OUT = ('        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]\n'
                   "        if !platform_additions.is_empty() {\n")
-HOSTED_DOWN_ERR = (
-    "        // boring-remote: the Hosted servers didn't answer; say so plainly, naming them (ticket 08).\n"
-    "        let mut socket = socket.map_err(|err| {\n"
-    '            log::warn!("Hosted servers unreachable: {err}");\n'
-    "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n"
-    "        })?;\n")
+_SOCKET_OUT = "        let mut socket = socket?;\n"
+HOSTED_DOWN_ERR = ("        let socket = socket.map_err(crate::connect_plan::hosted_down); "
+                   "// boring-remote: say so, naming them (ticket 08)\n")
+_START_ERR = ("            Err(err) => {\n                let err_str = err.to_string();\n"
+              "                if err_str.starts_with(\"Failed\") {\n")
+HOSTED_RELAY_ERR = "                let err = crate::connect_plan::hosted_error(err); // boring-remote: our relay (ticket 08)\n"
 _SET_TYPE = ("                self.handler\n"
              "                    .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready\n")
 PATH_LABEL = ("                // boring-remote: the session shows its path: tailnet direct, direct or relayed (ticket 08).\n"
@@ -1160,20 +1143,22 @@ PATCHES += [
      "mod trust_policy; // boring-remote: trusted Controllers (ticket 06); iOS Controllers sign too\n"
      "mod connect_plan; // boring-remote: tailnet first, Hosted fallback (ticket 08)\n",
      "connect plan module (tailnet first, Hosted fallback)"),
-    ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
-     TAILNET_FIRST_FN + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME", "a saved Machine ID's tailnet attempt"),
     ("src/client.rs", _OTHER_SERVER, TAILNET_FIRST + _OTHER_SERVER,
      "a saved Machine ID tries its tailnet address before the Hosted servers"),
-    ("src/client/io_loop.rs", _REFUSE_HEAD, TAILNET_EXEMPT + _REFUSE_HEAD,
+    ("src/client.rs", TAILNET_FIELD.split("    /// boring")[0], TAILNET_FIELD,
+     "the login config holds the tailnet-first stream's reached address for its login"),
+    ("src/client.rs", _SOCKET_OUT, HOSTED_DOWN_ERR + _SOCKET_OUT,
+     "Hosted servers unreachable: a plain error naming them"),
+    ("src/client.rs", _START_ERR, _START_ERR.replace("                let err_str", HOSTED_RELAY_ERR + "                let err_str", 1),
+     "our relay unreachable: the same plain error"),
+    ("src/client/io_loop.rs", _SET_TYPE, TAILNET_EXEMPT + PATH_LABEL + _SET_TYPE, "the session's path label"),
+    ("src/client/io_loop.rs", _REFUSE_HEAD, TAILNET_EXEMPT_USE + _REFUSE_HEAD,
      "a tailnet-first stream is Direct IP across the tailnet, not an unverified Hosted one"),
     ("src/client/io_loop.rs", _PEER_INFO_IN, _PEER_INFO_IN.replace(
         "                        self.set_peer_info", REMEMBER_TAILNET + "                        self.set_peer_info", 1),
      "a saved Machine ID records the tailnet address its verified Target reports"),
-    ("src/client.rs", "        let mut socket = socket?;\n", HOSTED_DOWN_ERR,
-     "Hosted servers unreachable: a plain error naming them"),
     ("src/server/connection.rs", _ADDITIONS_OUT, REPORT_TAILNET + _ADDITIONS_OUT,
      "the Target reports its tailnet address after login"),
-    ("src/client/io_loop.rs", _SET_TYPE, PATH_LABEL + _SET_TYPE, "the session's path label"),
     (DART_COMMON, _CONN_TEXT, _CONN_TEXT + TAILNET_TEXT, "tailnet direct shown on the session"),
 ]
 

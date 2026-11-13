@@ -740,7 +740,7 @@ GATE_KEY = ("crate::trust_policy::login_key(\n                            &lr,\n
 # The login is signed where it is sent, from the stream that carries it (ticket 07).
 SIGN_CALL = ("let challenge = lc.read().unwrap().hash.challenge.clone();\n"
              "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
-             "        let reached = crate::trust_policy::take_tailnet_stream(peer.local_addr());\n"
+             "        let reached = crate::trust_policy::take_reached(&mut lc.write().unwrap().boring_tailnet_stream, peer.local_addr());\n"
              "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), reached);\n    }\n"
              "    allow_err!(peer.send(&msg_out).await);")
 # A Machine ID runs only with the baked key, and an unverified one is refused without a prompt.
@@ -1048,37 +1048,42 @@ def hosted_signing_checks(c, client, trust, squash):
 
 # Ticket 08, pinned here (not taken from rebrand.py).
 TAILNET_FIRST = (
-    "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {\n"
-    "            return Ok(((stream, true, None, None, \"TCP\"), (0, \"\".to_owned()), false));\n"
+    "        if let Some((stream, reached)) =\n"
+    "            crate::connect_plan::tailnet_first(peer, conn_type, interface.is_force_relay()).await\n"
+    "        {\n"
+    "            interface.get_lch().write().unwrap().boring_tailnet_stream = Some((stream.local_addr(), reached));\n"
+    "            return Ok(((stream, true, None, None, crate::connect_plan::TAILNET_STREAM), (0, \"\".to_owned()), false));\n"
     "        }\n")
-TAILNET_DIAL = ("if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) { return None; } "
+TAILNET_DIAL = ("if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) || Config::get_socks().is_some() "
+                "{ return None; } "
                 "let options = PeerConfig::load(peer).options; "
                 "let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) }; "
-                "let reach = Reach { tailnet_up: crate::connect_plan::own_tailnet_addr().is_some(), relay_only }; "
-                "for attempt in plan(&record, reach) { let Attempt::Tailnet(addr) = attempt else { break }; "
-                "let Ok(ip) = addr.parse::<std::net::IpAddr>() else { break }; "
-                "match connect_tcp_local(check_port(&addr, RELAY_PORT + 1), None, TAILNET_TIMEOUT_MS).await { "
-                "Ok(stream) => { crate::trust_policy::note_tailnet_stream(stream.local_addr(), ip); return Some(stream); }")
+                "let reach = Reach { tailnet_up: own_tailnet_addr().is_some(), relay_only }; "
+                "for attempt in plan(&record, reach) { let Attempt::Tailnet(ip) = attempt else { break }; "
+                "let target = SocketAddr::new(ip, (RELAY_PORT + 1) as u16); "
+                "match connect_tcp_local(target, None, TAILNET_TIMEOUT_MS).await { "
+                "Ok(stream) if is_tailnet(stream.local_addr().ip()) => return Some((stream, ip)), "
+                "Ok(_) =>")
 TAILNET_PLAN = ("if !crate::client::boring_is_machine_id(peer.id) { return vec![Attempt::DirectIp(peer.id.to_owned())]; } "
                 "let mut attempts = Vec::new(); "
                 "let saved = peer.tailnet.and_then(|a| a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip)); "
                 "if let Some(ip) = saved { if reach.tailnet_up && !reach.relay_only { "
-                "attempts.push(Attempt::Tailnet(ip.to_string())); } } "
+                "attempts.push(Attempt::Tailnet(ip)); } } "
                 "attempts.push(Attempt::Hosted(peer.id.to_owned())); attempts")
-TAILNET_EXEMPT = "let is_secured = is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());"
+TAILNET_MARK = "let tailnet_first = stream_type == crate::connect_plan::TAILNET_STREAM;"
+TAILNET_EXEMPT = "let is_secured = is_secured || tailnet_first;"
 REACHED = ("reached .filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer)) "
            ".map(|ip| canonical(ip).to_string())")
-NOTED = ("if !is_tailnet(reached) { return; } let mut streams = TAILNET_STREAMS.lock().unwrap(); "
-         "streams.retain(|(l, _)| *l != local);")
+TAKE_REACHED = ("match *slot { Some((l, ip)) if l == local => { *slot = None; Some(ip) } _ => None, }")
 REMEMBERED = ("crate::connect_plan::save_reported_tailnet(\n                            &self.handler.get_id(),\n"
               "                            peer.is_secured(),\n                            &pi.platform_additions,\n"
               "                        );")
 TAILNET_REMEMBER_IF = "if !verified || !crate::client::boring_is_machine_id(id) {"
 HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
                " connection, or connect by Tailscale name or IP.")
-HOSTED_DOWN_MAP = ("let mut socket = socket.map_err(|err| {\n"
-                   '            log::warn!("Hosted servers unreachable: {err}");\n'
-                   "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n        })?;")
+HOSTED_DOWN_MAP = ("let socket = socket.map_err(crate::connect_plan::hosted_down); "
+                   "// boring-remote: say so, naming them (ticket 08)\n        let mut socket = socket?;")
+HOSTED_RELAY = "let err = crate::connect_plan::hosted_error(err);"
 PATH_LABEL = "let stream_type = crate::connect_plan::stream_label(stream_type, direct, peer.local_addr().ip());"
 
 
@@ -1104,9 +1109,12 @@ def tailnet_first_checks(c):
         why.append("_start doesn't try the tailnet address after the typed-name branch and before the Hosted servers")
     elif strip_tests_and_comments(body[guard:rendezvous]).count("return Ok((") != 2:
         why.append("something else returns between the tailnet attempt and the Hosted servers")
-    dial = squash(fn_body(code, "async fn boring_tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) -> Option<Stream> {"))
-    if TAILNET_DIAL not in dial:
-        why.append(f"boring_tailnet_first isn't Direct IP to the plan's tailnet address only: {dial[:80]!r}")
+    dial = squash(fn_body(plan_code, "pub async fn tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) "
+                                     "-> Option<(Stream, IpAddr)> {"))
+    if not dial.startswith(TAILNET_DIAL):
+        why.append(f"tailnet_first isn't Direct IP over the tailnet to the plan's tailnet address only: {dial[:80]!r}")
+    if "boring_tailnet_first" in code or "connect_tcp_local" in strip_tests_and_comments(body[first:rendezvous]):
+        why.append("the tailnet attempt isn't a thin hook into connect_plan")
     if squash(fn_body(plan_code, "pub fn plan(peer: &PeerRecord, reach: Reach) -> Vec<Attempt> {")) != TAILNET_PLAN:
         why.append("plan isn't: typed names Direct IP only; a Machine ID's saved tailnet address, then the Hosted servers")
     if "pub const TAILNET_TIMEOUT_MS: u64 = 3_000;" not in plan_code:
@@ -1117,17 +1125,15 @@ def tailnet_first_checks(c):
     why = []
     if squash(fn_body(trust, "pub fn reached_target(peer: &str, reached: Option<IpAddr>) -> Option<String> {")) != REACHED:
         why.append("reached_target signs something other than a Machine ID's tailnet address")
-    if not squash(fn_body(trust, "pub fn note_tailnet_stream(local: SocketAddr, reached: IpAddr) {")).startswith(NOTED):
-        why.append("note_tailnet_stream records a non-tailnet address or more than one entry per stream")
-    if "Some(streams.remove(i).1)" not in (fn_body(trust, "pub fn take_tailnet_stream(local: SocketAddr) -> Option<IpAddr> {") or ""):
-        why.append("the reached address isn't consumed when the login is sent")
-    if code.count("note_tailnet_stream(") != 1 or code.count("take_tailnet_stream(") != 1 \
-            or (code + io_loop).count("is_tailnet_stream(") != 1:
-        why.append("the tailnet-first stream is recorded, read or consumed somewhere else")
-    refuse = io_loop.find(REFUSE_IO)
-    if not 0 <= io_loop.find(TAILNET_EXEMPT) < refuse:
-        why.append("a tailnet-first stream isn't told apart before 07's unverified Machine-ID refusal")
-    if "boring_tailnet_target" in code or "boring_verified_target" in code:
+    if squash(fn_body(trust, "pub fn take_reached(slot: &mut Option<(SocketAddr, IpAddr)>, local: SocketAddr) -> Option<IpAddr> {")) != TAKE_REACHED:
+        why.append("take_reached isn't: only the stream the slot names, and once")
+    if code.count("boring_tailnet_stream =") != 1 or code.count(".boring_tailnet_stream") != 2 \
+            or "TAILNET_STREAMS" in trust or code.count("connect_plan::TAILNET_STREAM)") != 1:
+        why.append("the tailnet-first stream is marked, recorded or read somewhere else")
+    mark, use, refuse = io_loop.find(TAILNET_MARK), io_loop.find(TAILNET_EXEMPT), io_loop.find(REFUSE_IO)
+    if not (0 <= mark < io_loop.find(PATH_LABEL)) or not (0 <= use < refuse) or io_loop.count("tailnet_first") != 2:
+        why.append("the tailnet-first mark isn't the stream type _start returned, or isn't what passes 07's refusal")
+    if "boring_verified_target" in code:
         why.append("a per-session field is back")
     c.fact("a tailnet-first login signs only the address its own stream reached, at send time (ticket 08)",
            not why, "; ".join(why))
@@ -1141,7 +1147,7 @@ def tailnet_first_checks(c):
            0 <= peer_info.find(REMEMBERED) < peer_info.find("self.set_peer_info(&pi);")
            and f"{squash(TAILNET_REMEMBER_IF)} return; }}" in remember
            and save.startswith("if !(secured && crate::client::boring_is_machine_id(id)) { return; }")
-           and plan_code.count("TAILNET_OPTION.to_owned()") == 1 and code.count("TAILNET_OPTION") == 2
+           and plan_code.count("TAILNET_OPTION.to_owned()") == 1 and "TAILNET_OPTION" not in code
            and 0 <= reported < conn.find("pi.platform_additions = serde_json::to_string(&platform_additions)"),
            remember[:80])
 
@@ -1150,7 +1156,9 @@ def tailnet_first_checks(c):
     missing = [p.name for p in langs for k in (HOSTED_DOWN, rebrand.TAILNET_LABEL)
                if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" else 1)]
     c.fact(f"Hosted servers unreachable: a plain error naming {HOSTED} (ticket 08)",
-           HOSTED_DOWN_MAP in inner and "socket?;" not in inner and HOSTED in HOSTED_DOWN
+           HOSTED_DOWN_MAP in inner and inner.count("socket?;") == 1 and HOSTED in HOSTED_DOWN
+           and HOSTED_RELAY in (fn_body(code, "    pub async fn start(\n") or "")
+           and 'starts_with("Failed to connect via relay server")' in plan_code
            and f'pub const HOSTED_DOWN: &str = "{HOSTED_DOWN}";' in plan_code and rebrand.HOSTED_DOWN == HOSTED_DOWN
            and bool(langs) and not missing, ", ".join(missing[:5]))
 
