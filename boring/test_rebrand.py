@@ -1396,19 +1396,22 @@ class RebrandSeam(unittest.TestCase):
         self.edit("flutter/lib/common.dart", "  if (streamType == 'Tailnet') {\n", "  if (false) {\n")
         self.assert_check_fails(self.PATH)
     # --- ticket 09: 1.8.0 first launch sets a Permanent password ---------------------
-    HOSTED_GATE = ("no Permanent password, no Hosted servers: the Target registers its Machine ID only once "
-                   "a password is set; Direct IP keeps listening (ticket 09)")
-    HOSTED_OFF_ON_REMOVE = "removing the Permanent password drops the Hosted registration (ticket 09)"
+    HOSTED_GATE = ("no app-generated Permanent password, no Hosted servers: the Target registers its Machine ID "
+                   "only once the generator's marker is set; Direct IP keeps listening (ticket 09)")
+    MARKER = ("only an app-generated password sets the Hosted marker: the daemon writes it with the password, "
+              "any other password write clears it, and no Options write or remote session sets it (ticket 09)")
+    TICK = "a live Hosted registration ends within a tick once the generated password is gone, whatever removed it (ticket 09)"
+    LOCK = "src/password_lock.rs"
 
     def test_hosted_gate_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
-        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+        for fact in (self.HOSTED_GATE, self.MARKER, self.TICK):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_hosted_gate_facts_fail_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
-        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+        for fact in (self.HOSTED_GATE, self.MARKER, self.TICK):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_registering_without_a_password_fails_check(self):
@@ -1416,9 +1419,20 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/rendezvous_mediator.rs", rebrand.HOSTED_GATE, "                let servers = Config::get_rendezvous_servers();\n")
         self.assert_check_fails(self.HOSTED_GATE)
 
+    def test_gate_on_any_password_fails_check(self):
+        # A 1.7.x typed password must not turn Hosted on (review M1).
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", "crate::password_lock::hosted_on(),", "Config::has_permanent_password(),")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_gate_ignoring_the_marker_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, '    marker == "Y" && has_password\n', "    has_password\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
     def test_gate_helper_ignoring_the_password_fails_check(self):
         self.rebrand()
-        self.edit("src/password_lock.rs", "    if password_set {\n", "    if true {\n")
+        self.edit(self.LOCK, "    if password_set {\n", "    if true {\n")
         self.assert_check_fails(self.HOSTED_GATE)
 
     def test_direct_ip_behind_the_password_gate_fails_check(self):
@@ -1429,13 +1443,39 @@ class RebrandSeam(unittest.TestCase):
         self.edit(med, spawn, "        if Config::has_permanent_password() {\n" + spawn + "        }\n")
         self.assert_check_fails(self.HOSTED_GATE)
 
-    def test_password_removal_keeping_the_registration_fails_check(self):
+    def test_registration_kept_after_the_password_goes_fails_check(self):
         self.rebrand()
-        self.edit("src/ipc.rs", rebrand.HOSTED_OFF_ON_REMOVE, "")
-        self.assert_check_fails(self.HOSTED_OFF_ON_REMOVE)
+        self.edit("src/rendezvous_mediator.rs", rebrand.TICK_EXIT, "")
+        self.assert_check_fails(self.TICK)
 
-    SETUP_SCREEN = ("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs "
-                    "the generator and shows the password once; never again once one is set (ticket 09)")
+    def test_typed_password_keeping_the_marker_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", rebrand.CLEAR_MARKER, "")
+        self.assert_check_fails(self.MARKER)
+
+    def test_marker_writable_during_a_session_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, '&["permanent-password", GENERATED_CONFIG, ', '&["permanent-password", ')
+        self.assert_check_fails(self.MARKER)
+
+    def test_marker_settable_through_options_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, "    pin_option(&mut incoming, current, GENERATED_OPTION);\n", "")
+        self.assert_check_fails(self.MARKER)
+
+    def test_generator_using_the_typed_password_path_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, "send_generated(pw.clone())", "crate::ui_interface::set_permanent_password_with_result(pw.clone())")
+        self.assert_check_fails(self.MARKER)
+
+    def test_daemon_marking_any_password_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, "    if !generated_write_allowed(\n", "    if false && !generated_write_allowed(\n")
+        self.assert_check_fails(self.MARKER)
+
+    SETUP_SCREEN = ("1.8.0 first launch: a Target without an app-generated Permanent password gets the setup screen, "
+                    "which runs the generator (asking first if a password is set) and shows it once; never again "
+                    "once one is generated (ticket 09)")
     SETUP = "flutter/lib/desktop/widgets/password_setup.dart"
 
     def test_setup_screen_fact_passes_after_rebrand(self):
@@ -1450,9 +1490,21 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.HOME, rebrand.SETUP_HOOK, "")
         self.assert_check_fails(self.SETUP_SCREEN)
 
-    def test_setup_screen_shown_with_a_password_already_set_fails_check(self):
+    def test_setup_screen_shown_with_a_generated_password_fails_check(self):
         self.rebrand()
-        self.edit(self.SETUP, "  if (await permanentPasswordSet()) return;\n", "")
+        self.edit(self.SETUP, "  if (await generatedPasswordSet()) return;\n", "")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_skipped_for_a_typed_password_fails_check(self):
+        # A 1.7.x typed password still gets the screen (review M1).
+        self.rebrand()
+        self.edit(self.SETUP, "  return bind.mainGetOption(key: kBoringPasswordGenerated) == 'Y';\n",
+                  "  return (await bind.mainGetCommon(key: \"permanent-password-set\")) == \"true\";\n")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_replacing_a_password_without_asking_fails_check(self):
+        self.rebrand()
+        self.edit(self.SETUP, "        final go = await confirmReplacePassword();\n        if (go == null) return;\n", "")
         self.assert_check_fails(self.SETUP_SCREEN)
 
     def test_setup_screen_not_showing_the_password_once_fails_check(self):

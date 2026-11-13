@@ -838,12 +838,13 @@ def password_lock_checks(c, locked):
     sessions = (fn_body(lock, "pub fn authed_sessions() -> usize {") or "").strip()
     key = re.search(r'pub const TRUSTED_OPTION: &str = "([^"]+)";', trust)
     guarded = str_array(c, lock, "SECURITY_OPTIONS", {"TRUSTED_OPTION": key and key.group(1)})
-    protected = str_array(c, lock, "PROTECTED_CONFIG")
+    gen_key = (re.search(r'pub const GENERATED_CONFIG: &str = "([^"]+)";', lock) or [None, None])[1]
+    protected = str_array(c, lock, "PROTECTED_CONFIG", {"GENERATED_CONFIG": gen_key})
     need = ("approve-mode", "verification-method", "allow-remote-config-modification", "access-mode", "whitelist")
     c.fact("a remote session can't change the password, PIN or security options",
            all(arms) and ipc.count(rebrand.IPC_GUARD) == 3 and options is not None and "remote_sessions == 0" in guard
            and sessions == "crate::server::AUTHED_CONNS.lock().unwrap().len()"
-           and set(protected) == {"permanent-password", "salt", "unlock-pin"}
+           and set(protected) - {gen_key} == {"permanent-password", "salt", "unlock-pin"}
            and None not in guarded and all(k in guarded for k in need),
            f"guarded arms {[a is not None for a in arms]}, options guard {options is not None}, "
            f"authed_sessions {sessions!r}, unresolved or missing {[k for k in need if k not in guarded]}")
@@ -1396,41 +1397,79 @@ def exposure_checks(c, cfg):
 
 
 def first_launch_checks(c):
-    """Ticket 09: a Target with no Permanent password stays off the Hosted servers (its Machine ID
-    is never registered) while Direct IP over the tailnet keeps working."""
+    """Ticket 09: a Target without an app-generated Permanent password stays off the Hosted servers
+    (its Machine ID is never registered) while Direct IP over the tailnet keeps working."""
     med = c.read("src/rendezvous_mediator.rs")
+    ipc = c.read("src/ipc.rs")
     lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
     body = fn_body(med, "pub async fn start_all() {") or ""
+    flat = lambda sig: re.sub(r"\s+", "", fn_body(lock, sig) or "")
     gate = re.search(r"let servers = crate::password_lock::hosted_servers\(\s*Config::get_rendezvous_servers\(\),"
-                     r"\s*Config::has_permanent_password\(\),\s*\);", body)
-    helper = re.sub(r"\s+", "", fn_body(lock, "pub fn hosted_servers(servers: Vec<String>, password_set: bool)"
-                                            " -> Vec<String> {") or "")
+                     r"\s*crate::password_lock::hosted_on\(\),\s*\);", body)
+    helper = flat("pub fn hosted_servers(servers: Vec<String>, password_set: bool) -> Vec<String> {")
+    ready = flat("pub fn hosted_ready(marker: &str, has_password: bool) -> bool {")
+    on = flat("pub fn hosted_on() -> bool {")
     spawn = re.search(r"let server_cloned = server\.clone\(\);\s*tokio::spawn\(async move \{\s*"
                       r"direct_server\(server_cloned\)\.await;\s*\}\);", body)
     loop = body.find("for host in servers.clone() {")
-    c.fact("no Permanent password, no Hosted servers: the Target registers its Machine ID only once a password "
-           "is set; Direct IP keeps listening (ticket 09)",
+    c.fact("no app-generated Permanent password, no Hosted servers: the Target registers its Machine ID only once "
+           "the generator's marker is set; Direct IP keeps listening (ticket 09)",
            gate is not None and 0 <= gate.end() < loop and body.count("Config::get_rendezvous_servers()") == 1
            and med.count("Self::start(server, host)") == 1 and helper == "ifpassword_set{servers}else{Vec::new()}"
+           and ready == 'marker=="Y"&&has_password'
+           and on == "hosted_ready(&Config::get_option(GENERATED_OPTION),Config::has_permanent_password())"
            and spawn is not None and spawn.start() < body.find("\n        loop {\n"),
-           f"gate {gate is not None}, helper {helper!r}, Direct IP ungated {spawn is not None}")
-    remove = re.search(r"updated = Config::set_permanent_password\(&value\);\s*(?://[^\n]*\s*)?"
-                       r"if updated && !Config::has_permanent_password\(\) \{\s*crate::RendezvousMediator::restart\(\);"
-                       r"\s*\}", c.read("src/ipc.rs"))
-    c.fact("removing the Permanent password drops the Hosted registration (ticket 09)", remove is not None)
+           f"gate {gate is not None}, helper {helper!r}, ready {ready!r}, on {on!r}, Direct IP ungated {spawn is not None}")
+
+    ticks = re.findall(r"_ = timer\.tick\(\) => \{\s*if SHOULD_EXIT\.load\(Ordering::SeqCst\) \{\s*break;\s*\}"
+                       r"\s*if !crate::password_lock::hosted_on\(\) \{\s*break;", med)
+    c.fact("a live Hosted registration ends within a tick once the generated password is gone, whatever removed it "
+           "(ticket 09)", len(ticks) == 2 == med.count("_ = timer.tick() => {"), f"{len(ticks)} of 2 ticks")
+
+    key = re.search(r'pub const GENERATED_CONFIG: &str = "([^"]+)";', lock)
+    opt = re.search(r'pub const GENERATED_OPTION: &str = "([^"]+)";', lock)
+    protected = str_array(c, lock, "PROTECTED_CONFIG", {"GENERATED_CONFIG": key and key.group(1)})
+    arm = re.search(r"\} else if name == crate::password_lock::GENERATED_CONFIG \{\s*(?://[^\n]*\s*)?"
+                    r"updated = crate::password_lock::set_generated\(&value\);\s*let ack = if updated", ipc)
+    clear = re.search(r"updated = Config::set_permanent_password\(&value\);\s*if updated \{\s*"
+                      r"crate::password_lock::clear_generated\(\);", ipc)
+    setgen = fn_body(lock, "pub fn set_generated(password: &str) -> bool {") or ""
+    order = [setgen.find(n) for n in ("if !generated_write_allowed(", "authed_sessions()",
+                                      "Config::is_disable_change_permanent_password()",
+                                      "if !Config::set_permanent_password(password) {",
+                                      "Config::set_option(GENERATED_OPTION.to_owned(), \"Y\".to_owned());")]
+    allowed = flat("pub fn generated_write_allowed(password: &str, remote_sessions: usize, change_disabled: bool) -> bool {")
+    guard = fn_body(lock, "pub fn guard_options(") or ""
+    pinned = guard.find("pin_option(&mut incoming, current, GENERATED_OPTION);")
+    gen = flat("pub fn generate_and_set() -> String {")
+    c.fact("only an app-generated password sets the Hosted marker: the daemon writes it with the password, any other "
+           "password write clears it, and no Options write or remote session sets it (ticket 09)",
+           key and opt and key.group(1) in protected and arm and clear
+           and -1 not in order and order == sorted(order)
+           and allowed == ("!change_disabled&&config_write_allowed(GENERATED_CONFIG,remote_sessions)"
+                           "&&password.len()==LEN&&password.bytes().all(|b|ALPHABET.contains(&b))")
+           and 0 <= pinned < guard.find("if remote_sessions == 0")
+           and "ifsend_generated(pw.clone()){" in gen and "set_permanent_password" not in gen,
+           f"protected {protected}, generated arm {arm is not None}, typed clears {clear is not None}, "
+           f"set_generated order {order}, options pin {pinned}")
 
     home, setup = c.read(rebrand.HOME), c.read("flutter/lib/desktop/widgets/password_setup.dart")
     init = fn_body(home[home.find("class _DesktopHomePageState"):], "void initState() {") or ""
     ask = fn_body(setup, "Future<void> showPasswordSetupIfNeeded() async {") or ""
-    is_set = re.sub(r"\s+", "", fn_body(setup, "Future<bool> permanentPasswordSet() async {") or "")
-    order = [ask.find(s) for s in ("if (await permanentPasswordSet()) return;", "gFFI.dialogManager.show(",
+    is_set = re.sub(r"\s+", "", fn_body(setup, "Future<bool> generatedPasswordSet() async {") or "")
+    dart_opt = re.search(r"const kBoringPasswordGenerated = '([^']+)';", setup)
+    order = [ask.find(s) for s in ("if (await generatedPasswordSet()) return;", "gFFI.dialogManager.show(",
+                                   'if ((await bind.mainGetCommon(key: "permanent-password-set")) == "true") {',
+                                   "final go = await confirmReplacePassword();", "if (go == null) return;",
                                    "final pass = await bind.mainGeneratePermanentPassword();",
                                    "if (pass.isEmpty) {", "close();", "showGeneratedPasswordOnce(pass);")]
-    c.fact("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs the "
-           "generator and shows the password once; never again once one is set (ticket 09)",
+    c.fact("1.8.0 first launch: a Target without an app-generated Permanent password gets the setup screen, which "
+           "runs the generator (asking first if a password is set) and shows it once; never again once one is "
+           "generated (ticket 09)",
            "addPostFrameCallback((_) => showPasswordSetupIfNeeded());" in init
            and "import 'package:flutter_hbb/desktop/widgets/password_setup.dart';" in home
-           and is_set == 'return(awaitbind.mainGetCommon(key:"permanent-password-set"))=="true";'
+           and is_set == "returnbind.mainGetOption(key:kBoringPasswordGenerated)=='Y';"
+           and dart_opt is not None and opt is not None and dart_opt.group(1) == opt.group(1)
            and -1 not in order and order == sorted(order),
            f"hooked {'showPasswordSetupIfNeeded' in init}, set check {is_set!r}, order {order}")
 
