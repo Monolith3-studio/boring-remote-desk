@@ -13,7 +13,8 @@ file copy-paste, the Windows MSI (name, exe, art sizes, license, icon, no RustDe
 translations, app metadata, every logo slot; one AGPL line on the About page), that
 the connect box sends a Machine ID through the Hosted servers and any other name Direct IP
 to a tailnet address, that the Target shows its Machine ID, and that the protocol files are
-upstream's. It only reads the tree.
+upstream's, that a Target without a Permanent password stays off the Hosted servers and is
+asked to set one at launch, and that the Update keeps 1.7.x's config (ticket 09). It only reads the tree.
 Idempotence is proved by test_rebrand.py and build-mac's second-run step.
 
 Prints one PASS/FAIL line per fact, then
@@ -48,6 +49,15 @@ PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
 HOSTED = "rs.theboringremote.com"
 SERVER_KEY = pathlib.Path(__file__).resolve().parent / "server-key.pub"
 RUSTDESK_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="
+# Ticket 09, pinned here (not taken from rebrand.py): what 1.7.x shipped. The config (saved
+# machines, settings, trusted list) lives in ~/Library/Preferences/<ORG>.<APP_NAME> on Mac and
+# %APPDATA%\<APP_NAME> on Windows; the License key is a local option. Change any and the
+# 1.8.0 Update starts from an empty config.
+SHIPPED_ORG, SHIPPED_APP, SHIPPED_KEY_OPTION = "io.boringlabs", "BoringRemote", "boring-license-key"
+# Calls that clear saved machines or settings in bulk; nothing we add may make them.
+CONFIG_WIPE = re.compile(r"PeerConfig::remove\(|\b(?:Config|Config2|LocalConfig)::set\(|set_options\(\s*"
+                         r"(?:HashMap::new\(\)|Default::default\(\))|Config::path\(|mainRemovePeer|mainForgetPassword")
+CONFIG_PATH = re.compile(r"Preferences|AppData|\.toml\b")
 FORCE_SERVERS = ("if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
                  " // boring-remote: the Hosted servers only")
 FORCE_SERVER = ('if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
@@ -867,7 +877,7 @@ def password_lock_checks(c, locked):
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS + [rebrand.MACHINE_ID_LABEL]
                if p.read_text(encoding="utf-8").count(f'("{k}", ') != 1]
-    c.fact("new UI strings (tickets 05, 06, 07) have a key in every translation file", langs and not missing,
+    c.fact("new UI strings (tickets 05, 06, 07, 09) have a key in every translation file", langs and not missing,
            ", ".join(missing[:5]))
 
 
@@ -1173,6 +1183,83 @@ def hosted_checks(c, cfg, locked):
     c.fact("no Tailscale whitelist left (ADR 0005)", not left, ", ".join(left))
 
 
+def first_launch_checks(c):
+    """Ticket 09: a Target with no Permanent password stays off the Hosted servers (its Machine ID
+    is never registered) while Direct IP over the tailnet keeps working."""
+    med = c.read("src/rendezvous_mediator.rs")
+    lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
+    body = fn_body(med, "pub async fn start_all() {") or ""
+    gate = re.search(r"let servers = crate::password_lock::hosted_servers\(\s*Config::get_rendezvous_servers\(\),"
+                     r"\s*Config::has_permanent_password\(\),\s*\);", body)
+    helper = re.sub(r"\s+", "", fn_body(lock, "pub fn hosted_servers(servers: Vec<String>, password_set: bool)"
+                                            " -> Vec<String> {") or "")
+    spawn = re.search(r"let server_cloned = server\.clone\(\);\s*tokio::spawn\(async move \{\s*"
+                      r"direct_server\(server_cloned\)\.await;\s*\}\);", body)
+    loop = body.find("for host in servers.clone() {")
+    c.fact("no Permanent password, no Hosted servers: the Target registers its Machine ID only once a password "
+           "is set; Direct IP keeps listening (ticket 09)",
+           gate is not None and 0 <= gate.end() < loop and body.count("Config::get_rendezvous_servers()") == 1
+           and med.count("Self::start(server, host)") == 1 and helper == "ifpassword_set{servers}else{Vec::new()}"
+           and spawn is not None and spawn.start() < body.find("\n        loop {\n"),
+           f"gate {gate is not None}, helper {helper!r}, Direct IP ungated {spawn is not None}")
+    remove = re.search(r"updated = Config::set_permanent_password\(&value\);\s*(?://[^\n]*\s*)?"
+                       r"if updated && !Config::has_permanent_password\(\) \{\s*crate::RendezvousMediator::restart\(\);"
+                       r"\s*\}", c.read("src/ipc.rs"))
+    c.fact("removing the Permanent password drops the Hosted registration (ticket 09)", remove is not None)
+
+    home, setup = c.read(rebrand.HOME), c.read("flutter/lib/desktop/widgets/password_setup.dart")
+    init = fn_body(home[home.find("class _DesktopHomePageState"):], "void initState() {") or ""
+    ask = fn_body(setup, "Future<void> showPasswordSetupIfNeeded() async {") or ""
+    is_set = re.sub(r"\s+", "", fn_body(setup, "Future<bool> permanentPasswordSet() async {") or "")
+    order = [ask.find(s) for s in ("if (await permanentPasswordSet()) return;", "gFFI.dialogManager.show(",
+                                   "final pass = await bind.mainGeneratePermanentPassword();",
+                                   "if (pass.isEmpty) {", "close();", "showGeneratedPasswordOnce(pass);")]
+    c.fact("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs the "
+           "generator and shows the password once; never again once one is set (ticket 09)",
+           "addPostFrameCallback((_) => showPasswordSetupIfNeeded());" in init
+           and "import 'package:flutter_hbb/desktop/widgets/password_setup.dart';" in home
+           and is_set == 'return(awaitbind.mainGetCommon(key:"permanent-password-set"))=="true";'
+           and -1 not in order and order == sorted(order),
+           f"hooked {'showPasswordSetupIfNeeded' in init}, set check {is_set!r}, order {order}")
+
+
+def our_code(c):
+    """The Rust and Dart we add: our own modules and widgets, and the text rebrand.py inserts."""
+    files, inserted = set(), []
+    for rel, old, new, _ in rebrand.PATCHES:
+        if not isinstance(old, str):
+            continue
+        added = new.replace(old, "", 1) if old in new else new
+        if rel.endswith((".rs", ".dart")):
+            inserted.append(added)
+        if rel == "src/lib.rs":
+            files |= {f"src/{m}.rs" for m in re.findall(r"\bmod (\w+);", added)}
+        files |= {f"flutter/lib/desktop/widgets/{w}.dart"
+                  for w in re.findall(r"package:flutter_hbb/desktop/widgets/(\w+)\.dart", added)}
+    texts = {rel: strip_tests_and_comments(c.read(rel)) for rel in sorted(files)}
+    texts["rebrand.py inserted text"] = "\n".join(inserted)
+    return texts
+
+
+def config_kept_checks(c, cfg):
+    """Ticket 09: the 1.8.0 Update starts from the 1.7.x config, untouched."""
+    org = re.search(r'static ref ORG: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    app = re.search(r'static ref APP_NAME: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    key = re.search(r'pub const KEY_OPTION: &str = "([^"]*)";', c.read("src/license_key.rs"))
+    same = ((org and org.group(1), app and app.group(1), key and key.group(1))
+            == (SHIPPED_ORG, SHIPPED_APP, SHIPPED_KEY_OPTION))
+    script = c.read("src/platform/privileges_scripts/install-update.sh")
+    removed = set(re.findall(r'\brm -r?f "([^"]+)"', script))
+    script_ok = (script and not CONFIG_PATH.search(script)
+                 and removed <= {"$STAGE", "$PREV", "$APP", "$f", "$SUPPORT/update-pending"})
+    wipes = [f"{rel}: {m.group(0)}" for rel, text in our_code(c).items() for m in CONFIG_WIPE.finditer(text)]
+    c.fact("the 1.8.0 Update keeps 1.7.x's config: same config dir and License key option, the update script "
+           "never touches it, and nothing we add clears saved machines or settings (ticket 09)",
+           same and script_ok and not wipes,
+           f"identity {org and org.group(1)}.{app and app.group(1)} / {key and key.group(1)}, "
+           f"script removes {sorted(removed)}, wipes {wipes[:5]}")
+
+
 def run_checks(root):
     c = Check(root)
     workflow_guard(c)
@@ -1233,6 +1320,8 @@ def run_checks(root):
            "'allow-only-conn-window-open'" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
     password_lock_checks(c, locked)
     trust_checks(c, locked)
+    first_launch_checks(c)
+    config_kept_checks(c, cfg)
 
     # sync, NAT test, updater
     for rel, sig, what in (

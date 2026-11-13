@@ -367,7 +367,7 @@ class RebrandSeam(unittest.TestCase):
     SHOWN_ONCE = "the new password closes only on I've saved it, and Reset asks before replacing"
     CLIPBOARD = "a copied password leaves the clipboard after a minute"
     ONE_TIME_LABEL = "one-time password label hidden when it is off (desktop and mobile)"
-    UI_KEYS = "new UI strings (tickets 05, 06, 07) have a key in every translation file"
+    UI_KEYS = "new UI strings (tickets 05, 06, 07, 09) have a key in every translation file"
 
     def test_password_lock_facts_pass_after_rebrand(self):
         self.rebrand()
@@ -1160,6 +1160,105 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/server/connection.rs", "                            &Config::get_id(),\n",
                   "                            &lr.username,\n")
         self.assert_check_fails(self.PROOF)
+
+    # --- ticket 09: 1.8.0 first launch sets a Permanent password ---------------------
+    HOSTED_GATE = ("no Permanent password, no Hosted servers: the Target registers its Machine ID only once "
+                   "a password is set; Direct IP keeps listening (ticket 09)")
+    HOSTED_OFF_ON_REMOVE = "removing the Permanent password drops the Hosted registration (ticket 09)"
+
+    def test_hosted_gate_facts_pass_after_rebrand(self):
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_hosted_gate_facts_fail_on_clean_upstream_tree(self):
+        r = run(CHECK, self.root)
+        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+            self.assertIn(f"FAIL {fact}", r.stdout)
+
+    def test_registering_without_a_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", rebrand.HOSTED_GATE, "                let servers = Config::get_rendezvous_servers();\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_gate_helper_ignoring_the_password_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "    if password_set {\n", "    if true {\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_direct_ip_behind_the_password_gate_fails_check(self):
+        # The tailnet path keeps working while setup is pending: Direct IP is never gated.
+        self.rebrand()
+        med = "src/rendezvous_mediator.rs"
+        spawn = "        tokio::spawn(async move {\n            direct_server(server_cloned).await;\n        });\n"
+        self.edit(med, spawn, "        if Config::has_permanent_password() {\n" + spawn + "        }\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_password_removal_keeping_the_registration_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", rebrand.HOSTED_OFF_ON_REMOVE, "")
+        self.assert_check_fails(self.HOSTED_OFF_ON_REMOVE)
+
+    SETUP_SCREEN = ("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs "
+                    "the generator and shows the password once; never again once one is set (ticket 09)")
+    SETUP = "flutter/lib/desktop/widgets/password_setup.dart"
+
+    def test_setup_screen_fact_passes_after_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {self.SETUP_SCREEN}", run(CHECK, self.root).stdout)
+
+    def test_setup_screen_fact_fails_on_clean_upstream_tree(self):
+        self.assertIn(f"FAIL {self.SETUP_SCREEN}", run(CHECK, self.root).stdout)
+
+    def test_setup_screen_not_wired_into_the_home_page_fails_check(self):
+        self.rebrand()
+        self.edit(rebrand.HOME, rebrand.SETUP_HOOK, "")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_shown_with_a_password_already_set_fails_check(self):
+        self.rebrand()
+        self.edit(self.SETUP, "  if (await permanentPasswordSet()) return;\n", "")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_not_showing_the_password_once_fails_check(self):
+        self.rebrand()
+        self.edit(self.SETUP, "showGeneratedPasswordOnce(pass);", "showToast(pass);")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    KEPT = ("the 1.8.0 Update keeps 1.7.x's config: same config dir and License key option, the update script "
+            "never touches it, and nothing we add clears saved machines or settings (ticket 09)")
+
+    def test_config_kept_fact_passes_after_rebrand(self):
+        self.rebrand()
+        self.assertIn(f"PASS {self.KEPT}", run(CHECK, self.root).stdout)
+
+    def test_config_kept_fact_fails_on_clean_upstream_tree(self):
+        self.assertIn(f"FAIL {self.KEPT}", run(CHECK, self.root).stdout)
+
+    def test_moved_config_dir_fails_check(self):
+        # A new org or app name is a new, empty config dir: every saved machine gone.
+        self.rebrand()
+        self.edit(HBB, '"io.boringlabs".to_owned()', '"io.boringlabs.remote".to_owned()')
+        self.assert_check_fails(self.KEPT)
+
+    def test_renamed_license_key_option_fails_check(self):
+        self.rebrand()
+        self.edit("src/license_key.rs", '"boring-license-key"', '"boring-license"')
+        self.assert_check_fails(self.KEPT)
+
+    def test_migration_clearing_saved_machines_fails_check(self):
+        self.rebrand()
+        self.edit("src/password_lock.rs", "pub fn generate() -> String {\n",
+                  "pub fn migrate() {\n    for (id, _, _) in PeerConfig::peers(None) {\n"
+                  "        PeerConfig::remove(&id);\n    }\n}\n\npub fn generate() -> String {\n")
+        self.assert_check_fails(self.KEPT)
+
+    def test_update_script_touching_the_config_fails_check(self):
+        self.rebrand()
+        self.edit("src/platform/privileges_scripts/install-update.sh", 'rm -rf "$PREV"\n',
+                  'rm -rf "$PREV"\nrm -rf "$ROOT/Library/Preferences/io.boringlabs.BoringRemote"\n')
+        self.assert_check_fails(self.KEPT)
 
     def test_line_endings_are_kept(self):
         crlf = ["flutter/macos/Runner/Configs/AppInfo.xcconfig", "res/msi/Package/Package.wxs",
