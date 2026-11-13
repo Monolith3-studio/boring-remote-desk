@@ -20,8 +20,9 @@
 //! - A Controller's identity is its key file (the key pair in its config). Whoever copies that
 //!   file and has the Unattended Password gets in with no Allow, as that Controller; Remove ends it.
 //!   A Direct Link token (1.7) is the same: a bearer secret in the Controller's config.
-//! - A login over a Direct Link to a typed name or address is not signed (the Controller didn't
-//!   dial a Machine ID): only its token (1.7) can make it Trusted, else it asks.
+//! - A login over a Direct Link to a typed name or address signs the Target ID that link's
+//!   handshake verified and pinned (trust on first use, as every 1.7 Direct Link), so one Controller
+//!   has one entry whichever way it connects (review-v18 S2).
 //! - The Hosted servers' word on which key belongs to a Machine ID can be wrong: whoever holds the
 //!   server's private key (on the Hosted box and in Keychain) can vouch any key, and stock `hbbs`
 //!   lets a Machine ID's key change when the registration carries the same UUID from the same IP
@@ -42,12 +43,37 @@ pub fn baked_key(key: &str) -> bool {
     key.is_empty() || key == hbb_common::config::RS_PUB_KEY
 }
 
-/// What this Controller signs as the Target: `peer`'s Machine ID, only when the stream carrying
-/// this login is keyed (`secured`). For a Machine ID a keyed stream means a Direct Link pinned to
-/// it or `secure_connection` under the baked key verified the Target. None for anything else (a
-/// typed name or address), so that login goes unsigned.
-pub fn signed_target(peer: &str, secured: bool) -> Option<String> {
-    (secured && crate::client::boring_is_machine_id(peer)).then(|| peer.to_owned())
+/// What this Controller signs as the Target: `peer`'s Machine ID, or for a Direct Link to a typed
+/// name or address the Target ID that link's handshake verified and pinned (`link`, review-v18 S2),
+/// only when the stream carrying this login is keyed (`secured`). For a Machine ID a keyed stream
+/// means a Direct Link pinned to it or `secure_connection` under the baked key verified the Target.
+/// None for anything else, so that login goes unsigned.
+pub fn signed_target(peer: &str, secured: bool, link: Option<&str>) -> Option<String> {
+    if !secured {
+        return None;
+    }
+    if crate::client::boring_is_machine_id(peer) {
+        return Some(peer.to_owned());
+    }
+    link.filter(|id| crate::client::boring_is_machine_id(id)).map(str::to_owned)
+}
+
+/// Direct Links this session opened to a typed name or address: each stream's local address and
+/// the Target ID its handshake verified (`_start` writes it for every stream it returns, before
+/// any login on it). A stream reads only its own entry.
+pub fn note_link(links: &mut Vec<(std::net::SocketAddr, String)>, local: std::net::SocketAddr, id: Option<String>) {
+    links.retain(|(l, _)| *l != local);
+    if let Some(id) = id {
+        if links.len() >= 16 {
+            links.remove(0);
+        }
+        links.push((local, id));
+    }
+}
+
+/// The Target ID the Direct Link carrying this login (by its local address) verified, if any.
+pub fn link_target(links: &[(std::net::SocketAddr, String)], local: std::net::SocketAddr) -> Option<String> {
+    links.iter().find(|(l, _)| *l == local).map(|(_, id)| id.clone())
 }
 
 /// Sign this login with the Controller's own key pair, for the Target's Trusted list. Left
@@ -55,8 +81,8 @@ pub fn signed_target(peer: &str, secured: bool) -> Option<String> {
 /// (`signed_target`), a challenge no Target makes, or no key pair. On desktop it takes the key
 /// pair the service made and never makes one: a key made by this UI process could differ from
 /// the service's or race it. Mobile runs both sides in one process.
-pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool) {
-    let Some(target) = signed_target(&lr.username, secured) else {
+pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool, link: Option<String>) {
+    let Some(target) = signed_target(&lr.username, secured, link.as_deref()) else {
         return;
     };
     if base::trust::login_message(challenge, &target, &lr.my_id).is_none() {
@@ -99,7 +125,7 @@ mod tests {
     /// What `sign_login` does, with a key pair of our own (the real one reads the service's).
     fn login(dialed: &str, secured: bool, sk: &sign::SecretKey, pk: &sign::PublicKey) -> LoginRequest {
         let mut lr = LoginRequest { my_id: CONTROLLER.into(), username: dialed.into(), ..Default::default() };
-        if let Some(target) = signed_target(dialed, secured) {
+        if let Some(target) = signed_target(dialed, secured, None) {
             lr.boring_controller_pk = pk.0.to_vec().into();
             lr.boring_login_sig = base::trust::login_signature(CHALLENGE, &target, CONTROLLER, &sk.0).unwrap().into();
         }
@@ -112,11 +138,28 @@ mod tests {
 
     #[test]
     fn a_machine_id_is_signed_only_over_a_keyed_stream() {
-        assert_eq!(signed_target(TARGET, true), Some(TARGET.into()));
-        assert_eq!(signed_target(TARGET, false), None, "unverified: unsigned");
+        assert_eq!(signed_target(TARGET, true, None), Some(TARGET.into()));
+        assert_eq!(signed_target(TARGET, false, None), None, "unverified: unsigned");
         for not_an_id in ["edit-bay-2.local", "100.101.102.103", "192.168.1.20:21118", "123@rs.example.com", ""] {
-            assert_eq!(signed_target(not_an_id, true), None, "{}", not_an_id);
+            assert_eq!(signed_target(not_an_id, true, None), None, "{}", not_an_id);
         }
+    }
+
+    #[test]
+    fn a_typed_name_signs_the_target_id_its_direct_link_verified() {
+        // review-v18 S2: a typed name's Direct Link is pinned like a Machine ID's, so it signs that ID.
+        assert_eq!(signed_target("edit-bay-2.local", true, Some(TARGET)), Some(TARGET.into()));
+        assert_eq!(signed_target("edit-bay-2.local", false, Some(TARGET)), None, "unkeyed: unsigned");
+        assert_eq!(signed_target("edit-bay-2.local", true, Some("not-an-id")), None);
+        let a: std::net::SocketAddr = "192.168.1.5:50001".parse().unwrap();
+        let b: std::net::SocketAddr = "192.168.1.5:50002".parse().unwrap();
+        let mut links = Vec::new();
+        note_link(&mut links, a, Some(TARGET.into()));
+        note_link(&mut links, b, Some("111222333".into()));
+        assert_eq!(link_target(&links, a).as_deref(), Some(TARGET), "each stream reads its own");
+        assert_eq!(link_target(&links, b).as_deref(), Some("111222333"));
+        note_link(&mut links, a, None);
+        assert_eq!(link_target(&links, a), None, "a new stream at that address clears the old entry");
     }
 
     #[test]

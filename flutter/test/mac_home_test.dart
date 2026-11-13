@@ -446,5 +446,10 @@ void main() {
     expect(find.text('Or use Tailscale'), findsOneWidget);
     expect(machineIdGroups('1234567890'), '1 234 567 890');
   });
-}
 
+  testWidgets('a Machine ID conflict on the servers is said in plain words', (tester) async {
+    await tester.pumpWidget(host(MacHome(
+        macs: const [], tailscaleAddress: () async => null, onConnect: (_) {}, notices: const [MachineIdConflictNotice()])));
+    expect(find.text(machineIdConflictWords), findsOneWidget);
+  });
+}

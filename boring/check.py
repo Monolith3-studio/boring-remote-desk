@@ -957,11 +957,11 @@ def trust_checks(c, cfg):
     ]
     missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
     conn = c.read("src/server/connection.rs")
-    # The trusted skip must sit inside the login decision, right before the no-password gate (1.8) and
-    # the approve-mode ask.
+    # The trusted checks (with 1.8's lock and no-password gate inside them) sit right before the
+    # approve-mode ask.
     i, j = conn.find(rebrand.T04_TRUSTED_SKIP), conn.find("if (password::approve_mode() == ApproveMode::Click")
-    if i < 0 or conn[i + len(rebrand.T04_TRUSTED_SKIP):j].strip() != rebrand.NO_PASSWORD_GATE.strip():
-        missing.append("connection.rs: trusted skip is not right before the no-password gate and the approve-mode ask")
+    if i < 0 or conn[i + len(rebrand.T04_TRUSTED_SKIP):j].strip():
+        missing.append("connection.rs: trusted checks are not right before the approve-mode ask")
     c.fact("LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)",
            not missing, "; ".join(missing))
 
@@ -1044,9 +1044,10 @@ def always_ask_checks(c, conn, rs, dart):
     grant, answer = fn_body(rs, "    fn approve_into(") or "", fn_body(rs, "pub async fn answer(") or ""
     settings = c.read(rebrand.SETTINGS)
     bad = [n for n, ok in [
-        ("connection.rs sends an always-ask Controller to the password before its token or any ask",
+        ("connection.rs sends an always-ask Controller to the password before any ask or trust gate",
          ask in conn and ask in rebrand.T04_TRUSTED_SKIP
-         and -1 < conn.find(ask) < conn.find("if self.boring_trust.is_trusted() {")),
+         and -1 < conn.find(ask) < conn.find("if self.boring_trust.must_ask() {")
+         < conn.find("if !self.boring_trust.skips_click() {")),
         ("only the Unattended Password counts, never a one-time code or a recent session",
          "self.validate_password(allow_logon_screen_password)\n"
          "                    && self.conn_audit_primary_auth == ConnAuditPrimaryAuth::PermanentPassword\n" in ask
@@ -1450,7 +1451,7 @@ def transfer_checks(c):
     if model.count("approvalAsk(") != model.count("files: client.type_() == ClientType.file,"):
         why.append("an ask to the main window does not say what kind it is")
     # The trust gate runs once the login's kind is known and does not look at the kind.
-    login = conn.find("if self.boring_trust.is_trusted() {")
+    login = conn.find("if self.boring_trust.always_ask() {\n                if !(password::permanent_enabled()")
     ask = conn.find("if self.boring_trust.must_ask() {")
     kind = conn.find("self.file_transfer = Some((ft.dir, ft.show_hidden));")
     if not 0 <= kind < login < ask:
@@ -2031,8 +2032,9 @@ PROVE_CALL = ("self.boring_trust.prove(\n                crate::trust_policy::lo
               "                ),\n                &base::trust::Trusted::load(),\n            );")
 # Ticket 07, the Controller side: the login is signed where it is sent, from the stream that carries it.
 SIGN_CALL = ("let challenge = lc.read().unwrap().hash.challenge.clone();\n"
+             "    let link = crate::trust_policy::link_target(&lc.read().unwrap().boring_link_ids, peer.local_addr());\n"
              "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
-             "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured());\n    }\n"
+             "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), link);\n    }\n"
              "    allow_err!(peer.send(&msg_out).await);")
 # A Machine ID runs only with the baked key; an unverified one is refused without a prompt, and a
 # verified one keeps the key it was first verified with.
@@ -2215,8 +2217,6 @@ def logon_sites(conn, locked):
         "always ask (1.7): this computer's Unattended Password, and nothing else":
             lambda before: before.rstrip().endswith("self.boring_trust.unattended_password_right();")
             and before[-1500:].rfind("if self.boring_trust.always_ask() {") >= 0,
-        "a token this computer issued and still trusts (1.7 Direct Link)":
-            lambda before: before.rstrip().endswith("if self.boring_trust.is_trusted() {"),
     }
     unexplained = [s for s in sites if sum(bool(ok(conn[:s])) for ok in why.values()) != 1]
     return len(sites), unexplained
@@ -2252,14 +2252,14 @@ def proof_checks(c, conn, trust):
     client = c.read("src/client.rs")
     built = fn_body(client, "async fn send_login(") or ""
     hash_fn = fn_body(client, "pub async fn handle_hash(") or ""
-    signing = squash(fn_body(policy, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool) {"))
+    signing = squash(fn_body(policy, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool, link: Option<String>) {"))
     lib = c.read("src/lib.rs")
     why = []
     if not 0 <= built.find(rebrand.SIGN_LOGIN) < built.find("allow_err!(peer.send(&msg_out).await);"):
         why.append("send_login doesn't sign before sending")
     if rebrand.HASH_FIRST_NEW.split("    true\n")[0] not in hash_fn:
         why.append("handle_hash sends the login before it stores the challenge")
-    want = ('let Some(target) = signed_target(&lr.username, secured) else { return; }; '
+    want = ('let Some(target) = signed_target(&lr.username, secured, link.as_deref()) else { return; }; '
             'if base::trust::login_message(challenge, &target, &lr.my_id).is_none() { return; } '
             '#[cfg(any(target_os = "android", target_os = "ios"))] let pair = Some(Config::get_key_pair()); '
             '#[cfg(not(any(target_os = "android", target_os = "ios")))] let pair = Config::get_existing_key_pair(); '
@@ -2286,8 +2286,8 @@ def hosted_signing_checks(c, client, trust, squash):
     if squash(fn_body(trust, "pub fn baked_key(key: &str) -> bool {")) != \
             "key.is_empty() || key == hbb_common::config::RS_PUB_KEY":
         why.append("baked_key accepts another key")
-    signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, secured: bool) -> Option<String> {"))
-    if signed != "(secured && crate::client::boring_is_machine_id(peer)).then(|| peer.to_owned())":
+    signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, secured: bool, link: Option<&str>) -> Option<String> {"))
+    if not signed.startswith("if !secured { return None; }"):
         why.append(f"signed_target is {signed[:90]!r}")
     code = strip_tests_and_comments(client)
     start = fn_body(code, "    pub async fn start(\n") or ""
@@ -2319,17 +2319,12 @@ def hosted_signing_checks(c, client, trust, squash):
 
 
 # Ticket 08 on 1.7's Direct Link, pinned here (not taken from rebrand.py).
-DIRECT_FIRST = ("if let Some((stream, path, pk)) =\n"
+DIRECT_FIRST = ("if let Some((stream, path, pk, who)) =\n"
                 "            crate::connect_plan::direct_first(peer, interface.is_force_relay()).await\n"
                 "        {\n")
 CONNECT_PLAN = ("if !crate::client::boring_is_machine_id(peer) { return vec![Attempt::DirectLink]; } "
                 "let mut attempts = Vec::new(); if known && !relay_only { attempts.push(Attempt::DirectLink); } "
                 "attempts.push(Attempt::Hosted); attempts")
-MACHINE_ID_PLAN = ("let port = hbb_common::config::RELAY_PORT as u16 + 1; let tailscale = known.tailscale_of(id); "
-                   "let direct = crate::lan::advert_of(id).first().map(|a| SocketAddr::new(a.ip, port)); "
-                   "let mut plan = match (direct, tailscale) { (Some(direct), ts) => widen(direct, ts, Some(id), known, None), "
-                   "(None, Some(ts)) => Plan::single(ts, None), (None, None) => return None, }; "
-                   "plan.target = Some(id.to_owned()); plan.dialled = None; Some(plan)")
 REMEMBERED = ("crate::connect_plan::save_reported(\n                            &self.handler.get_id(),\n"
               "                            peer.is_secured(),\n                            &pi.platform_additions,\n"
               "                        );")
@@ -2363,8 +2358,9 @@ def direct_first_checks(c):
     if "base::direct_link::machine_id_known(peer, &known)" not in first or \
             "base::direct_link::connect_machine_id(peer, DIRECT_FIRST_MS, known).await" not in first:
         why.append("direct_first isn't the strict Machine-ID Direct Link")
-    if squash(fn_body(link, "fn plan_for_machine_id(id: &str, known: &Known) -> Option<Plan> {")) != MACHINE_ID_PLAN:
-        why.append("a Machine ID's Direct Link plan isn't strict (target set, nothing exempt, no name lookups)")
+    if "plan.target = Some(id.to_owned()); plan.dialled = None; Some(plan)" not in squash(
+            fn_body(link, "async fn plan_for_machine_id(id: &str, name: &str, known: &Known, ms: u64) -> Option<Plan> {")):
+        why.append("a Machine ID's Direct Link plan isn't strict (target set, nothing exempt)")
     judge = squash(fn_body(link, "fn judge<S>("))
     if "Err(Failure::Refused(e)) => Err(Failure::Stale(e))," not in judge or \
             "Ok((_, Some(who))) if who.id != target && plan.dialled != Some(addr) =>" not in judge:
@@ -2373,7 +2369,7 @@ def direct_first_checks(c):
         why.append("the Tailscale attempt isn't ~3 s")
     if re.search(r"TAILNET_STREAM|tailnet_first|boring_tailnet_stream|TAILNET_OPTION", strip_tests_and_comments(client) + io_loop):
         why.append("a plaintext tailnet-first path or its exemption is back")
-    c.fact("a Machine ID tries a pinned Direct Link where it was met (~3 s on Tailscale), then the Hosted servers (ticket 08)",
+    c.fact("a pinned Machine ID tries a Direct Link where it was met (~3 s on Tailscale), then the Hosted servers (ticket 08)",
            not why, "; ".join(why))
 
     pin = squash(fn_body(plan_code, "pub fn pin_target(id: &str, pk: Option<&[u8]>) -> bool {"))
@@ -2385,7 +2381,7 @@ def direct_first_checks(c):
     reported = conn.find("crate::connect_plan::add_own_tailnet(&mut platform_additions);")
     why = []
     if not pin.startswith("let Some(pk) = pk.filter(|pk| pk.len() == 32) else { return false; };") or \
-            "let ok = known.pin_id(id, pk);" not in pin:
+            "known.pin_id(id, pk)" not in pin:
         why.append("pin_target doesn't refuse a missing key or check the pin")
     if pin_id != ("let pk = hex(sign_pk); match self.0.get(id) { Some(t) => t.pk == pk, None => { "
                   "self.0.insert(id.to_owned(), KnownTarget { pk, ..Default::default() }); true } }"):
@@ -2416,7 +2412,7 @@ def direct_first_checks(c):
 
 
 # The one way a key lets a login skip Allow: a Trusted entry found by the key this login proved.
-SKIPS = "matches!(self.by_key, Some(ByKey::Trusted(..)))"
+SKIPS = "self.trusted.is_some() || matches!(self.by_key, Some(ByKey::Trusted(..)))"
 PROVE = ("self.pk = pk.map(|k| hex(&k)); self.by_key = None; "
          "if self.trusted.is_some() || self.always_ask.is_some() || self.removed.is_some() { return; } "
          "let Some(c) = self.pk.as_deref().and_then(|pk| t.by_pk(pk)) else { return };")
@@ -2449,7 +2445,7 @@ def controller_key_checks(c, locked):
         why.append("prove doesn't let a token decide first, or matches on something other than the proven key")
     if "pub fn by_pk(&self, pk: &str) -> Option<&TrustedController> {\n        if pk.len() != 64 {" not in trust:
         why.append("by_pk matches a short or empty key")
-    c.fact("a right password waits for Allow on the Target unless a Trusted Controller proves its key",
+    c.fact("a right password waits for Allow on the Target unless a Trusted Controller shows its token or key",
            not why, "; ".join(why))
 
     accept = conn.find("ipc::Data::Authorize => {")
@@ -2477,7 +2473,7 @@ def controller_key_checks(c, locked):
            rebrand.EMPTY_PASSWORD_NO_CM in conn and rebrand.EMPTY_PASSWORD_CM not in conn
            and rebrand.WRONG_PASSWORD_CM not in conn)
     n, odd = logon_sites(conn, locked)
-    c.fact("exactly seven ways into a session, each gated or explained", n == 7 and not odd,
+    c.fact("exactly six ways into a session, each gated or explained", n == 6 and not odd,
            f"{n} logon calls, unexplained at {odd}")
 
     lost = squash(fn_body(trust, "fn lost_trust_in(&self, t: &Trusted) -> bool {"))
@@ -2495,6 +2491,93 @@ def controller_key_checks(c, locked):
            not why, "; ".join(why))
     proof_checks(c, conn, trust)
 
+
+
+REVIEW_M1 = "the lock and no password set come before every Trusted check; a token skips Allow, never the password (review-v18 M1)"
+REVIEW_S1 = "a token alone never stores a key: only a login that also gave the Unattended Password binds it, and a failed store says why (review-v18 S1)"
+REVIEW_S2 = ("one Controller, one row: a typed-name Direct Link signs the Target ID it verified, a key-only row folds "
+             "into the token row, Remove takes every row with that key (review-v18 S2)")
+REVIEW_S3 = "a Machine ID is dialled as a Direct Link only once pinned; first contact goes through the Hosted servers (review-v18 S3)"
+REVIEW_S4 = "on UUID_MISMATCH the Machine ID stays, said in the log and on Home (review-v18 S4)"
+REVIEW_S6 = "every ask counts against the IP's failure budget, a removed token's too (review-v18 S6)"
+REVIEW_S7 = "Known is changed under one lock: every pin and address write goes through Known::edit (review-v18 S7)"
+
+
+def review_v18_checks(c):
+    """The port review's findings (review-v18.md), each pinned here, not taken from rebrand.py."""
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    conn = c.read("src/server/connection.rs")
+    trust = strip_tests_and_comments(c.read("libs/base/src/trust.rs"))
+    link = strip_tests_and_comments(c.read(DIRECT_LINK))
+    plan = strip_tests_and_comments(c.read("src/connect_plan.rs"))
+    policy = strip_tests_and_comments(c.read("src/trust_policy.rs"))
+    client = c.read("src/client.rs")
+
+    at = conn.find("self.boring_trust.prove(")
+    order = [conn.find(n, at) for n in (
+        "if crate::password_lock::refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD)) {",
+        "if self.boring_trust.always_ask() {\n",
+        "if !Config::has_permanent_password() {\n",
+        "if self.boring_trust.must_ask() {",
+        "if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)")]
+    c.fact(REVIEW_M1, at >= 0 and -1 not in order and order == sorted(order)
+           and "boring_trust.is_trusted()" not in conn
+           and squash(fn_body(trust, "pub fn skips_click(&self) -> bool {")) == SKIPS,
+           f"order {order}")
+
+    approve = fn_body(trust, "pub fn approve(&mut self, how: SignIn, name: &str) {") or ""
+    trusted = approve.split("if self.always_ask() {", 1)[0]
+    c.fact(REVIEW_S1, "match (self.trusted.is_some() && self.password_right, self.key.as_deref(), self.pk.as_deref()) {"
+           in (fn_body(trust, "fn bind_into(&self, t: &mut Trusted) -> bool {") or "")
+           and "let bound = self.bind_into(t);" in trusted and "t.bind_pk(" not in trusted
+           and "Err(e) => hbb_common::log::warn!(" in trusted)
+
+    why = []
+    if squash(fn_body(policy, "pub fn signed_target(peer: &str, secured: bool, link: Option<&str>) -> Option<String> {")) != (
+            "if !secured { return None; } if crate::client::boring_is_machine_id(peer) { return Some(peer.to_owned()); } "
+            "link.filter(|id| crate::client::boring_is_machine_id(id)).map(str::to_owned)"):
+        why.append("signed_target")
+    if "crate::trust_policy::link_target(&lc.read().unwrap().boring_link_ids, peer.local_addr());" not in client \
+            or client.count("crate::trust_policy::note_link(&mut interface.get_lch().write().unwrap().boring_link_ids, stream.local_addr(), who);") != 2 \
+            or "pub boring_link_ids: Vec<(std::net::SocketAddr, String)>," not in client:
+        why.append("a Direct Link's verified Target ID doesn't reach its login")
+    bind = fn_body(trust, "fn bind_pk(&mut self, key: &str, pk: &str) -> bool {") or ""
+    if "c.key.starts_with(PK_KEY_PREFIX) && !c.removed" not in bind or "self.list.retain(|c| !folds(c));" not in bind \
+            or "if self.list.iter().any(|c| c.pk == pk && !folds(c)) {" not in bind:
+        why.append("a key-only row doesn't fold into the token row")
+    if "t.key == key || !pk.is_empty() && t.pk == pk" not in (fn_body(trust, "pub fn remove(&mut self, key: &str) -> bool {") or ""):
+        why.append("Remove leaves a row with the same key")
+    c.fact(REVIEW_S2, not why, "; ".join(why))
+
+    first = fn_body(link, "async fn plan_for_machine_id(id: &str, name: &str, known: &Known, ms: u64) -> Option<Plan> {") or ""
+    c.fact(REVIEW_S3, first.lstrip().startswith("if !known.pinned(id) {\n        return None;\n    }")
+           and squash(fn_body(link, "pub fn machine_id_known(id: &str, known: &Known) -> bool {")) == "known.pinned(id)"
+           and squash(fn_body(link, "pub fn pinned(&self, id: &str) -> bool {")) == "self.0.get(id).map_or(false, |t| !t.pk.is_empty())"
+           and "tailscale_answer(name, ms)" in first, first.strip()[:80])
+
+    med = c.read("src/rendezvous_mediator.rs")
+    mismatch = fn_body(med, "    async fn handle_uuid_mismatch(&mut self, socket: Sink<'_>) -> ResultType<()> {") or ""
+    keep = fn_body(plan, "pub fn keep_id_on_conflict(host: &str) -> bool {") or ""
+    home = c.read(rebrand.HOME)
+    dart = re.search(r"const kBoringIdConflict = '([^']+)';", c.read("flutter/lib/desktop/kit/mac_home.dart"))
+    rust = re.search(r'pub const ID_CONFLICT_OPTION: &str = "([^"]+)";', plan)
+    c.fact(REVIEW_S4, mismatch.lstrip().startswith("// boring-remote (review-v18 S4)")
+           and 0 <= mismatch.find("crate::connect_plan::keep_id_on_conflict(&self.host)") < mismatch.find("Config::update_id();")
+           and 'crate::get_builtin_option("disable-change-id") != "Y"' in keep and "update_id" not in keep
+           and "crate::connect_plan::id_registered();" in med
+           and "if (bind.mainGetOptionSync(key: kBoringIdConflict) == 'Y') const MachineIdConflictNotice()," in home
+           and dart and rust and dart.group(1) == rust.group(1))
+
+    must = conn[conn.find("if self.boring_trust.must_ask() {"):][:900]
+    c.fact(REVIEW_S6, re.search(r"let \(failure, res\) = self\.check_failure\(0\)\.await;\s*if !res \{\s*return true;\s*\}\s*"
+                                + BUMP + r"\s*self\.boring_trust\.wait_for_allow\(false\);", must) is not None)
+
+    edit = fn_body(link, "pub fn edit<R>(f: impl FnOnce(&mut Known) -> R) -> R {") or ""
+    dial = fn_body(link, "async fn dial(") or ""
+    c.fact(REVIEW_S7, "static KNOWN_LOCK: std::sync::Mutex<()>" in link and "KNOWN_LOCK.lock()" in edit
+           and "Known::edit(|known| {" in dial and ".save()" not in dial
+           and "Known::edit(|known| known.pin_id(id, pk))" in plan and "Known::edit(|known| known.learn_tailscale(id, ip))" in plan
+           and ".save()" not in plan)
 
 def stored_controller_key_checks(c):
     """1.8 keys on 1.7's Trusted list: optional, never written empty, never a token."""
@@ -2563,9 +2646,10 @@ BORING_RELAY = ('let ours = hbb_common::config::Config::get_option("relay-server
                 '{ bail!("no relay server"); } if !advertised.is_empty() && advertised != ours '
                 '&& !advertised.starts_with(&format!("{ours}:")) { log::warn!("relay {advertised} named by the peer '
                 'ignored, using {ours}"); } Ok(ours)')
-DIRECT_LAN_ONLY = ('log::info!("direct access from {}", addr);\n'
-                   "                // boring-remote: the Direct Link answers Tailscale and private-LAN addresses only (ADR 0003, 0005).\n"
-                   "                if !base::lan::is_allowed(addr.ip()) {\n                    continue;\n                }\n")
+# review-v18 S5: refused before a single line is logged (the log is per connect, at the peer's rate).
+DIRECT_LAN_ONLY = ("// boring-remote: the Direct Link answers Tailscale and private-LAN addresses only (ADR 0003, 0005).\n"
+                   "                if !base::lan::is_allowed(addr.ip()) {\n                    continue;\n                }\n"
+                   '                log::info!("direct access from {}", addr);\n')
 
 
 def exposure_checks(c, cfg):
@@ -2794,6 +2878,7 @@ def run_checks(root):
     password_lock_checks(c, locked)
     controller_key_checks(c, locked)
     stored_controller_key_checks(c)
+    review_v18_checks(c)
     first_launch_checks(c)
     config_kept_checks(c, cfg)
 

@@ -316,7 +316,34 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{:02x}", x)).collect()
 }
 
+/// review-v18 S7: one read-modify-write of [`Known`] at a time in this process (a Direct Link and a
+/// Hosted attempt, or port-forward sockets, would otherwise drop each other's fresh pins).
+static KNOWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Known {
+    /// Load, change and save under [`KNOWN_LOCK`]; saved only when `f` changed something.
+    pub fn edit<R>(f: impl FnOnce(&mut Known) -> R) -> R {
+        let _lock = KNOWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut known = Known::load();
+        let before = known.clone();
+        let r = f(&mut known);
+        if known != before {
+            known.save();
+        }
+        r
+    }
+
+    /// review-v18 S3: this Controller holds an identity key for Target `id` (met over a Direct
+    /// Link, or vouched once by the Hosted servers under the baked key).
+    pub fn pinned(&self, id: &str) -> bool {
+        self.0.get(id).map_or(false, |t| !t.pk.is_empty())
+    }
+
+    /// Met on its LAN over a Direct Link (an address it answered on, or listed), as 1.7.x Targets were.
+    fn met_on_lan(&self, id: &str) -> bool {
+        self.0.get(id).map_or(false, |t| !t.lan.is_empty() || !t.addrs.is_empty())
+    }
+
     pub fn parse(json: &str) -> Self {
         Known(crate::trust::parse_or_default(json, "known Targets"))
     }
@@ -553,37 +580,73 @@ pub async fn plan_for_recent(id: &str, name: &str, known: &Known, ms: u64) -> Re
     }
 }
 
-/// 1.8: where a Machine ID can be dialled as a Direct Link before the Hosted servers: its LAN
-/// addresses while LAN Discovery sees it on this network right now (elsewhere they would only
-/// time out), and its known Tailscale address. Strict: only that Machine ID answering counts
-/// (`target`, and no address is exempt from the who-check), so a failure goes on to Hosted, never
-/// to another computer at an old address. No name lookups: a Machine ID is not a name.
-fn plan_for_machine_id(id: &str, known: &Known) -> Option<Plan> {
-    let port = hbb_common::config::RELAY_PORT as u16 + 1;
-    let tailscale = known.tailscale_of(id);
-    let direct = crate::lan::advert_of(id).first().map(|a| SocketAddr::new(a.ip, port));
-    let mut plan = match (direct, tailscale) {
-        (Some(direct), ts) => widen(direct, ts, Some(id), known, None),
-        (None, Some(ts)) => Plan::single(ts, None),
-        (None, None) => return None,
+/// 1.8: where a Machine ID can be dialled as a Direct Link before the Hosted servers. Only a Machine
+/// ID this Controller already holds a pin for (review-v18 S3): LAN Discovery adverts and names are
+/// unauthenticated, so first contact always goes through the Hosted servers, vouched under the baked
+/// key. A Target met on its LAN (a 1.7.x one, typically) gets 1.7's recents plan: its LAN addresses,
+/// its name (MagicDNS on a tailnet), its Tailscale address. One met only over Hosted gets its LAN
+/// addresses while LAN Discovery sees it here, and the Tailscale address it reported. Strict: only
+/// that Machine ID answering, under its pinned key, counts (`target`, nothing exempt from the
+/// who-check), so a failure goes on to Hosted, never to another computer at an old address.
+async fn plan_for_machine_id(id: &str, name: &str, known: &Known, ms: u64) -> Option<Plan> {
+    if !known.pinned(id) {
+        return None;
+    }
+    let mut plan = if known.met_on_lan(id) {
+        plan_for_recent(id, name, known, ms).await.ok()?
+    } else if known.tailscale_of(id).is_none() && crate::lan::advert_of(id).is_empty() && !name.is_empty() {
+        // Met over a Tailscale Direct Link that gave no address to keep: its name, as 1.7 did.
+        plan_for_recent(id, name, known, ms).await.ok()?
+    } else {
+        let port = hbb_common::config::RELAY_PORT as u16 + 1;
+        let tailscale = known.tailscale_of(id);
+        let direct = crate::lan::advert_of(id).first().map(|a| SocketAddr::new(a.ip, port));
+        match (direct, tailscale) {
+            (Some(direct), ts) => widen(direct, ts, Some(id), known, None),
+            (None, Some(ts)) => Plan::single(ts, None),
+            (None, None) => return None,
+        }
     };
+    // Compat (a 1.8 Controller, a 1.7.x Target that isn't on the Hosted servers): no Tailscale address
+    // kept for it, but a name, which MagicDNS answers on a tailnet. Its Tailscale answer goes last.
+    if plan.tailscale.is_none() && !name.is_empty() {
+        plan.tailscale = tailscale_answer(name, ms).await.filter(|ts| *ts != plan.direct && !plan.others.contains(ts));
+    }
     plan.target = Some(id.to_owned());
     plan.dialled = None;
     Some(plan)
 }
 
-/// 1.8: whether a Machine ID has anywhere to try as a Direct Link (`plan_for_machine_id`).
+/// The Tailscale address `name` resolves to here (MagicDNS), if it resolves to one.
+async fn tailscale_answer(name: &str, ms: u64) -> Option<SocketAddr> {
+    let host = hbb_common::socket_client::check_port(name, hbb_common::config::RELAY_PORT + 1);
+    match hbb_common::timeout(ms, hbb_common::tokio::net::lookup_host(host)).await {
+        Ok(Ok(addrs)) => first_tailscale(addrs.map(hbb_common::try_into_v4)),
+        _ => None,
+    }
+}
+
+fn first_tailscale(addrs: impl IntoIterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    addrs.into_iter().find(|a| is_tailscale(a.ip()))
+}
+
+/// 1.8: whether a Machine ID may try a Direct Link at all: only one already pinned (S3).
 pub fn machine_id_known(id: &str, known: &Known) -> bool {
-    plan_for_machine_id(id, known).is_some()
+    known.pinned(id)
 }
 
 /// 1.8: a Machine ID as a Direct Link (`plan_for_machine_id`), before the Hosted servers.
-/// `slow_ms` is the Tailscale (or last) address's budget. Every session comes back encrypted and
-/// pinned to that Machine ID, or not at all.
-pub async fn connect_machine_id(id: &str, slow_ms: u64, known: Known) -> ResultType<(Stream, Route, Option<Vec<u8>>)> {
-    let plan = plan_for_machine_id(id, &known).ok_or_else(|| anyhow!(NO_ADDRESS))?;
+/// `slow_ms` is the Tailscale (or last) address's budget and each name lookup's. Every session comes
+/// back encrypted and pinned to that Machine ID, or not at all.
+pub async fn connect_machine_id(id: &str, slow_ms: u64, known: Known) -> ResultType<Connected> {
+    let name = hbb_common::config::PeerConfig::load(id).info.hostname;
+    let plan = plan_for_machine_id(id, &name, &known, slow_ms).await.ok_or_else(|| anyhow!(NO_ADDRESS))?;
     dial(plan, slow_ms, known).await
 }
+
+/// A Direct Link session: the stream, the route it took, the Target's identity key and its verified
+/// Target ID (review-v18 S2: the Controller signs its login for that ID, whatever was typed).
+pub type Connected = (Stream, Route, Option<Vec<u8>>, Option<String>);
 
 /// Home's recents are stored by Target ID (digits); the connect box takes names and addresses.
 pub fn is_target_id(peer: &str) -> bool {
@@ -594,7 +657,7 @@ pub fn is_target_id(peer: &str) -> bool {
 /// [`NOT_ON_THIS_NETWORK`]. A recent from Home (a Target ID) goes by [`plan_for_recent`].
 /// Every session comes back encrypted or not at all. Returns the
 /// stream, the route it took and the Target's identity key (the session fingerprint) when known.
-pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Route, Option<Vec<u8>>)> {
+pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<Connected> {
     let known = Known::load();
     let plan = if is_target_id(peer) {
         let name = hbb_common::config::PeerConfig::load(peer).info.hostname;
@@ -605,7 +668,7 @@ pub async fn connect(peer: &str, slow_ms: u64) -> ResultType<(Stream, Route, Opt
     dial(plan?, slow_ms, known).await
 }
 
-async fn dial(plan: Plan, slow_ms: u64, mut known: Known) -> ResultType<(Stream, Route, Option<Vec<u8>>)> {
+async fn dial(plan: Plan, slow_ms: u64, known: Known) -> ResultType<Connected> {
     let here = crate::lan::local_nics();
     let strict = plan.clone();
     let here_ref = &here;
@@ -621,17 +684,21 @@ async fn dial(plan: Plan, slow_ms: u64, mut known: Known) -> ResultType<(Stream,
     )
     .await?;
     let mut link = Default::default();
+    let id = who.as_ref().map(|w| w.id.clone());
     let pk = who.map(|w| {
-        known.record(&w, addr);
-        let fresh = crate::lan::advert_of(&w.id);
-        if !fresh.is_empty() {
-            known.set_addresses(&w.id, &fresh);
-        }
-        known.save();
-        link = known.link_at(&w.id, addr.ip()).and(crate::lan::local_link(stream.local_addr().ip(), &here));
+        // review-v18 S7: on the map as it is now, under the lock, not the copy this dial began with.
+        link = Known::edit(|known| {
+            known.record(&w, addr);
+            let fresh = crate::lan::advert_of(&w.id);
+            if !fresh.is_empty() {
+                known.set_addresses(&w.id, &fresh);
+            }
+            known.link_at(&w.id, addr.ip())
+        })
+        .and(crate::lan::local_link(stream.local_addr().ip(), &here));
         w.sign_pk
     });
-    Ok((stream, Route { path: Path::of(addr), link }, pk))
+    Ok((stream, Route { path: Path::of(addr), link }, pk, id))
 }
 
 /// boring-remote (v1.7 t25): TCP to `addr`, leaving by `source` if this computer picked a way out. A
@@ -1324,11 +1391,61 @@ mod tests {
         assert!(known.learn_tailscale("123", "100.101.102.103".parse().unwrap()));
         assert!(!known.learn_tailscale("123", "100.101.102.103".parse().unwrap()), "unchanged");
         assert_eq!(known.tailscale_of("123"), Some(sa(TS)));
-        // Its next connect dials that address first, strictly as that Machine ID.
-        let plan = plan_for_machine_id("123", &known).unwrap();
-        assert_eq!((plan.direct, plan.target.as_deref(), plan.dialled), (sa(TS), Some("123"), None));
         assert!(machine_id_known("123", &known));
-        assert!(!machine_id_known("999", &known), "never met: Hosted only, no name lookups");
+        assert!(!machine_id_known("999", &known), "never met: Hosted only");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_machine_id_dials_its_tailscale_address_strictly() {
+        let mut known = Known::default();
+        known.pin_id("123", &[1u8; 32]);
+        known.learn_tailscale("123", "100.101.102.103".parse().unwrap());
+        let plan = plan_for_machine_id("123", "", &known, 50).await.unwrap();
+        assert_eq!((plan.direct, plan.target.as_deref(), plan.dialled), (sa(TS), Some("123"), None));
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_machine_id_is_never_dialled_from_a_lan_advert() {
+        // review-v18 S3: anyone on this network can advertise any Machine ID at its own address.
+        let advert = serde_json::json!({ "addrs": [{ "ip": "192.168.1.66" }] }).to_string();
+        crate::lan::pong_addresses("s3-unpinned", "192.168.1.66".parse().unwrap(), "aa:bb", &advert);
+        assert!(!crate::lan::advert_of("s3-unpinned").is_empty(), "the advert is there");
+        let known = Known::parse(r#"{"s3-unpinned":{"pk":"","tailscale":"100.101.102.103:21118"}}"#);
+        assert!(plan_for_machine_id("s3-unpinned", "", &known, 50).await.is_none(), "no pin: Hosted first");
+        assert!(!machine_id_known("s3-unpinned", &known));
+        // Once pinned, the advert is only a hint: the pin still decides who answered.
+        let mut known = Known::default();
+        known.pin_id("s3-unpinned", &[2u8; 32]);
+        let plan = plan_for_machine_id("s3-unpinned", "", &known, 50).await.unwrap();
+        assert_eq!(plan.direct.ip().to_string(), "192.168.1.66");
+        assert_eq!(plan.target.as_deref(), Some("s3-unpinned"));
+    }
+
+    #[tokio::test]
+    async fn a_machine_id_met_on_its_lan_keeps_1_7s_name_fallback() {
+        // Compat: a 1.7.1 Target met at home, now reachable only by its MagicDNS name. The name
+        // resolves here to a loopback stand-in (not allowed, so NOT_FOUND), so the plan falls back
+        // to its stored LAN address; what matters is that the name is tried, strictly.
+        let mut known = Known::default();
+        let who = Verified { id: "4242".into(), sign_pk: vec![5u8; 32], tailscale: None };
+        known.record(&who, sa(LAN));
+        assert!(known.met_on_lan("4242"));
+        let plan = plan_for_machine_id("4242", "tori-mbp", &known, 50).await.unwrap();
+        assert_eq!((plan.target.as_deref(), plan.dialled), (Some("4242"), None));
+        assert_eq!(plan.direct, sa(LAN), "1.7's recents plan: the address it was met on");
+    }
+
+    #[test]
+    fn a_name_counts_only_for_the_tailscale_address_it_resolves_to() {
+        assert_eq!(first_tailscale([sa(LAN), sa(TS)]), Some(sa(TS)));
+        assert_eq!(first_tailscale([sa(LAN), sa("8.8.8.8:21118")]), None);
+    }
+
+    #[test]
+    fn known_edits_go_through_one_lock_and_save_only_a_change() {
+        let first = Known::edit(|k| k.clone());
+        let again = Known::edit(|k| k.clone());
+        assert_eq!(first, again);
     }
 
     #[tokio::test]

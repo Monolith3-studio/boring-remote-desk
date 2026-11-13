@@ -227,11 +227,18 @@ impl Trusted {
     }
 
     /// A 1.7 entry (token only) whose Controller now proved its own key: store the key with it,
-    /// once. Never over another key, and never a key another entry already holds.
+    /// once. Never over another key. A key-only row the same Controller got over Hosted is folded
+    /// in (review-v18 S2: one Controller, one row, so one Remove cuts it off); a key another token
+    /// row holds, or a removed key-only row, stops it.
     fn bind_pk(&mut self, key: &str, pk: &str) -> bool {
-        if pk.len() != 64 || self.list.iter().any(|c| c.pk == pk) {
+        if pk.len() != 64 || !self.list.iter().any(|c| c.key == key && c.pk.is_empty() && !c.removed) {
             return false;
         }
+        let folds = |c: &TrustedController| c.pk == pk && c.key.starts_with(PK_KEY_PREFIX) && !c.removed;
+        if self.list.iter().any(|c| c.pk == pk && !folds(c)) {
+            return false;
+        }
+        self.list.retain(|c| !folds(c));
         match self.list.iter_mut().find(|c| c.key == key && c.pk.is_empty()) {
             Some(c) => {
                 c.pk = pk.to_owned();
@@ -257,13 +264,14 @@ impl Trusted {
     /// this Mac, and only Allow here trusts it again (not the Unattended Password). Settings'
     /// Remove reaches it through [`edit`].
     pub fn remove(&mut self, key: &str) -> bool {
-        match self.list.iter_mut().find(|t| t.key == key && !t.removed) {
-            Some(t) => {
-                t.removed = true;
-                true
-            }
-            None => false,
+        let Some(pk) = self.list.iter().find(|t| t.key == key && !t.removed).map(|t| t.pk.clone()) else {
+            return false;
+        };
+        // review-v18 S2: every row holding the same Controller key goes with it.
+        for t in self.list.iter_mut().filter(|t| t.key == key || !pk.is_empty() && t.pk == pk) {
+            t.removed = true;
         }
+        true
     }
 
     /// Reset password's "Also remove every Trusted Controller": all of them, as Remove does.
@@ -434,10 +442,11 @@ impl Admission {
         self.always_ask.is_some() || matches!(self.by_key, Some(ByKey::AlwaysAsk(..)))
     }
 
-    /// 1.8: a Trusted Controller found by its proven key (no token): once its Unattended Password
-    /// checks out it is in with no Allow here (rebrand TRUST_GATE). Never for a key alone.
+    /// 1.8: a Trusted Controller, by the token it presented (1.7 Direct Link) or the key it proved:
+    /// once its Unattended Password checks out it is in with no Allow here (rebrand TRUST_GATE). A
+    /// token skips the click, never the password (review-v18 M1, story 14). Never for a key alone.
     pub fn skips_click(&self) -> bool {
-        matches!(self.by_key, Some(ByKey::Trusted(..)))
+        self.trusted.is_some() || matches!(self.by_key, Some(ByKey::Trusted(..)))
     }
 
     /// 1.8, on each login request: `pk` is the Controller key this login proved (src/trust_policy.rs
@@ -526,6 +535,15 @@ impl Admission {
         t.list.iter().any(|c| c.key == key && (c.removed || !self.password_right && !self.stays && c.always_ask))
     }
 
+    /// review-v18 S1: a token-trusted login's proven key goes on its entry only when this same login
+    /// also gave the Unattended Password, so a copied token alone never mints Hosted trust.
+    fn bind_into(&self, t: &mut Trusted) -> bool {
+        match (self.trusted.is_some() && self.password_right, self.key.as_deref(), self.pk.as_deref()) {
+            (true, Some(key), Some(pk)) => t.bind_pk(key, pk),
+            _ => false,
+        }
+    }
+
     /// What `how` may store (1.8): a new Controller, or one found removed by its key, only by Allow
     /// after its Unattended Password checked out, with no other session open; one whose token says
     /// removed (a Direct Link, 1.7) by Allow with no other session open. Anything else lets this
@@ -544,15 +562,15 @@ impl Admission {
     /// leaves them worthless. A token-trusted Controller that proved its key gets it stored.
     pub fn approve(&mut self, how: SignIn, name: &str) {
         if self.trusted.is_some() {
-            if let (Some(key), Some(pk)) = (self.key.clone(), self.pk.clone()) {
-                if let Ok(true) = edit_list(|t| {
-                    let bound = t.bind_pk(&key, &pk);
-                    Ok((bound, bound))
-                }) {
-                    hbb_common::log::info!("Direct Link: Trusted Controller {:?} proved its own key; stored", name);
-                }
+            match edit_list(|t| {
+                let bound = self.bind_into(t);
+                Ok((bound, bound))
+            }) {
+                Ok(true) => hbb_common::log::info!("Trusted Controller {:?} proved its own key; stored", name),
+                Ok(false) => {}
+                Err(e) => hbb_common::log::warn!("Trusted Controller {:?}: its key not stored: {}", name, e),
             }
-            hbb_common::log::info!("Direct Link: Trusted Controller {:?} came straight in", name);
+            hbb_common::log::info!("Trusted Controller {:?} came in by its token and the password", name);
             return;
         }
         if self.always_ask() {
@@ -1560,7 +1578,7 @@ mod tests {
         let key = t17.list()[0].key.clone();
         let (mut c, _) = connect(&t17, token.clone()).await;
         c.prove(signed(&sk, &pk, "c", "1", "9"), &t17);
-        assert!(c.is_trusted() && !c.skips_click(), "the token's verdict stands");
+        assert!(c.is_trusted() && c.skips_click(), "the token's verdict stands: no Allow, the password still asked");
         assert!(t17.bind_pk(&key, &hex(&pk)));
         let (_, pk2) = keypair();
         assert!(!t17.bind_pk(&key, &hex(&pk2)), "never over another key");
@@ -1607,5 +1625,73 @@ mod tests {
         let pre = format!("123456789:{},987654321", "ab".repeat(32));
         assert_eq!(Trusted::parse_strict(&pre), Some(Trusted::default()));
         assert_eq!(Trusted::parse_strict("not json"), None, "anything else stays unreadable");
+    }
+
+    // --- review-v18 (M1, S1, S2) ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_token_skips_the_click_never_the_password() {
+        // M1 / story 14: a Trusted token is "no Allow needed", not "no password needed". The
+        // password check itself is connection.rs's; the token only answers skips_click.
+        let mut trusted = Trusted::default();
+        let (mut a, issued) = connect(&trusted, None).await;
+        a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2");
+        let (b, _) = connect(&trusted, issued).await;
+        assert!(b.is_trusted() && b.skips_click());
+        let (c, _) = connect(&trusted, None).await;
+        assert!(!c.skips_click(), "a stranger still needs Allow");
+    }
+
+    #[tokio::test]
+    async fn a_token_alone_never_stores_a_key() {
+        // S1: only a login that also proved the Unattended Password (or an Allow) binds its key.
+        let (sk, pk) = keypair();
+        let mut t = Trusted::default();
+        let (mut a, token) = connect(&t, None).await;
+        a.approve_into(&mut t, SignIn::Allowed, "Old Mac");
+        let (mut b, _) = connect(&t, token.clone()).await;
+        b.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        assert!(!b.bind_into(&mut t), "token alone: no key stored");
+        assert!(t.list()[0].pk.is_empty());
+        b.unattended_password_right();
+        assert!(b.bind_into(&mut t), "token and the password: stored");
+        assert_eq!(t.list()[0].pk, hex(&pk));
+    }
+
+    #[tokio::test]
+    async fn a_hosted_entry_merges_into_its_token_entry_and_remove_takes_both() {
+        // S2: approved over a typed-name Direct Link (token, no key), then over Hosted (key only).
+        let (sk, pk) = keypair();
+        let mut t = Trusted::default();
+        let (mut lan, token) = connect(&t, None).await;
+        lan.approve_into(&mut t, SignIn::Allowed, "Laptop");
+        let mut hosted = Admission::default();
+        hosted.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        hosted.approve_into(&mut t, SignIn::Allowed, "Laptop");
+        assert_eq!(t.list().len(), 2, "two rows before the merge");
+        let token_key = t.list().iter().find(|c| c.pk.is_empty()).unwrap().key.clone();
+        assert!(t.bind_pk(&token_key, &hex(&pk)), "the key-only row folds into the token row");
+        assert_eq!(t.list().len(), 1);
+        assert_eq!(t.list()[0].pk, hex(&pk));
+        assert!(!t.to_json().contains(PK_KEY_PREFIX));
+        let _ = token;
+
+        // Two rows sharing a key: Remove on either takes both.
+        let mut two = Trusted::default();
+        two.add("aa11", "Laptop", &hex(&pk));
+        two.add(&format!("{PK_KEY_PREFIX}{}", hex(&pk)), "Laptop", &hex(&pk));
+        assert!(two.remove("aa11"));
+        assert!(two.list().is_empty(), "every row with that key is removed");
+        // A removed key-only row is never folded back in (that would undo Remove).
+        let mut gone = Trusted::default();
+        gone.add("bb22", "Laptop", "");
+        gone.add(&format!("{PK_KEY_PREFIX}{}", hex(&pk)), "Laptop", &hex(&pk));
+        gone.remove(&format!("{PK_KEY_PREFIX}{}", hex(&pk)));
+        assert!(!gone.bind_pk("bb22", &hex(&pk)));
+        // Another token row's key is never taken.
+        let mut other = Trusted::default();
+        other.add("cc33", "A", &hex(&pk));
+        other.add("dd44", "B", "");
+        assert!(!other.bind_pk("dd44", &hex(&pk)));
     }
 }

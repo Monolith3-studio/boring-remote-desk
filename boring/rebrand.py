@@ -67,7 +67,9 @@ DIRECT_LINK_CALL = (
     "        // own address, then its Tailscale address, else \"Not on this network\"; always encrypted\n"
     "        // or refused, Tailscale too (ADR 0004, 0005). Never the ID path below.\n"
     "        if !boring_is_machine_id(peer) {\n"
-    "            let (stream, path, pk) = base::direct_link::connect(peer, CONNECT_TIMEOUT).await?;\n"
+    "            let (stream, path, pk, who) = base::direct_link::connect(peer, CONNECT_TIMEOUT).await?;\n"
+    "            // Its login signs the Target ID this handshake verified (review-v18 S2).\n"
+    "            crate::trust_policy::note_link(&mut interface.get_lch().write().unwrap().boring_link_ids, stream.local_addr(), who);\n"
     "            return Ok((\n"
     "                (stream, true, pk, None, path.stream_type()),\n"
     "                (0, \"\".to_owned()),\n"
@@ -76,9 +78,10 @@ DIRECT_LINK_CALL = (
     "        }\n"
     "        // boring-remote (1.8, ticket 08): a Machine ID tries a Direct Link where it was met first\n"
     "        // (pinned to that Machine ID), then the Hosted servers below (src/connect_plan.rs).\n"
-    "        if let Some((stream, path, pk)) =\n"
+    "        if let Some((stream, path, pk, who)) =\n"
     "            crate::connect_plan::direct_first(peer, interface.is_force_relay()).await\n"
     "        {\n"
+    "            crate::trust_policy::note_link(&mut interface.get_lch().write().unwrap().boring_link_ids, stream.local_addr(), who);\n"
     "            return Ok((\n"
     "                (stream, true, pk, None, path.stream_type()),\n"
     "                (0, \"\".to_owned()),\n"
@@ -377,8 +380,8 @@ PATCHES = [
      "    if true { return Default::default(); } // boring-remote: no IPv6 punch (ticket 07)\n",
      "the Target starts no IPv6 punch (it would probe STUN servers)"),
     ("src/rendezvous_mediator.rs", '                log::info!("direct access from {}", addr);\n',
-     '                log::info!("direct access from {}", addr);\n' + DIRECT_LAN_ONLY,
-     "Direct Link (21118) answers Tailscale and private-LAN addresses only"),
+     DIRECT_LAN_ONLY + '                log::info!("direct access from {}", addr);\n',
+     "Direct Link (21118) answers Tailscale and private-LAN addresses only, before it logs a line"),
     # --- connect box: a Machine ID can reach the Hosted servers; names and IPs are a Direct Link ----
     ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
      MACHINE_ID_HELPERS + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
@@ -1063,6 +1066,50 @@ T04_EDIT_FFI = (
     "    #[cfg(any(target_os = \"android\", target_os = \"ios\"))]\n"
     "    return base::trust::edit(&edit);\n"
     "}\n\n")
+def _click_wait(indent):
+    i = " " * indent
+    return (
+        f"{i}#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+        f"{i}if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {{\n"
+        f"{i}    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {{\n"
+        f"{i}        return keep_alive;\n"
+        f"{i}    }}\n"
+        f"{i}}}\n"
+        f"{i}self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+        f"{i}if hbb_common::get_version_number(&lr.version)\n"
+        f"{i}    >= hbb_common::get_version_number(\"1.2.0\")\n"
+        f"{i}{{\n"
+        f"{i}    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS).await;\n"
+        f"{i}}}\n"
+        f"{i}return true;\n")
+
+
+# review-v18 M1: these two run before any Trusted check, a token's included. The lock gone refuses
+# everyone; no Unattended Password set means attended only, for every Controller.
+LOCK_GATE = (
+    "            // boring-remote: Unattended (permanent) password only (ticket 05). The lock gone\n"
+    "            // refuses every login, a Trusted one's too (review-v18 M1).\n"
+    "            if crate::password_lock::refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD)) {\n"
+    "                self.send_login_error(crate::password_lock::LOCK_GONE_ERROR).await;\n"
+    "                return false;\n"
+    "            }\n")
+NO_PASSWORD_ASK = (
+    "            // boring-remote: no Unattended Password set: no unattended access for anyone, a token\n"
+    "            // holder's included (ticket 05, review-v18 M1); someone at this computer can still\n"
+    "            // click Allow, for this session only (ticket 06, base::trust).\n"
+    "            if !Config::has_permanent_password() {\n"
+    "                // Every prompt counts against this IP's failure budget: no prompt spam.\n"
+    "                let (failure, res) = self.check_failure(0).await;\n"
+    "                if !res {\n"
+    "                    return true;\n"
+    "                }\n"
+    "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+    "                self.boring_trust.wait_for_allow(false);\n"
+    + _click_wait(16) +
+    "            }\n")
+NO_PASSWORD_GATE = LOCK_GATE + NO_PASSWORD_ASK
+
+
 # 1.8 (ticket 06, option B): the Controller key a login proves finds its entry on the same list,
 # before the always-ask and Trusted checks read it (base::trust::Admission::prove). A token, where
 # the Direct Link exchange gave one, still decides first. The fields are read one by one: upstream's
@@ -1082,24 +1129,26 @@ T04_PROVE = (
     "                ),\n"
     "                &base::trust::Trusted::load(),\n"
     "            );\n")
-T04_TRUSTED_SKIP = T04_PROVE + T04_ALWAYS_ASK + (
-    "            // boring-remote (v1.7 t04): only a token this Mac issued skips the ask (ADR 0005).\n"
-    "            if self.boring_trust.is_trusted() {\n"
-    "                if !self.send_logon_response_and_keep_alive().await {\n"
-    "                    return false;\n"
-    "                }\n"
-    "                self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n"
-    "                return true;\n"
-    "            }\n"
+# 1.7's token (t04) now skips the click, never the password (review-v18 M1, story 14): a Trusted
+# token's login goes through the password check below and passes the trust gate on skips_click. Order:
+# the key, the lock, always ask, no password set, removed.
+T04_MUST_ASK = (
     "            // A Controller removed from Trusted Controllers waits for Allow here, whatever\n"
-    "            // password it brings: Remove is not undone quietly (device check A2 step 5).\n"
+    "            // password it brings: Remove is not undone quietly (device check A2 step 5). Every ask\n"
+    "            // counts against this IP's failure budget (review-v18 S6).\n"
     "            if self.boring_trust.must_ask() {\n"
+    "                let (failure, res) = self.check_failure(0).await;\n"
+    "                if !res {\n"
+    "                    return true;\n"
+    "                }\n"
+    "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
     "                self.boring_trust.wait_for_allow(false); // 1.8: Allow takes only a login waiting on it\n"
     "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
     "                self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)\n"
     "                    .await;\n"
     "                return true;\n"
     "            }\n")
+T04_TRUSTED_SKIP = T04_PROVE + LOCK_GATE + T04_ALWAYS_ASK + NO_PASSWORD_ASK + T04_MUST_ASK
 # ADR 0005 (1.7): Allow here makes a Controller Trusted; a one-time code (or the recent-session
 # password) lets it in for this session only. 1.8 (base::trust): the Unattended Password alone no
 # longer stores a new Controller, and Allow stores one only after that password, with no other
@@ -1421,6 +1470,8 @@ MAC_HOME_METHOD = (
     "            onTransferFiles: (t) => connect(context, t, isFileTransfer: true),\n"
     "            notices: [\n"
     "              AccessSummary(checks: boringAccessChecks()), // v1.7 t17: not ready yet, and its Fix\n"
+    "              // 1.8 (review-v18 S4): the Hosted servers say another device holds this Machine ID.\n"
+    "              if (bind.mainGetOptionSync(key: kBoringIdConflict) == 'Y') const MachineIdConflictNotice(),\n"
     + NOTICE_BANNER +
     "            ],\n"
     "          ),\n"
@@ -4002,42 +4053,6 @@ PATCHES += [
 # The locks themselves are in LOCKED (verification-method, allow-remote-config-modification).
 # Shared by both gates below: upstream's click branch (Windows terminal OS-login prep, the
 # version check before the wait message), so a gated login behaves like an upstream click login.
-def _click_wait(indent):
-    i = " " * indent
-    return (
-        f"{i}#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
-        f"{i}if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {{\n"
-        f"{i}    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {{\n"
-        f"{i}        return keep_alive;\n"
-        f"{i}    }}\n"
-        f"{i}}}\n"
-        f"{i}self.try_start_cm(lr.my_id, lr.my_name, false);\n"
-        f"{i}if hbb_common::get_version_number(&lr.version)\n"
-        f"{i}    >= hbb_common::get_version_number(\"1.2.0\")\n"
-        f"{i}{{\n"
-        f"{i}    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS).await;\n"
-        f"{i}}}\n"
-        f"{i}return true;\n")
-
-
-NO_PASSWORD_GATE = (
-    "            // boring-remote: Unattended (permanent) password only (ticket 05). None set yet: no\n"
-    "            // unattended access, but someone at this computer can still click Allow, for this\n"
-    "            // session only (ticket 06, base::trust).\n"
-    "            if crate::password_lock::refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD)) {\n"
-    "                self.send_login_error(crate::password_lock::LOCK_GONE_ERROR).await;\n"
-    "                return false;\n"
-    "            }\n"
-    "            if !Config::has_permanent_password() {\n"
-    "                // Every prompt counts against this IP's failure budget: no prompt spam.\n"
-    "                let (failure, res) = self.check_failure(0).await;\n"
-    "                if !res {\n"
-    "                    return true;\n"
-    "                }\n"
-    "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
-    "                self.boring_trust.wait_for_allow(false);\n"
-    + _click_wait(16) +
-    "            }\n")
 GENERATE_BUTTON = (
     "        // boring-remote: Generate (ticket 05) sets a strong password and shows it once. Reset asks\n"
     "        // first and can remove every Trusted Controller too (ticket 06, one locked edit in the service).\n"
@@ -4098,10 +4113,6 @@ PATCHES += [
      "}\n\n"
      "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
      "generate password bridge call"),
-    ("src/server/connection.rs", "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
-     NO_PASSWORD_GATE
-     + "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
-     "no permanent password refuses the login"),
     ("src/ipc.rs",
      '                } else if name == "permanent-password" {\n'
      "                    if Config::is_disable_change_permanent_password() {\n",
@@ -4237,8 +4248,9 @@ _LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n
 SIGN_LOGIN = ("    // boring-remote: sign this login for the Target's Trusted list, a Machine ID only over a\n"
               "    // stream keyed to the Target this connection verified (tickets 06, 07; src/trust_policy.rs).\n"
               "    let challenge = lc.read().unwrap().hash.challenge.clone();\n"
+              "    let link = crate::trust_policy::link_target(&lc.read().unwrap().boring_link_ids, peer.local_addr());\n"
               "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
-              "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured());\n"
+              "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), link);\n"
               "    }\n")
 _SEND_LOGIN = ("    let msg_out = lc\n        .read()\n        .unwrap()\n"
                "        .create_login_msg(os_username, os_password, password);\n"
@@ -4306,7 +4318,15 @@ PROTO_FIELDS = (
 PROTO_PATCH = ("libs/base/protos/message.proto", "  string avatar = 17;\n}\n",
                "  string avatar = 17;\n" + PROTO_FIELDS + "}\n",
                "LoginRequest carries the Controller's key and login signature")
+# review-v18 S2: the Target ID each of this session's Direct Links verified, by the stream's local
+# address (trust_policy::note_link / link_target).
+_OTHER_SERVER_FIELD = "    pub other_server: Option<(String, String, String)>,\n"
+LINK_IDS_FIELD = ("    /// boring-remote (review-v18 S2): each Direct Link stream's local address and the Target ID\n"
+                  "    /// its handshake verified; that stream's login signs the ID (src/trust_policy.rs).\n"
+                  "    pub boring_link_ids: Vec<(std::net::SocketAddr, String)>,\n")
 PATCHES += [
+    ("src/client.rs", _OTHER_SERVER_FIELD, _OTHER_SERVER_FIELD + LINK_IDS_FIELD,
+     "the login config keeps each Direct Link's verified Target ID for its login"),
     ("src/lib.rs", "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
      "mod password_lock; // boring-remote: permanent password only (ticket 05)\n"
      "mod trust_policy; // boring-remote: Trusted Controllers' signed login (ticket 06); iOS Controllers sign too\n",
@@ -4429,7 +4449,22 @@ PASSWORD_SETUP_BRANCH = (
 _SETUP_STATE = "  bool _boringSetup = false; // v1.7 t06: first launch shows Setup until it is finished\n"
 _SETUP_T31 = "    if (isMacOS && bind.mainGetLocalOption(key: kSetupStepOption).isNotEmpty) _boringSetup = true;\n"
 _SETUP_BRANCH = "    if ((isMacOS || isWindows) && _boringSetup) {\n"
+# review-v18 S4: the Hosted servers' UUID_MISMATCH would make upstream pick a new random Machine ID
+# (breaking every saved machine, handing the old ID to whoever holds it). With Change ID off the ID
+# stays: logged loudly, said on Home, and asked again only on the next registration round.
+_UUID_MISMATCH = "    async fn handle_uuid_mismatch(&mut self, socket: Sink<'_>) -> ResultType<()> {\n"
+KEEP_ID = ("        // boring-remote (review-v18 S4): the Machine ID never changes; another device holding it\n"
+           "        // is said loudly and on Home, and the next registration round asks again.\n"
+           "        if crate::connect_plan::keep_id_on_conflict(&self.host) {\n"
+           "            Config::set_key_confirmed(false);\n"
+           "            return Ok(());\n"
+           "        }\n")
+_PK_OK = ("                        Config::set_key_confirmed(true);\n"
+          "                        Config::set_host_key_confirmed(&self.host_prefix, true);\n")
+ID_OK = "                        crate::connect_plan::id_registered(); // boring-remote (review-v18 S4)\n"
 PATCHES += [
+    (MEDIATOR, _UUID_MISMATCH, _UUID_MISMATCH + KEEP_ID, "UUID_MISMATCH keeps the Machine ID (Change ID is off)"),
+    (MEDIATOR, _PK_OK, _PK_OK + ID_OK, "a registration that goes through clears the Machine ID conflict"),
     (HOME, _SETUP_STATE, PASSWORD_SETUP_STATE + _SETUP_STATE, "first launch on 1.8: password step state"),
     (HOME, _SETUP_T31, _SETUP_T31 + PASSWORD_SETUP_INIT, "first launch on 1.8: no password made here asks for one"),
     (HOME, _SETUP_BRANCH, PASSWORD_SETUP_BRANCH + _SETUP_BRANCH, "first launch on 1.8: Setup's password step alone"),

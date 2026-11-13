@@ -899,7 +899,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_trusted_skip_moved_out_of_the_login_decision_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", "if self.boring_trust.is_trusted() {", "if self.authorized {")
+        self.edit("src/server/connection.rs", "if self.boring_trust.must_ask() {", "if self.authorized {")
         self.assert_check_fails(TRUST_WIRED)
 
     def test_one_time_code_granting_lasting_trust_fails_check(self):
@@ -1096,15 +1096,15 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_password_gate_removed_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.NO_PASSWORD_GATE, "")
+        self.edit("src/server/connection.rs", rebrand.NO_PASSWORD_ASK, "")
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_no_password_gate_after_click_to_accept_fails_check(self):
         self.rebrand()
         conn = "src/server/connection.rs"
-        self.edit(conn, rebrand.NO_PASSWORD_GATE, "")
+        self.edit(conn, rebrand.NO_PASSWORD_ASK, "")
         self.edit(conn, "            } else if self.is_recent_session(false) {\n",
-                  "            }\n" + rebrand.NO_PASSWORD_GATE + "            if self.is_recent_session(false) {\n")
+                  "            }\n" + rebrand.NO_PASSWORD_ASK + "            if self.is_recent_session(false) {\n")
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_refuse_login_ignoring_the_lock_fails_check(self):
@@ -1123,7 +1123,7 @@ class RebrandSeam(unittest.TestCase):
     def test_no_password_login_falling_through_fails_check(self):
         self.rebrand()
         conn = "src/server/connection.rs"
-        gate = rebrand.NO_PASSWORD_GATE
+        gate = rebrand.NO_PASSWORD_ASK
         self.edit(conn, gate, gate.replace("                return true;\n            }\n", "            }\n"))
         self.assert_check_fails(self.NO_PASSWORD)
 
@@ -1250,12 +1250,12 @@ class RebrandSeam(unittest.TestCase):
 
     # --- ticket 06 on 1.7's one Trusted list (option B: the Controller proves its key) ----------
     APPROVE_LOCKED = "new Controllers need the password and Allow on the Target (approve mode locked, ask can't hide)"
-    TRUST_GATE = "a right password waits for Allow on the Target unless a Trusted Controller proves its key"
+    TRUST_GATE = "a right password waits for Allow on the Target unless a Trusted Controller shows its token or key"
     ACCEPT_GATED = ("Allow only counts for a login waiting on it, and stores a Controller only after its password, "
                     "with no other session open")
     SWAP = "a new login on a connection waiting on Allow ends it (the click can't land on another login)"
     NO_DEAD_ACCEPT = "no Allow prompt for a login without the right password (empty or wrong)"
-    LOGON_SITES = "exactly seven ways into a session, each gated or explained"
+    LOGON_SITES = "exactly six ways into a session, each gated or explained"
     REMOVE = "Remove ends that Controller's sessions; while anyone is connected Settings only tightens the list"
     PROOF = ("a Trusted login by key needs that key's signature over this login, for this Target; a known ID alone "
              "never skips Allow")
@@ -1349,7 +1349,7 @@ class RebrandSeam(unittest.TestCase):
         self.edit(self.CONN, rebrand.EMPTY_PASSWORD_NO_CM, rebrand.EMPTY_PASSWORD_CM)
         self.assert_check_fails(self.NO_DEAD_ACCEPT)
 
-    def test_eighth_way_into_a_session_fails_check(self):
+    def test_seventh_way_into_a_session_fails_check(self):
         self.rebrand()
         self.edit(self.CONN, "            if !self.check_login_scope(&lr).await {\n",
                   "            if !self.send_logon_response_and_keep_alive().await {\n                return false;\n"
@@ -1827,8 +1827,108 @@ class RebrandSeam(unittest.TestCase):
                   "                    &self.hash.challenge,\n                    &lr.username,\n")
         self.assert_check_fails(self.PROOF)
 
+
+    # --- review-v18: the port review's findings ---------------------------------------------------
+    def test_review_v18_facts_pass_after_rebrand_and_fail_on_upstream(self):
+        facts = (check.REVIEW_M1, check.REVIEW_S1, check.REVIEW_S2, check.REVIEW_S3, check.REVIEW_S4,
+                 check.REVIEW_S6, check.REVIEW_S7)
+        r = run(CHECK, self.root)
+        for fact in facts:
+            self.assertIn(f"FAIL {fact}", r.stdout)
+        self.rebrand()
+        r = run(CHECK, self.root)
+        for fact in facts:
+            self.assertIn(f"PASS {fact}", r.stdout)
+
+    def test_token_back_ahead_of_the_password_fails_check(self):  # M1
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.LOCK_GATE,
+                  "            if self.boring_trust.is_trusted() {\n                if !self.send_logon_response_and_keep_alive().await {\n"
+                  "                    return false;\n                }\n                return true;\n            }\n" + rebrand.LOCK_GATE)
+        self.assert_check_fails(check.REVIEW_M1)
+
+    def test_lock_checked_after_the_trusted_checks_fails_check(self):  # M1
+        self.rebrand()
+        conn = "src/server/connection.rs"
+        self.edit(conn, rebrand.LOCK_GATE, "")
+        self.edit(conn, rebrand.T04_MUST_ASK, rebrand.T04_MUST_ASK + rebrand.LOCK_GATE)
+        self.assert_check_fails(check.REVIEW_M1)
+
+    def test_token_not_skipping_the_click_fails_check(self):  # M1: then a token would need Allow every time
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "        self.trusted.is_some() || matches!(self.by_key, Some(ByKey::Trusted(..)))\n",
+                  "        matches!(self.by_key, Some(ByKey::Trusted(..)))\n")
+        self.assert_check_fails(check.REVIEW_M1)
+
+    def test_token_alone_binding_a_key_fails_check(self):  # S1
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "self.trusted.is_some() && self.password_right,", "self.trusted.is_some(),")
+        self.assert_check_fails(check.REVIEW_S1)
+
+    def test_failed_key_store_kept_quiet_fails_check(self):  # S1, standards
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "                Err(e) => hbb_common::log::warn!(\"Trusted Controller {:?}: its key not stored: {}\", name, e),\n",
+                  "                Err(_) => {}\n")
+        self.assert_check_fails(check.REVIEW_S1)
+
+    def test_typed_name_login_unsigned_again_fails_check(self):  # S2
+        self.rebrand()
+        self.edit("src/client.rs", "crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), link);",
+                  "crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), None);")
+        self.assert_check_fails(check.REVIEW_S2)
+
+    def test_key_only_row_left_beside_its_token_row_fails_check(self):  # S2
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "        self.list.retain(|c| !folds(c));\n", "")
+        self.assert_check_fails(check.REVIEW_S2)
+
+    def test_remove_leaving_a_row_with_the_same_key_fails_check(self):  # S2
+        self.rebrand()
+        self.edit("libs/base/src/trust.rs", "t.key == key || !pk.is_empty() && t.pk == pk", "t.key == key")
+        self.assert_check_fails(check.REVIEW_S2)
+
+    def test_unpinned_machine_id_dialled_from_an_advert_fails_check(self):  # S3
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "    if !known.pinned(id) {\n        return None;\n    }\n", "")
+        self.assert_check_fails(check.REVIEW_S3)
+
+    def test_name_fallback_for_a_1_7_target_dropped_fails_check(self):  # compat
+        self.rebrand()
+        self.edit("libs/base/src/direct_link.rs", "        plan.tailscale = tailscale_answer(name, ms).await", "        plan.tailscale = None::<SocketAddr>")
+        self.assert_check_fails(check.REVIEW_S3)
+
+    def test_uuid_mismatch_changing_the_machine_id_fails_check(self):  # S4
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", rebrand.KEEP_ID, "")
+        self.assert_check_fails(check.REVIEW_S4)
+
+    def test_machine_id_conflict_hidden_from_home_fails_check(self):  # S4
+        self.rebrand()
+        self.edit(rebrand.HOME, "if (bind.mainGetOptionSync(key: kBoringIdConflict) == 'Y') const MachineIdConflictNotice(),", "")
+        self.assert_check_fails(check.REVIEW_S4)
+
+    def test_direct_link_logging_before_its_lan_check_fails_check(self):  # S5
+        self.rebrand()
+        med = "src/rendezvous_mediator.rs"
+        self.edit(med, rebrand.DIRECT_LAN_ONLY + '                log::info!("direct access from {}", addr);\n',
+                  '                log::info!("direct access from {}", addr);\n' + rebrand.DIRECT_LAN_ONLY)
+        self.assert_check_fails("the Direct Link (21118) answers Tailscale and private-LAN addresses only, with no global whitelist")
+
+    def test_removed_token_ask_not_counted_fails_check(self):  # S6
+        self.rebrand()
+        self.edit("src/server/connection.rs", rebrand.T04_MUST_ASK,
+                  rebrand.T04_MUST_ASK.replace(
+                      "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n", "", 1))
+        self.assert_check_fails(check.REVIEW_S6)
+
+    def test_unlocked_known_write_fails_check(self):  # S7
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "base::direct_link::Known::edit(|known| known.pin_id(id, pk))",
+                  "{ let mut known = base::direct_link::Known::load(); let ok = known.pin_id(id, pk); known.save(); ok }")
+        self.assert_check_fails(check.REVIEW_S7)
+
     # --- ticket 08 on 1.7's Direct Link: a Machine ID's Direct Link first, Hosted after -----------
-    FIRST = "a Machine ID tries a pinned Direct Link where it was met (~3 s on Tailscale), then the Hosted servers (ticket 08)"
+    FIRST = "a pinned Machine ID tries a Direct Link where it was met (~3 s on Tailscale), then the Hosted servers (ticket 08)"
     PINNED = ("the Hosted path holds the same pin as a Direct Link, and a tailnet address is kept only from a pinned "
               "Target (tickets 08, 16)")
     DOWN = "Hosted servers unreachable: a plain error naming rs.theboringremote.com (ticket 08)"

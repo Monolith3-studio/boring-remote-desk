@@ -49,12 +49,9 @@ pub fn plan(peer: &str, known: bool, relay_only: bool) -> Vec<Attempt> {
     attempts
 }
 
-/// A Machine ID's Direct Link attempt (`plan`): the stream, its route and the Target's identity
-/// key, or None to go on to the Hosted servers.
-pub async fn direct_first(
-    peer: &str,
-    relay_only: bool,
-) -> Option<(Stream, base::direct_link::Route, Option<Vec<u8>>)> {
+/// A Machine ID's Direct Link attempt (`plan`): the stream, its route, the Target's identity key and
+/// its verified ID, or None to go on to the Hosted servers.
+pub async fn direct_first(peer: &str, relay_only: bool) -> Option<base::direct_link::Connected> {
     let known = base::direct_link::Known::load();
     let first = plan(peer, base::direct_link::machine_id_known(peer, &known), relay_only);
     if first.first() != Some(&Attempt::DirectLink) {
@@ -77,13 +74,7 @@ pub fn pin_target(id: &str, pk: Option<&[u8]>) -> bool {
     let Some(pk) = pk.filter(|pk| pk.len() == 32) else {
         return false;
     };
-    let mut known = base::direct_link::Known::load();
-    let before = known.clone();
-    let ok = known.pin_id(id, pk);
-    if known != before {
-        known.save();
-    }
-    ok
+    base::direct_link::Known::edit(|known| known.pin_id(id, pk)) // one writer at a time (S7)
 }
 
 /// After login on a keyed stream to a Machine ID (`secured`; pinned by `pin_target`): keep the
@@ -97,10 +88,36 @@ pub fn save_reported(id: &str, secured: bool, additions: &str) {
         .ok()
         .and_then(|v| v.get(ADDITIONS_KEY)?.as_str()?.parse::<IpAddr>().ok());
     if let Some(ip) = reported {
-        let mut known = base::direct_link::Known::load();
-        if known.learn_tailscale(id, ip) {
-            known.save();
-        }
+        base::direct_link::Known::edit(|known| known.learn_tailscale(id, ip)); // one writer at a time (S7)
+    }
+}
+
+/// Server option: "Y" while the Hosted servers say another device holds this Target's Machine ID
+/// (review-v18 S4). Home says so; cleared once a registration goes through.
+pub const ID_CONFLICT_OPTION: &str = "boring-machine-id-conflict";
+
+/// Target, on the Hosted servers' UUID_MISMATCH: true when this build keeps its Machine ID (upstream
+/// would pick a new random one, breaking every saved machine and handing the old ID to whoever
+/// holds it). The ID never changes here (`disable-change-id`), so it says so loudly instead.
+pub fn keep_id_on_conflict(host: &str) -> bool {
+    if crate::get_builtin_option("disable-change-id") != "Y" {
+        return false;
+    }
+    hbb_common::throttled_log!(
+        std::time::Duration::from_secs(300),
+        error,
+        "{host}: another device holds this Machine ID on the Hosted servers; keeping it (Change ID is off)"
+    );
+    if hbb_common::config::Config::get_option(ID_CONFLICT_OPTION) != "Y" {
+        hbb_common::config::Config::set_option(ID_CONFLICT_OPTION.to_owned(), "Y".to_owned());
+    }
+    true
+}
+
+/// Target: the Hosted servers took this Machine ID's key; any conflict Home showed is over.
+pub fn id_registered() {
+    if hbb_common::config::Config::get_option(ID_CONFLICT_OPTION) == "Y" {
+        hbb_common::config::Config::set_option(ID_CONFLICT_OPTION.to_owned(), String::new());
     }
 }
 

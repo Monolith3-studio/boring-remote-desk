@@ -264,6 +264,28 @@ class _MacHomeState extends State<MacHome> {
 
 /// For a computer that isn't on this network: the way in is Tailscale (ADR 0004), so the thing to
 /// type over there is this computer's Tailscale address. No Tailscale here: how to get it.
+/// Server option: "Y" while the Boring Remote servers say another device holds this computer's
+/// Machine ID (src/connect_plan.rs ID_CONFLICT_OPTION, review-v18 S4). The ID never changes.
+const kBoringIdConflict = 'boring-machine-id-conflict';
+
+/// What Home says while that lasts.
+const machineIdConflictWords = "Another device is using this computer's Machine ID on the Boring Remote servers, "
+    "so other computers can't reach it by Machine ID right now. On this network and over Tailscale it still works.";
+
+class MachineIdConflictNotice extends StatelessWidget {
+  const MachineIdConflictNotice({super.key});
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.only(bottom: Kit.s4),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.warning_amber_rounded, color: Kit.muted),
+          const SizedBox(width: Kit.s2),
+          Expanded(child: Text(machineIdConflictWords)),
+        ]),
+      );
+}
+
 /// 1.8: a Machine ID shown in groups of three, as people read it out.
 String machineIdGroups(String id) {
   final b = StringBuffer();
