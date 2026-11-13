@@ -1223,7 +1223,7 @@ def ask_info_checks(c, kit, trust):
     rs = c.read(TRUST_RS)
     hooks = [("src/ipc.rs", rebrand.H1_LOGIN_FIELD), ("src/server/connection.rs", rebrand.H1_LOGIN_SEND),
              (rebrand.CM_IFACE, "    #[serde(flatten)]\n" + rebrand.H1_ASK_INFO),
-             (rebrand.CM_IFACE, "privacy_mode, from_switch, boring, self.tx.clone());\n"),
+             (rebrand.CM_IFACE, "privacy_mode, from_switch, *boring, self.tx.clone());\n"),
              (rebrand.SERVER_MODEL, rebrand.H1_CLIENT_FIELDS), (rebrand.SERVER_MODEL, rebrand.H1_CLIENT_JSON),
              (rebrand.CM_PAGE, "            trust: client.boringTrust,\n            ip: client.boringIp,\n"),
              (rebrand.SERVER_MODEL, "trust: client.boringTrust, key: client.boringKey, ip: client.boringIp)")]

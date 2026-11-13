@@ -2166,8 +2166,10 @@ PATCHES += [
 # connection window's Data::Login and client JSON to Flutter's Client, then into the ask.
 CM_IFACE = "src/ui_cm_interface.rs"
 H1_ASK_INFO = "    pub boring: base::trust::AskInfo, // boring-remote: audit H1 (boring_trust, _key, _ip)\n"
-H1_LOGIN_FIELD = "        #[serde(default)]\n        boring: base::trust::AskInfo, // boring-remote: audit H1\n"
-H1_LOGIN_SEND = "            boring: self.boring_trust.ask_info(&self.ip), // boring-remote: audit H1\n"
+# Boxed: upstream keeps ipc::Data at 120 bytes or less (ipc.rs verify_ffi_enum_data_size); three Strings
+# inline made it 192.
+H1_LOGIN_FIELD = "        #[serde(default)]\n        boring: Box<base::trust::AskInfo>, // boring-remote: audit H1\n"
+H1_LOGIN_SEND = "            boring: Box::new(self.boring_trust.ask_info(&self.ip)), // boring-remote: audit H1\n"
 H1_CLIENT_FIELDS = (
     "  // boring-remote (audit H1): new / removed, its trust key and address (base::trust::AskInfo).\n"
     "  String boringTrust = '';\n  String boringKey = '';\n  String boringIp = '';\n")
@@ -2190,7 +2192,7 @@ PATCHES += [
      "            from_switch,\n            boring,\n            #[cfg(not(any(target_os = \"ios\")))]\n            tx,\n",
      "ask info on the client"),
     (CM_IFACE, "privacy_mode, from_switch} => {\n", "privacy_mode, from_switch, boring} => {\n", "ask info from Data::Login"),
-    (CM_IFACE, "privacy_mode, from_switch, self.tx.clone());\n", "privacy_mode, from_switch, boring, self.tx.clone());\n",
+    (CM_IFACE, "privacy_mode, from_switch, self.tx.clone());\n", "privacy_mode, from_switch, *boring, self.tx.clone());\n",
      "ask info into add_connection (desktop)"),
     (CM_IFACE, "                    from_switch,\n                    tx.clone(),\n                );\n",
      "                    from_switch,\n                    Default::default(), // boring-remote: audit H1, no ask info here\n"
