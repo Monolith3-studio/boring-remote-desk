@@ -2192,6 +2192,9 @@ PATCHES += [
      "            from_switch,\n            boring,\n            #[cfg(not(any(target_os = \"ios\")))]\n            tx,\n",
      "ask info on the client"),
     (CM_IFACE, "privacy_mode, from_switch} => {\n", "privacy_mode, from_switch, boring} => {\n", "ask info from Data::Login"),
+    ("src/ipc.rs", "        assert!(std::mem::size_of::<Data>() <= 120);\n",
+     "        // boring-remote (audit H1): Data::Login carries one boxed AskInfo, a pointer more than upstream.\n"
+     "        assert!(std::mem::size_of::<Data>() <= 128);\n", "IPC enum budget plus audit H1's boxed ask info"),
     (CM_IFACE, "privacy_mode, from_switch, self.tx.clone());\n", "privacy_mode, from_switch, *boring, self.tx.clone());\n",
      "ask info into add_connection (desktop)"),
     (CM_IFACE, "                    from_switch,\n                    tx.clone(),\n                );\n",
