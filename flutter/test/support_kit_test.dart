@@ -108,7 +108,7 @@ void main() {
       macName: 'Edit Bay 2',
       onRename: (_) async {},
       passwordSet: true,
-      setPassword: (_) async => true,
+      generatePassword: () async => '',
       remoteAccess: true,
       onRemoteAccess: (_) {},
       checkUpdates: true,

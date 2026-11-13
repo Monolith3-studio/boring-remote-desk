@@ -35,7 +35,7 @@ void main() {
     expect(find.text('Computers'), findsOneWidget);
     expect(find.text('No other computers found on this network yet.'), findsOneWidget);
     expect(find.text('1. Open Boring Remote on the other computer and finish its Setup.'), findsOneWidget);
-    expect(texts(tester).where((s) => s.contains('Mac')), isEmpty);
+    expect(texts(tester).where((s) => s.replaceAll('Machine ID', '').contains('Mac')), isEmpty); // 1.8: "Machine ID" is the glossary term
     await tester.tap(find.text('Connect from outside the building'));
     await tester.pumpAndSettle();
     expect(find.textContaining('pick this computer by name'), findsOneWidget);
@@ -76,7 +76,7 @@ void main() {
     expect(find.text('FOH wants to transfer files with this computer.'), findsOneWidget); // t29
     await tester.pumpWidget(host(TrustedControllersPage(
         trusted: const [], known: const [], onRemove: (_) async {}, onForget: (_) async {})));
-    expect(texts(tester).where((s) => s.contains('Mac')), isEmpty);
+    expect(texts(tester).where((s) => s.replaceAll('Machine ID', '').contains('Mac')), isEmpty); // 1.8: "Machine ID" is the glossary term
     expect(find.text('None yet. A computer lands here once you allow it in.'), findsOneWidget);
   });
 
@@ -86,7 +86,7 @@ void main() {
       macName: 'Front Desk',
       onRename: (_) async {},
       passwordSet: false,
-      setPassword: (_) async => true,
+      generatePassword: () async => '',
       remoteAccess: false,
       onRemoteAccess: (_) {},
       checkUpdates: true,
@@ -94,6 +94,6 @@ void main() {
       advanced: const [],
     )));
     expect(find.text("This computer's name"), findsOneWidget);
-    expect(texts(tester).where((s) => s.contains('Mac')), isEmpty);
+    expect(texts(tester).where((s) => s.replaceAll('Machine ID', '').contains('Mac')), isEmpty); // 1.8: "Machine ID" is the glossary term
   });
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
+import 'package:flutter_hbb/desktop/kit/password.dart';
 import 'package:flutter_hbb/desktop/kit/simple_settings.dart';
 
 Widget host(Widget w) => MaterialApp(theme: Kit.theme(), home: Scaffold(body: w));
@@ -10,7 +11,9 @@ SimpleSettings settings({
   String macName = 'Edit Bay 2',
   Future<void> Function(String)? onRename,
   bool passwordSet = false,
-  Future<bool> Function(String)? setPassword,
+  bool? passwordGenerated,
+  Future<String> Function()? generatePassword,
+  Future<void> Function()? removeTrusted,
   bool remoteAccess = false,
   void Function(bool)? onRemoteAccess,
   bool? openAtLogin,
@@ -26,7 +29,9 @@ SimpleSettings settings({
       macName: macName,
       onRename: onRename ?? (_) async {},
       passwordSet: passwordSet,
-      setPassword: setPassword ?? (_) async => true,
+      passwordGenerated: passwordGenerated ?? passwordSet,
+      generatePassword: generatePassword ?? () async => 'Abc23defGhjk45mnPqrs',
+      removeTrusted: removeTrusted,
       remoteAccess: remoteAccess,
       onRemoteAccess: onRemoteAccess ?? (_) {},
       openAtLogin: openAtLogin,
@@ -61,60 +66,76 @@ void main() {
     await tester.pumpWidget(host(settings(passwordSet: false)));
     expect(find.text('Password for when no one is here'), findsOneWidget);
     expect(find.text('Not set. Someone has to be at this Mac to click Allow each time.'), findsOneWidget);
-    expect(find.text('Set password'), findsOneWidget);
+    expect(find.text(passwordCopy['make']!), findsOneWidget);
+    expect(find.byType(TextField).evaluate().length, 1, reason: 'only the name: nobody types a password');
     await tester.pumpWidget(host(settings(passwordSet: true)));
     expect(find.text('Set. Your other computers can get in with it when no one is here.'), findsOneWidget);
-    expect(find.text('Change password'), findsOneWidget);
-    await tester.tap(find.text('Change password'));
-    await tester.pump();
-    expect(tester.widget<TextField>(find.byKey(SimpleSettings.passwordKey)).decoration?.hintText, 'Type a new password');
+    expect(find.text(passwordCopy['remake']!), findsOneWidget);
   });
 
-  Future<void> typePassword(WidgetTester tester, String pw) async {
-    await tester.tap(find.text('Set password'));
-    await tester.pump();
-    await tester.enterText(find.byKey(SimpleSettings.passwordKey), pw);
-    await tester.tap(find.text('Save password'));
-    await tester.pump();
-  }
-
-  testWidgets('a blank or weak password is refused', (tester) async {
-    final got = <String>[];
-    await tester.pumpWidget(host(settings(setPassword: (p) async {
-      got.add(p);
-      return true;
+  testWidgets('Make a password: the service makes it, shown once', (tester) async {
+    var made = 0;
+    await tester.pumpWidget(host(settings(generatePassword: () async {
+      made++;
+      return 'Abc23defGhjk45mnPqrs';
     })));
-    await typePassword(tester, '');
-    expect(find.text('At least 8 characters, with a capital, a small letter and a number.'),
-        findsOneWidget);
-    await tester.enterText(find.byKey(SimpleSettings.passwordKey), 'password');
-    await tester.tap(find.text('Save password'));
+    await tester.tap(find.text(passwordCopy['make']!));
     await tester.pump();
-    expect(got, isEmpty);
+    expect(made, 1);
+    expect(find.text('Abc23defGhjk45mnPqrs'), findsOneWidget);
+    await tester.ensureVisible(find.text(passwordCopy['saved.button']!));
+    await tester.tap(find.text(passwordCopy['saved.button']!));
+    await tester.pump();
+    expect(find.text('Abc23defGhjk45mnPqrs'), findsNothing);
+    expect(find.text('Set. Your other computers can get in with it when no one is here.'), findsOneWidget);
   });
 
-  testWidgets('a good password is saved, typed hidden', (tester) async {
-    final got = <String>[];
-    await tester.pumpWidget(host(settings(setPassword: (p) async {
-      got.add(p);
-      return true;
-    })));
-    await tester.tap(find.text('Set password'));
+  testWidgets('Copy puts it on the clipboard and takes it off a minute later', (tester) async {
+    String clip = '';
+    await tester.pumpWidget(host(UnattendedPasswordPanel(
+      passwordSet: false,
+      generated: false,
+      generate: () async => 'Abc23defGhjk45mnPqrs',
+      copyText: (t) async => clip = t,
+      readClipboard: () async => clip,
+    )));
+    await tester.tap(find.text(passwordCopy['make']!));
     await tester.pump();
-    final field = tester.widget<TextField>(find.byKey(SimpleSettings.passwordKey));
-    expect(field.obscureText, isTrue);
-    await tester.enterText(find.byKey(SimpleSettings.passwordKey), 'Stage4Left');
-    await tester.tap(find.text('Save password'));
-    await tester.pumpAndSettle();
-    expect(got, ['Stage4Left']);
-    expect(find.text('Stage4Left'), findsNothing);
+    await tester.tap(find.text(passwordCopy['copy']!));
+    await tester.pump();
+    expect(clip, 'Abc23defGhjk45mnPqrs');
+    expect(find.text(passwordCopy['copied']!), findsOneWidget);
+    await tester.pump(const Duration(seconds: 61));
+    expect(clip, '', reason: 'cleared once the minute is up');
   });
 
-  testWidgets('a password the Mac rejects says so', (tester) async {
-    await tester.pumpWidget(host(settings(setPassword: (_) async => false)));
-    await typePassword(tester, 'Stage4Left');
+  testWidgets('replacing asks first and can remove every Trusted Controller', (tester) async {
+    var made = 0, removed = 0;
+    await tester.pumpWidget(host(settings(
+        passwordSet: true,
+        generatePassword: () async {
+          made++;
+          return 'Abc23defGhjk45mnPqrs';
+        },
+        removeTrusted: () async => removed++)));
+    await tester.tap(find.text(passwordCopy['remake']!));
+    await tester.pump();
+    expect(find.text(passwordCopy['confirm.title']!), findsOneWidget);
+    expect(made, 0);
+    await tester.tap(find.text(passwordCopy['confirm.trusted']!));
+    await tester.pump();
+    await tester.ensureVisible(find.text(passwordCopy['confirm.replace']!));
+    await tester.tap(find.text(passwordCopy['confirm.replace']!));
+    await tester.pump();
+    expect((made, removed), (1, 1));
+  });
+
+  testWidgets('a password the service refuses says so', (tester) async {
+    await tester.pumpWidget(host(settings(generatePassword: () async => '')));
+    await tester.tap(find.text(passwordCopy['make']!));
     await tester.pumpAndSettle();
-    expect(find.text("Couldn't save that password. Try again."), findsOneWidget);
+    expect(find.text(passwordCopy['failed']!), findsOneWidget);
+    expect(find.byKey(UnattendedPasswordPanel.shownKey), findsNothing);
   });
 
   testWidgets('remote access, open at login and updates are switches', (tester) async {

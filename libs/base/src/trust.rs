@@ -411,11 +411,13 @@ impl Admission {
         self.trusted.is_some()
     }
 
-    /// Presented a token this Mac issued and then removed, or (1.8) proved the key of a removed
-    /// entry: the session waits for Allow here, whatever password it brings (src/server/connection.rs,
-    /// rebrand T04_TRUSTED_SKIP).
+    /// Presented a token this Mac issued and then removed (a Direct Link): the session waits for
+    /// Allow here, whatever password it brings (src/server/connection.rs, rebrand T04_TRUSTED_SKIP).
+    /// 1.8: one that proved the key of a removed entry instead (the Hosted path has no token) is not
+    /// waved to Allow: it gives the Unattended Password first, as a new one does, and only Allow
+    /// after it trusts it again ([`Admission::approve_into`]).
     pub fn must_ask(&self) -> bool {
-        self.removed_key().is_some()
+        self.removed.is_some()
     }
 
     fn removed_key(&self) -> Option<&str> {
@@ -524,11 +526,12 @@ impl Admission {
         t.list.iter().any(|c| c.key == key && (c.removed || !self.password_right && !self.stays && c.always_ask))
     }
 
-    /// What `how` may store (1.8): a new Controller only by Allow after its Unattended Password
-    /// checked out, with no other session open; a removed one only by Allow with no other session
-    /// open. Anything else lets this session in and stores nothing.
+    /// What `how` may store (1.8): a new Controller, or one found removed by its key, only by Allow
+    /// after its Unattended Password checked out, with no other session open; one whose token says
+    /// removed (a Direct Link, 1.7) by Allow with no other session open. Anything else lets this
+    /// session in and stores nothing.
     fn effective(&self, how: SignIn) -> SignIn {
-        let ok = if self.removed_key().is_some() { self.may_reinstate } else { self.may_remember };
+        let ok = if self.must_ask() { self.may_reinstate } else { self.may_remember };
         if how == SignIn::Allowed && !ok {
             SignIn::ThisSessionOnly
         } else {
@@ -560,7 +563,7 @@ impl Admission {
             hbb_common::log::info!("Trusted Controller {:?} proved its key and gave the Unattended Password", name);
             return;
         }
-        let was_removed = self.must_ask();
+        let was_removed = self.removed_key().is_some();
         let how = self.effective(how);
         // Under the edit lock, on the list as it is now; an unreadable list is not written over,
         // so this one stays out of it (asked again next time) and the log says why.
@@ -1528,13 +1531,13 @@ mod tests {
         t.remove(&key);
         let mut c = Admission::default();
         c.prove(signed(&sk, &pk, "c", "1", "9"), &t);
-        assert!(c.must_ask() && !c.skips_click());
+        assert!(!c.must_ask() && !c.skips_click(), "found by key: the password first, then Allow");
         assert_eq!(c.ask_info("").boring_trust, "removed");
         assert!(!c.approve_into(&mut t, SignIn::UnattendedPassword, "Laptop"), "the password does not undo Remove");
-        c.wait_for_allow(false);
+        c.wait_for_allow(true);
         c.take_wait(1);
         assert_eq!(c.effective(SignIn::Allowed), SignIn::ThisSessionOnly, "another session open: not reinstated");
-        c.wait_for_allow(false);
+        c.wait_for_allow(true);
         c.take_wait(0);
         assert!(c.approve_into(&mut t, c.effective(SignIn::Allowed), "Laptop"));
         assert_eq!(t.list().len(), 1);

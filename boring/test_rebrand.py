@@ -64,7 +64,6 @@ WHITELIST_FIRST = "a whitelist the buyer sets is still checked first on incoming
 REMOTE_CONFIG = "allow-remote-config-modification locked off (a UI hint; the session guard holds the settings)"
 HBB = rebrand.HBB
 PROTOCOL = "protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)"
-TRUSTED_IF = "    if password == Password::Right && key.map_or(false, |k| trusted.contains(controller, k)) {"
 
 
 def export_clean_tree(dest):
@@ -1110,10 +1109,12 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/password_lock.rs", "    verification_method != PERMANENT_ONLY\n", "    false\n")
         self.assert_check_fails(self.NO_PASSWORD)
 
-    def test_no_password_login_counted_as_right_password_fails_check(self):
-        # ticket 06: Right would let a trusted Controller in unattended and remember new ones.
+    def test_no_password_login_waiting_to_be_stored_fails_check(self):
+        # No password here: Allow lets it in for that session only. Waiting as if the password were
+        # right would let Allow store it (base::trust::take_wait).
         self.rebrand()
-        self.edit("src/server/connection.rs", "crate::trust_policy::Password::NotSet", "crate::trust_policy::Password::Right")
+        self.edit("src/server/connection.rs", "                self.boring_trust.wait_for_allow(false);\n                #[cfg",
+                  "                self.boring_trust.wait_for_allow(true);\n                #[cfg")
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_no_password_login_falling_through_fails_check(self):
@@ -1121,17 +1122,6 @@ class RebrandSeam(unittest.TestCase):
         conn = "src/server/connection.rs"
         gate = rebrand.NO_PASSWORD_GATE
         self.edit(conn, gate, gate.replace("                return true;\n            }\n", "            }\n"))
-        self.assert_check_fails(self.NO_PASSWORD)
-
-    def test_no_password_approval_remembered_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "if password == Password::Right && remember && !trusted.has_id(controller) {",
-                  "if remember && !trusted.has_id(controller) {")
-        self.assert_check_fails(self.NO_PASSWORD)
-
-    def test_no_password_trusted_controller_skipping_the_click_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", TRUSTED_IF, TRUSTED_IF.replace("password == Password::Right && ", ""))
         self.assert_check_fails(self.NO_PASSWORD)
 
     def test_throttle_dropped_from_the_password_check_fails_check(self):
@@ -1254,34 +1244,34 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/lang/de.rs", '        ("Trusted Controllers", ""),\n', "")
         self.assert_check_fails(self.UI_KEYS)
 
-    # --- ticket 06: trusted Controllers --------------------------------------------
-    APPROVE_LOCKED = "unknown Controllers need the password and a click on the Target (approve mode locked, prompt can't hide)"
-    TRUST_GATE = "a right password waits for a click on the Target unless the Controller proves a trusted key"
-    PROOF = "a trusted login needs the stored key's signature over this login; a known ID alone never skips the click"
-    SIGNED = "Controllers sign each login with their own key (this challenge, the Target they dialed, their ID)"
-    ACCEPT_GATED = "the Target's Accept only counts for a login waiting on it; a stray one ends the connection"
-    TRUST_LIST = "trusted Controllers live in the daemon's config; only an Accept with no other session open adds one"
-    BUDGET = "every Accept prompt counts against the IP's failure budget; an approval clears it"
-    SWAP = "a new login on a connection waiting on Accept ends it (the click can't land on another login)"
-    NO_DEAD_ACCEPT = "no Accept prompt for a login without the right password (empty or wrong)"
-    LOGON_SITES = "exactly five ways into a session, each gated or explained"
-    REMOVE = "removing a trusted Controller works during a session and ends its sessions"
-    ID_LOG = "a Controller-supplied ID is logged throttled and only if storable"
-    TRUST_SETTINGS = "Settings lists trusted Controllers with Remove, behind the security unlock"
+    # --- ticket 06 on 1.7's one Trusted list (option B: the Controller proves its key) ----------
+    APPROVE_LOCKED = "new Controllers need the password and Allow on the Target (approve mode locked, ask can't hide)"
+    TRUST_GATE = "a right password waits for Allow on the Target unless a Trusted Controller proves its key"
+    ACCEPT_GATED = ("Allow only counts for a login waiting on it, and stores a Controller only after its password, "
+                    "with no other session open")
+    SWAP = "a new login on a connection waiting on Allow ends it (the click can't land on another login)"
+    NO_DEAD_ACCEPT = "no Allow prompt for a login without the right password (empty or wrong)"
+    LOGON_SITES = "exactly seven ways into a session, each gated or explained"
+    REMOVE = "Remove ends that Controller's sessions; while anyone is connected Settings only tightens the list"
+    PROOF = ("a Trusted login by key needs that key's signature over this login, for this Target; a known ID alone "
+             "never skips Allow")
+    SIGNED = "Controllers sign each login with their own key (this challenge, the Target's Machine ID, their ID)"
+    KEY_STORED = ("the Controller's key rides 1.7's list: optional, never written empty, its own entries never "
+                  "match a token")
+    TRUST_RS = "libs/base/src/trust.rs"
+    CONN = "src/server/connection.rs"
 
     def test_trust_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
-        for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
-                     self.TRUST_SETTINGS, self.BUDGET, self.SWAP, self.NO_DEAD_ACCEPT, self.LOGON_SITES,
-                     self.REMOVE, self.ID_LOG, self.PROOF, self.SIGNED, PROTOCOL):
+        for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.SWAP, self.NO_DEAD_ACCEPT,
+                     self.LOGON_SITES, self.REMOVE, self.PROOF, self.SIGNED, self.KEY_STORED, PROTOCOL):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_trust_facts_fail_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
-        for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.TRUST_LIST,
-                     self.TRUST_SETTINGS, self.BUDGET, self.SWAP, self.NO_DEAD_ACCEPT, self.LOGON_SITES,
-                     self.REMOVE, self.PROOF, self.SIGNED, PROTOCOL):
+        for fact in (self.APPROVE_LOCKED, self.TRUST_GATE, self.ACCEPT_GATED, self.SWAP, self.NO_DEAD_ACCEPT,
+                     self.LOGON_SITES, self.REMOVE, self.PROOF, self.SIGNED, PROTOCOL):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_password_only_approve_mode_fails_check(self):
@@ -1296,240 +1286,143 @@ class RebrandSeam(unittest.TestCase):
 
     def test_trust_gate_removed_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.TRUST_GATE, "")
+        self.edit(self.CONN, rebrand.TRUST_GATE, "")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_trust_gate_after_logon_fails_check(self):
+    def test_trust_gate_that_lets_the_ask_through_fails_check(self):
         self.rebrand()
-        conn = "src/server/connection.rs"
-        self.edit(conn, rebrand.TRUST_GATE, "")
-        self.edit(conn, "                    self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n                }\n            }\n",
-                  rebrand.TRUST_GATE + "                    self.try_start_cm(lr.my_id, lr.my_name, self.authorized);\n"
-                  "                }\n            }\n")
+        self.edit(self.CONN, "                    if !self.boring_trust.skips_click() {\n",
+                  "                    if false && !self.boring_trust.skips_click() {\n")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_trust_gate_that_lets_ask_through_fails_check(self):
+    def test_any_key_skipping_allow_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", "                        return true;\n                    }\n"
-                  "                    self.update_failure_with_scope(failure, true,",
-                  "                    }\n                    self.update_failure_with_scope(failure, true,")
+        self.edit(self.TRUST_RS, "        matches!(self.by_key, Some(ByKey::Trusted(..)))\n", "        self.by_key.is_some()\n")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_policy_letting_an_unasked_controller_in_fails_check(self):
+    def test_a_key_overriding_the_tokens_verdict_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "AtTarget::NotAsked => Decision::Ask,", "AtTarget::NotAsked => Decision::Allow,")
+        self.edit(self.TRUST_RS, "        if self.trusted.is_some() || self.always_ask.is_some() || self.removed.is_some() {\n"
+                                 "            return;\n        }\n        let Some(c) = self.pk",
+                  "        let Some(c) = self.pk")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_trusted_check_without_the_password_fails_check(self):
+    def test_ask_not_counted_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", TRUSTED_IF, TRUSTED_IF.replace("password == Password::Right && ", ""))
+        self.edit(self.CONN, "                        self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+                             "                        self.boring_trust.wait_for_allow(true);\n",
+                  "                        self.boring_trust.wait_for_allow(true);\n")
         self.assert_check_fails(self.TRUST_GATE)
 
-    def test_ungated_accept_fails_check(self):
+    def test_ungated_allow_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.ACCEPT_GATE, "")
+        self.edit(self.CONN, rebrand.ACCEPT_GATE, "")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_allow_remembered_during_another_session_fails_check(self):
+        self.rebrand()
+        self.edit(self.TRUST_RS, "self.may_remember = password_right && others == 0;", "self.may_remember = password_right;")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_password_alone_storing_a_new_controller_fails_check(self):
+        self.rebrand()
+        self.edit(self.TRUST_RS, "        if how != SignIn::Allowed {\n            self.pending = None;",
+                  "        if how == SignIn::ThisSessionOnly {\n            self.pending = None;")
+        self.assert_check_fails(self.ACCEPT_GATED)
+
+    def test_allow_storing_without_the_password_fails_check(self):
+        self.rebrand()
+        self.edit(self.TRUST_RS, "        let how = self.effective(how);\n", "")
         self.assert_check_fails(self.ACCEPT_GATED)
 
     def test_new_login_on_a_waiting_connection_kept_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.FORGET_ON_LOGIN,
-                  "            crate::trust_policy::forget(self.inner.id());\n")
+        self.edit(self.CONN, rebrand.FORGET_ON_LOGIN, "")
         self.assert_check_fails(self.SWAP)
 
-    def test_accept_that_ignores_pending_fails_check(self):
+    def test_allow_prompt_without_a_password_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "        return false;\n    };\n    let trusted = load();",
-                  "        return true;\n    };\n    let trusted = load();")
-        self.assert_check_fails(self.ACCEPT_GATED)
-
-    def test_stray_accept_left_hanging_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", "                                conn.send_close_reason_no_retry(\"\").await;\n"
-                  "                                conn.on_close(\"connection manager\", true).await;\n"
-                  "                                break;\n                            }\n                            clear_failures",
-                  "                                continue;\n                            }\n                            clear_failures")
-        self.assert_check_fails(self.ACCEPT_GATED)
-
-    def test_wait_kept_after_close_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs",
-                  "        crate::trust_policy::forget(self.inner.id()); // boring-remote (ticket 06)\n", "")
-        self.assert_check_fails(self.ACCEPT_GATED)
-
-    def test_prompt_not_counted_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", "                    {\n                        "
-                  "self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n",
-                  "                    {\n")
-        self.assert_check_fails(self.BUDGET)
-
-    def test_no_password_prompt_not_throttled_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", "                let (failure, res) = self.check_failure(0).await;\n"
-                  "                if !res {\n                    return true;\n                }\n"
-                  "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
-                  "                crate::trust_policy::on_login(", "                crate::trust_policy::on_login(")
-        self.assert_check_fails(self.BUDGET)
-
-    def test_accept_prompt_after_a_wrong_password_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", "LOGIN_MSG_PASSWORD_WRONG)\n                        .await;\n",
-                  "LOGIN_MSG_PASSWORD_WRONG)\n                        .await;\n"
-                  "                    self.try_start_cm(lr.my_id, lr.my_name, false);\n")
+        self.edit(self.CONN, rebrand.EMPTY_PASSWORD_NO_CM, rebrand.EMPTY_PASSWORD_CM)
         self.assert_check_fails(self.NO_DEAD_ACCEPT)
 
-    def test_accept_prompt_without_a_password_fails_check(self):
+    def test_eighth_way_into_a_session_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.EMPTY_PASSWORD_NO_CM, rebrand.EMPTY_PASSWORD_CM)
-        self.assert_check_fails(self.NO_DEAD_ACCEPT)
-
-    def test_sixth_way_into_a_session_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", "            if !self.check_login_scope(&lr).await {\n",
+        self.edit(self.CONN, "            if !self.check_login_scope(&lr).await {\n",
                   "            if !self.send_logon_response_and_keep_alive().await {\n                return false;\n"
                   "            }\n            if !self.check_login_scope(&lr).await {\n")
         self.assert_check_fails(self.LOGON_SITES)
 
-    def test_recent_session_with_one_time_passwords_on_fails_check(self):
+    def test_removed_controller_keeping_its_session_fails_check(self):
         self.rebrand()
-        self.edit(HBB, '("verification-method", "use-permanent-password")', '("verification-method", "use-both-passwords")')
-        self.assert_check_fails(self.LOGON_SITES)
-
-    def test_unanswered_prompt_no_longer_times_out_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", "                _ = login_deadline(conn.authorized, started) => {\n"
-                  "                    conn.on_close(\"Timeout\", true).await;\n                    break;\n                }\n", "")
-        self.assert_check_fails(self.ACCEPT_GATED)
-
-    def test_trusted_list_left_out_of_the_session_guard_fails_check(self):
-        self.rebrand()
-        self.edit("src/password_lock.rs", "    crate::trust_policy::TRUSTED_OPTION,\n", "")
-        self.assert_check_fails(self.TRUST_LIST)
-
-    def test_trusted_list_key_mismatch_fails_check(self):
-        # The session guard names the constant itself; the Settings list must follow a rename.
-        self.rebrand()
-        self.edit("src/trust_policy.rs", 'pub const TRUSTED_OPTION: &str = "boring-trusted-controllers";',
-                  'pub const TRUSTED_OPTION: &str = "boring-trusted";')
-        self.assert_check_fails(self.TRUST_SETTINGS)
-
-    def test_remove_key_mismatch_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", 'pub const REMOVE_OPTION: &str = "boring-trusted-controllers-remove";',
-                  'pub const REMOVE_OPTION: &str = "boring-untrust";')
+        self.edit(self.TRUST_RS, "(c.removed || !self.password_right && !self.stays && c.always_ask)",
+                  "(!self.password_right && !self.stays && c.always_ask)")
         self.assert_check_fails(self.REMOVE)
 
-    def test_trusted_list_in_local_options_fails_check(self):
-        # Local options live in the UI process's config, not the daemon's, and skip the guard.
+    def test_settings_letting_more_in_during_a_session_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "Config::set_option(TRUSTED_OPTION", "LocalConfig::set_option(TRUSTED_OPTION")
-        self.assert_check_fails(self.TRUST_LIST)
-
-    def test_approval_remembered_during_another_session_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "let remember = crate::password_lock::authed_sessions() == 0;", "let remember = true;")
-        self.assert_check_fails(self.TRUST_LIST)
-
-    def test_ui_copy_of_the_trusted_list_taken_fails_check(self):
-        self.rebrand()
-        self.edit("src/ipc.rs", "                let removed = crate::trust_policy::take_options(&mut value, &Config::get_options());\n",
-                  "                let removed: Vec<String> = Vec::new();\n")
-        self.assert_check_fails(self.TRUST_LIST)
-
-    def test_removed_controller_keeps_its_session_fails_check(self):
-        self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.CLOSE_ARM, "")
+        self.edit(self.TRUST_RS, "        Edit::Allow { .. } if sessions > 0 => return Err(IN_SESSION),\n", "")
         self.assert_check_fails(self.REMOVE)
 
-    def test_controller_id_logged_on_every_login_fails_check(self):
+    def test_service_edit_blind_to_sessions_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "        hbb_common::throttled_log!(\n            std::time::Duration::from_secs(60),\n            info,\n",
-                  "        log::info!(\n")
-        self.assert_check_fails(self.ID_LOG)
-
-    def test_settings_without_trusted_list_fails_check(self):
-        self.rebrand()
-        self.edit(rebrand.SETTINGS, rebrand.TRUST_CARD, "")
-        self.assert_check_fails(self.TRUST_SETTINGS)
-
-    def test_settings_list_outside_the_unlock_fails_check(self):
-        self.rebrand()
-        self.edit(rebrand.SETTINGS, rebrand.TRUST_CARD, "")
-        self.edit(rebrand.SETTINGS, "            _lock(locked, 'Unlock Security Settings', () {\n",
-                  rebrand.TRUST_CARD + "            _lock(locked, 'Unlock Security Settings', () {\n")
-        self.assert_check_fails(self.TRUST_SETTINGS)
-
-    def test_settings_widget_on_another_key_fails_check(self):
-        self.rebrand()
-        self.edit("flutter/lib/desktop/widgets/trusted_controllers.dart",
-                  "const kBoringTrustedControllers = 'boring-trusted-controllers';",
-                  "const kBoringTrustedControllers = 'trusted';")
-        self.assert_check_fails(self.TRUST_SETTINGS)
-
-    # --- trust binding (option B): the Controller proves its key ----------------------
-    def test_trust_keyed_on_the_id_alone_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "|(t, k)| t == id && k == key", "|(t, _)| t == id")
-        self.assert_check_fails(self.PROOF)
+        self.edit("src/ipc.rs", "base::trust::edit_in_session(&value, crate::password_lock::authed_sessions())",
+                  "base::trust::edit_in_session(&value, 0)")
+        self.assert_check_fails(self.REMOVE)
 
     def test_unverified_signature_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    (signed == want).then_some(key)\n", "    let _ = (signed, want);\n    Some(key)\n")
+        self.edit(self.TRUST_RS, "    let signed = sign::verify(sig, &sign::PublicKey(key)).ok()?;\n    (signed == want).then_some(key)",
+                  "    let _ = (sig, want);\n    Some(key)")
         self.assert_check_fails(self.PROOF)
 
-    def test_gate_trusting_the_presented_key_unsigned_fails_check(self):
+    def test_key_proven_on_an_unkeyed_connection_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", rebrand.LOGIN_KEY, "lr.boring_controller_pk.as_ref().try_into().ok()")
+        self.edit("src/trust_policy.rs", "    if !secured || !crate::client::boring_is_machine_id(own_id) {",
+                  "    if !crate::client::boring_is_machine_id(own_id) {")
         self.assert_check_fails(self.PROOF)
 
-    def test_signature_naming_the_claimed_target_fails_check(self):
+    def test_key_never_checked_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    target_names(arrived_on, from, own_id, secured)\n        .iter()",
-                  "    [lr.username.clone()]\n        .iter()")
+        self.edit(self.CONN, rebrand.T04_PROVE, "")
         self.assert_check_fails(self.PROOF)
 
-    def test_target_named_by_a_relay_or_lan_arrival_address_fails_check(self):
-        # review M1: a relayed or punched login arrives on the Target's LAN or relay-side address.
+    def test_login_message_without_its_domain_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    if !(is_tailnet(arrived_on) && is_tailnet(from)) {\n",
-                  "    if !is_tailnet(arrived_on) {\n")
+        self.edit(self.TRUST_RS, 'const LOGIN_DOMAIN: &[u8] = b"\\0boring-remote', 'const LOGIN_DOMAIN: &[u8] = b"boring-remote')
         self.assert_check_fails(self.PROOF)
 
-    def test_gate_key_not_proven_against_this_connection_fails_check(self):
+    def test_controller_signing_any_challenge_fails_check(self):
+        # A Target picks the challenge; unchecked, it could make the Controller's key sign a SignedId.
         self.rebrand()
-        self.edit("src/server/connection.rs", "self.stream.local_addr().ip(),\n                            &self.ip,",
-                  'self.stream.local_addr().ip(),\n                            "100.64.0.1",')
+        self.edit(self.TRUST_RS, " && challenge.bytes().all(|b| b.is_ascii_alphanumeric());", ";")
         self.assert_check_fails(self.PROOF)
 
-    def test_controller_signing_a_lan_address_fails_check(self):
+    def test_controller_not_signing_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    is_tailnet(ip).then(|| ip.to_string())\n", "    Some(ip.to_string())\n")
+        self.edit("src/client.rs", rebrand.SIGN_LOGIN, "")
         self.assert_check_fails(self.SIGNED)
 
-    def test_controller_signing_a_machine_id_fails_check(self):
-        # No signed ID logins until the session's Target identity is verified (Hosted, 07/08).
+    def test_login_signed_before_the_challenge_is_known_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "        None => DIALED.lock().unwrap().iter().find(|(p, _)| p == peer)?.1,\n",
-                  "        None => return Some(peer.to_owned()),\n")
+        self.edit("src/client.rs", rebrand.HASH_FIRST_NEW, rebrand.HASH_FIRST_OLD)
         self.assert_check_fails(self.SIGNED)
 
     def test_controller_ui_making_its_own_key_pair_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    let pair = Config::get_existing_key_pair();\n",
-                  "    let pair = Some(Config::get_key_pair());\n")
+        self.edit("src/trust_policy.rs", "    let pair = Config::get_existing_key_pair();",
+                  "    let pair = Some(Config::get_key_pair());")
         self.assert_check_fails(self.SIGNED)
 
-    def test_sign_login_signing_another_id_fails_check(self):
+    def test_trust_policy_left_out_of_ios_controllers_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "signature(challenge, &target, &lr.my_id, &sk)",
-                  "signature(challenge, &target, &lr.username, &sk)")
+        self.edit("src/lib.rs", "mod trust_policy;", rebrand.NON_IOS + "mod trust_policy;")
         self.assert_check_fails(self.SIGNED)
 
-    def test_approval_replacing_a_trusted_key_fails_check(self):
-        # review S1: a prompt for an already trusted ID with another key must not swap the key.
+    def test_key_written_empty_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", " && remember && !trusted.has_id(controller) {", " && remember {")
-        self.assert_check_fails(self.TRUST_LIST)
+        self.edit(self.TRUST_RS, '    #[serde(default, skip_serializing_if = "String::is_empty")]\n    pub pk: String,',
+                  "    #[serde(default)]\n    pub pk: String,")
+        self.assert_check_fails(self.KEY_STORED)
 
     def test_renumbered_login_fields_fail_the_pin(self):
         # review S3: the pin is check.py's own, so moving our fields in rebrand.py alone fails.
@@ -1546,42 +1439,6 @@ class RebrandSeam(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("pinned", msg)
 
-    def test_keyless_entry_kept_by_parse_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "    Some((id, unhex(key)?))\n", "    Some((id, unhex(key).unwrap_or([0; 32])))\n")
-        self.assert_check_fails(self.PROOF)
-
-    def test_controller_not_signing_fails_check(self):
-        self.rebrand()
-        self.edit("src/client.rs", rebrand.SIGN_LOGIN, "")
-        self.assert_check_fails(self.SIGNED)
-
-    def test_login_signed_before_the_challenge_is_known_fails_check(self):
-        self.rebrand()
-        self.edit("src/client.rs", rebrand.HASH_FIRST_NEW, rebrand.HASH_FIRST_OLD)
-        self.assert_check_fails(self.SIGNED)
-
-    def test_controller_signing_any_challenge_fails_check(self):
-        # A Target picks the challenge; unchecked, it could make the Controller's key sign a SignedId.
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "\n        && challenge.bytes().all(|b| b.is_ascii_alphanumeric());", ";")
-        self.assert_check_fails(self.SIGNED)
-
-    def test_login_message_without_its_domain_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", 'const LOGIN_DOMAIN: &[u8] = b"\\0boring-remote', 'const LOGIN_DOMAIN: &[u8] = b"boring-remote')
-        self.assert_check_fails(self.SIGNED)
-
-    def test_tailnet_name_not_bound_to_its_address_fails_check(self):
-        self.rebrand()
-        self.edit("src/client.rs", rebrand.NOTE_DIALED, "")
-        self.assert_check_fails(self.SIGNED)
-
-    def test_trust_policy_left_out_of_ios_controllers_fails_check(self):
-        self.rebrand()
-        self.edit("src/lib.rs", "mod trust_policy;", rebrand.NON_IOS + "mod trust_policy;")
-        self.assert_check_fails(self.SIGNED)
-
     def test_login_fields_dropped_from_the_protocol_fails_check(self):
         self.rebrand()
         self.edit("libs/base/protos/message.proto", rebrand.PROTO_FIELDS, "")
@@ -1593,11 +1450,6 @@ class RebrandSeam(unittest.TestCase):
                   rebrand.PROTO_FIELDS + "  bytes sneaky = 1002;\n")
         self.assert_check_fails(PROTOCOL)
 
-    def test_migration_writing_more_than_it_drops_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "    trusted\n}\n", "    save(&trusted);\n    trusted\n}\n")
-        self.assert_check_fails(self.TRUST_LIST)
-
     # --- ticket 07: the Hosted path (ADR 0005) ----------------------------------------
     # Independent of rebrand.py and check.py: the servers' public key as Jason published it
     # (boring-remote-servers keys/id_ed25519.pub) and the domain from the spec.
@@ -1607,11 +1459,11 @@ class RebrandSeam(unittest.TestCase):
     FORCED = "rendezvous server and list are always ours (exe name, Settings, config file, serial path skipped)"
     LOCKED_SERVERS = "server settings locked to rs.theboringremote.com (relay follows; no API server)"
     BAKED = "baked server key is server-key.pub (built-in key and locked key option)"
-    NO_WHITELIST = "no Tailscale whitelist left (ADR 0005)"
+    NO_WHITELIST = "no global whitelist left (ADR 0005: Hosted connections arrive from anywhere)"
     PUBLIC = "no shipped code names a RustDesk public server or its key"
     MACHINE_ID = "the Target shows its Machine ID and keeps it across restarts (made once, then read from its config)"
-    HOSTED_SIGNED = ("Controllers sign a Machine-ID login only on a session that verified the Target "
-                     "against the baked server key")
+    HOSTED_SIGNED = ("Controllers sign a Machine-ID login only on a stream that verified the Target (pinned Direct Link or "
+                     "the baked server key)")
 
     def locked(self):
         return check.rust_map((self.root / HBB).read_text(), "OVERWRITE_SETTINGS")
@@ -1854,7 +1706,7 @@ class RebrandSeam(unittest.TestCase):
     # Review S2-S6: what the Hosted path newly exposes.
     RELAY = "the Controller's relay is always the locked relay-server, never a host the peer names"
     NO_STUN = "no WebRTC, IPv6 or UDP punch, and no third-party STUN or TURN host ships"
-    DIRECT_TAILNET = "Direct IP (21118) answers tailnet addresses only"
+    DIRECT_TAILNET = "the Direct Link (21118) answers Tailscale and private-LAN addresses only, with no global whitelist"
     NO_CHANGE_ID = "Change ID is off: hidden on desktop and mobile, refused if called (the Machine ID never changes)"
 
     def test_exposure_facts_pass_after_rebrand_and_fail_upstream(self):
@@ -1902,7 +1754,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_direct_ip_from_any_address_fails_check(self):
         self.rebrand()
-        self.edit("src/rendezvous_mediator.rs", rebrand.DIRECT_TAILNET_ONLY, "")
+        self.edit("src/rendezvous_mediator.rs", rebrand.DIRECT_LAN_ONLY, "")
         self.assert_check_fails(self.DIRECT_TAILNET)
 
     def test_change_id_back_fails_check(self):
@@ -1970,129 +1822,88 @@ class RebrandSeam(unittest.TestCase):
                   "                            &lr.username,\n")
         self.assert_check_fails(self.PROOF)
 
-    # --- ticket 08: tailnet first, the Hosted servers as fallback -----------------------
-    FIRST = "a saved Machine ID tries its tailnet address first (~3 s), then the Hosted servers (ticket 08)"
-    TAILNET_SIGNED = "a tailnet-first login signs only the address its own stream reached, at send time (ticket 08)"
-    LEARNED = "a saved Machine ID records a tailnet address only from its verified Target (ticket 08)"
+    # --- ticket 08 on 1.7's Direct Link: a Machine ID's Direct Link first, Hosted after -----------
+    FIRST = "a Machine ID tries a pinned Direct Link where it was met (~3 s on Tailscale), then the Hosted servers (ticket 08)"
+    PINNED = ("the Hosted path holds the same pin as a Direct Link, and a tailnet address is kept only from a pinned "
+              "Target (tickets 08, 16)")
     DOWN = "Hosted servers unreachable: a plain error naming rs.theboringremote.com (ticket 08)"
-    PATH = "the session shows tailnet direct, direct or relayed (ticket 08)"
+    PLAN = "src/connect_plan.rs"
+    LINK = "libs/base/src/direct_link.rs"
 
-    def test_tailnet_first_facts_pass_after_rebrand_and_fail_on_upstream(self):
+    def test_direct_first_facts_pass_after_rebrand_and_fail_on_upstream(self):
         r = run(CHECK, self.root)
-        for fact in (self.FIRST, self.TAILNET_SIGNED, self.LEARNED, self.DOWN, self.PATH):
+        for fact in (self.FIRST, self.PINNED, self.DOWN):
             self.assertIn(f"FAIL {fact}", r.stdout)
         self.rebrand()
         r = run(CHECK, self.root)
-        for fact in (self.FIRST, self.TAILNET_SIGNED, self.LEARNED, self.DOWN, self.PATH, self.HOSTED_SIGNED):
+        for fact in (self.FIRST, self.PINNED, self.DOWN):
             self.assertIn(f"PASS {fact}", r.stdout)
 
-    def test_no_tailnet_attempt_before_the_hosted_servers_fails_check(self):
+    def test_no_direct_link_before_the_hosted_servers_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "            crate::connect_plan::tailnet_first(peer, conn_type, interface.is_force_relay()).await\n",
-                  "            None::<(Stream, std::net::IpAddr)>\n")
+        self.edit("src/client.rs", "crate::connect_plan::direct_first(peer, interface.is_force_relay()).await",
+                  "None::<(hbb_common::Stream, base::direct_link::Route, Option<Vec<u8>>)>")
         self.assert_check_fails(self.FIRST)
 
-    def test_slow_tailnet_attempt_fails_check(self):
+    def test_another_computer_at_a_machine_ids_address_let_through_fails_check(self):
         self.rebrand()
-        self.edit("src/connect_plan.rs", "pub const TAILNET_TIMEOUT_MS: u64 = 3_000;",
-                  "pub const TAILNET_TIMEOUT_MS: u64 = 30_000;")
+        self.edit(self.LINK, "    plan.dialled = None;\n    Some(plan)", "    plan.dialled = Some(plan.direct);\n    Some(plan)")
         self.assert_check_fails(self.FIRST)
 
-    def test_saved_lan_address_dialed_fails_check(self):
+    def test_a_refused_direct_link_not_handed_to_hosted_fails_check(self):
         self.rebrand()
-        self.edit("src/connect_plan.rs", "a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip));",
-                  "a.parse::<IpAddr>().ok());")
+        self.edit(self.LINK, "        Err(Failure::Refused(e)) => Err(Failure::Stale(e)),", "        Err(Failure::Refused(e)) => Err(Failure::Refused(e)),")
+        self.assert_check_fails(self.FIRST)
+
+    def test_slow_tailscale_attempt_fails_check(self):
+        self.rebrand()
+        self.edit(self.PLAN, "pub const DIRECT_FIRST_MS: u64 = 3_000;", "pub const DIRECT_FIRST_MS: u64 = 18_000;")
         self.assert_check_fails(self.FIRST)
 
     def test_typed_name_falling_back_to_the_hosted_servers_fails_check(self):
         self.rebrand()
-        self.edit("src/connect_plan.rs", "        return vec![Attempt::DirectIp(peer.id.to_owned())];\n",
-                  "        let _ = Attempt::DirectIp(peer.id.to_owned());\n")
+        self.edit(self.PLAN, "        return vec![Attempt::DirectLink];", "        return vec![Attempt::DirectLink, Attempt::Hosted];")
         self.assert_check_fails(self.FIRST)
 
-    def test_tailnet_attempt_through_a_socks_proxy_fails_check(self):
-        # review S1: through a proxy, whatever the proxy reaches at that 100.x answers.
+    def test_hosted_path_accepting_a_changed_key_fails_check(self):
         self.rebrand()
-        self.edit("src/connect_plan.rs", " || Config::get_socks().is_some()", "")
-        self.assert_check_fails(self.FIRST)
-
-    def test_tailnet_stream_kept_off_the_tailnet_fails_check(self):
-        # review S1: a SYN that left by the default route (carrier CGNAT, another tailnet) isn't WireGuard.
-        self.rebrand()
-        self.edit("src/connect_plan.rs", "Ok(stream) if is_tailnet(stream.local_addr().ip()) => return Some((stream, ip)),",
-                  "Ok(stream) => return Some((stream, ip)),")
-        self.assert_check_fails(self.FIRST)
-
-    def test_tailnet_dial_injected_into_client_fails_check(self):
-        self.rebrand()
-        self.edit("src/client.rs", "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n",
-                  "        let _ = connect_tcp_local(\"100.64.0.1:21118\", None, 3000).await;\n"
-                  "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n")
-        self.assert_check_fails(self.FIRST)
-
-    def test_reached_address_kept_after_the_login_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "            *slot = None;\n", "")
-        self.assert_check_fails(self.TAILNET_SIGNED)
-
-    def test_reached_address_signed_on_another_stream_fails_check(self):
-        # review S2: the slot counts only for the stream it names.
-        self.rebrand()
-        self.edit("src/trust_policy.rs", "        Some((l, ip)) if l == local => {", "        Some((_, ip)) => {")
-        self.assert_check_fails(self.TAILNET_SIGNED)
-
-    def test_tailnet_mark_set_elsewhere_fails_check(self):
-        self.rebrand()
-        self.edit("src/client.rs", '        let mut socket = socket?;\n',
-                  '        let mut socket = socket?;\n        let _ = (crate::connect_plan::TAILNET_STREAM);\n')
-        self.assert_check_fails(self.TAILNET_SIGNED)
-
-    def test_controller_signing_a_saved_lan_address_fails_check(self):
-        self.rebrand()
-        self.edit("src/trust_policy.rs", ".filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer))",
-                  ".filter(|_| crate::client::boring_is_machine_id(peer))")
-        self.assert_check_fails(self.TAILNET_SIGNED)
-
-    def test_every_unverified_machine_id_let_through_fails_check(self):
-        self.rebrand()
-        self.edit("src/client/io_loop.rs", "let is_secured = is_secured || tailnet_first;", "let is_secured = true;")
-        self.assert_check_fails(self.TAILNET_SIGNED)
+        self.edit(self.LINK, "            Some(t) => t.pk == pk,\n", "            Some(_) => true,\n")
+        self.assert_check_fails(self.PINNED)
 
     def test_unverified_session_recording_a_tailnet_address_fails_check(self):
         self.rebrand()
-        self.edit("src/connect_plan.rs", "    if !verified || !crate::client::boring_is_machine_id(id) {",
-                  "    if !crate::client::boring_is_machine_id(id) {")
-        self.assert_check_fails(self.LEARNED)
+        self.edit(self.PLAN, "    if !(secured && crate::client::boring_is_machine_id(id)) {\n        return;\n    }\n    let reported",
+                  "    let reported")
+        self.assert_check_fails(self.PINNED)
+
+    def test_lan_address_kept_as_tailscale_fails_check(self):
+        self.rebrand()
+        self.edit(self.LINK, "        if !is_tailscale(ip) {\n            return false;\n        }\n        let Some(t) = self.0.get_mut(id)",
+                  "        let Some(t) = self.0.get_mut(id)")
+        self.assert_check_fails(self.PINNED)
 
     def test_target_not_reporting_its_tailnet_address_fails_check(self):
         self.rebrand()
-        self.edit("src/server/connection.rs", "        crate::connect_plan::add_own_tailnet(&mut platform_additions);\n", "")
-        self.assert_check_fails(self.LEARNED)
+        self.edit(self.CONN_RS, rebrand.REPORT_TAILNET, "")
+        self.assert_check_fails(self.PINNED)
 
     def test_rendezvous_error_passed_through_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        let socket = socket.map_err(crate::connect_plan::hosted_down);", "")
+        self.edit("src/client.rs", rebrand.HOSTED_DOWN_ERR, "")
         self.assert_check_fails(self.DOWN)
 
     def test_relay_failure_passed_through_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "                let err = crate::connect_plan::hosted_error(err);", "")
-        self.assert_check_fails(self.DOWN)
-
-    def test_hosted_down_error_not_naming_our_servers_fails_check(self):
-        self.rebrand()
-        self.edit("src/connect_plan.rs", " (rs.theboringremote.com)", "")
+        self.edit("src/client.rs", rebrand.HOSTED_RELAY_ERR, "")
         self.assert_check_fails(self.DOWN)
 
     def test_hosted_down_key_missing_from_a_language_fails_check(self):
         self.rebrand()
-        self.edit("src/lang/de.rs", f'        ("{rebrand.HOSTED_DOWN}", ""),\n', "")
+        self.edit("src/lang/fr.rs", f'        ("{rebrand.HOSTED_DOWN}", ""),\n', "")
         self.assert_check_fails(self.DOWN)
 
-    def test_session_without_the_tailnet_label_fails_check(self):
-        self.rebrand()
-        self.edit("flutter/lib/common.dart", "  if (streamType == 'Tailnet') {\n", "  if (false) {\n")
-        self.assert_check_fails(self.PATH)
+    CONN_RS = "src/server/connection.rs"
+
     # --- ticket 09: 1.8.0 first launch sets a Permanent password ---------------------
     HOSTED_GATE = ("no app-generated Permanent password, no Hosted servers: the Target registers its Machine ID "
                    "only once the generator's marker is set; Direct IP keeps listening (ticket 09)")
@@ -2171,10 +1982,9 @@ class RebrandSeam(unittest.TestCase):
         self.edit(self.LOCK, "    if !generated_write_allowed(\n", "    if false && !generated_write_allowed(\n")
         self.assert_check_fails(self.MARKER)
 
-    SETUP_SCREEN = ("1.8.0 first launch: a Target without an app-generated Permanent password gets the setup screen, "
-                    "which runs the generator (asking first if a password is set) and shows it once; never again "
-                    "once one is generated (ticket 09)")
-    SETUP = "flutter/lib/desktop/widgets/password_setup.dart"
+    SETUP_SCREEN = ("1.8.0 first launch: a computer with no password made here gets Setup's password step alone, "
+                    "which runs the generator (asking first if a password is set) and shows it once (ticket 09)")
+    PANEL = "flutter/lib/desktop/kit/password.dart"
 
     def test_setup_screen_fact_passes_after_rebrand(self):
         self.rebrand()
@@ -2185,29 +1995,24 @@ class RebrandSeam(unittest.TestCase):
 
     def test_setup_screen_not_wired_into_the_home_page_fails_check(self):
         self.rebrand()
-        self.edit(rebrand.HOME, rebrand.SETUP_HOOK, "")
+        self.edit(rebrand.HOME, rebrand.PASSWORD_SETUP_BRANCH, "")
         self.assert_check_fails(self.SETUP_SCREEN)
 
-    def test_setup_screen_shown_with_a_generated_password_fails_check(self):
+    def test_setup_without_the_generator_fails_check(self):
         self.rebrand()
-        self.edit(self.SETUP, "  if (await generatedPasswordSet()) return;\n", "")
+        self.edit(rebrand.HOME, "        generatePassword: () => bind.mainGeneratePermanentPassword(),\n",
+                  "        generatePassword: () async => '',\n")
         self.assert_check_fails(self.SETUP_SCREEN)
 
-    def test_setup_screen_skipped_for_a_typed_password_fails_check(self):
-        # A 1.7.x typed password still gets the screen (review M1).
+    def test_replacing_a_password_without_asking_fails_check(self):
         self.rebrand()
-        self.edit(self.SETUP, "  return bind.mainGetOption(key: kBoringPasswordGenerated) == 'Y';\n",
-                  "  return (await bind.mainGetCommon(key: \"permanent-password-set\")) == \"true\";\n")
+        self.edit(self.PANEL, "                        setState(() => _step = _Step.confirm);\n", "                        _make();\n")
+        self.edit(self.PANEL, "      case _Step.confirm:\n", "      case _Step.saved when false:\n")
         self.assert_check_fails(self.SETUP_SCREEN)
 
-    def test_setup_screen_replacing_a_password_without_asking_fails_check(self):
+    def test_a_refusal_shown_as_a_password_fails_check(self):
         self.rebrand()
-        self.edit(self.SETUP, "        final go = await confirmReplacePassword();\n        if (go == null) return;\n", "")
-        self.assert_check_fails(self.SETUP_SCREEN)
-
-    def test_setup_screen_not_showing_the_password_once_fails_check(self):
-        self.rebrand()
-        self.edit(self.SETUP, "showGeneratedPasswordOnce(pass);", "showToast(pass);")
+        self.edit(self.PANEL, "    if (pass.isEmpty) {\n", "    if (pass == '\u0000') {\n")
         self.assert_check_fails(self.SETUP_SCREEN)
 
     KEPT = ("the 1.8.0 Update keeps 1.7.x's config: same config dir and License key option, the update script "

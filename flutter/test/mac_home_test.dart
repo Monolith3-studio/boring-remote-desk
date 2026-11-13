@@ -126,8 +126,9 @@ void main() {
     expect(find.text('Connect to a computer'), findsOneWidget);
     expect(find.text('Computers'), findsOneWidget);
     final hint = tester.widget<TextField>(find.byKey(MacHome.addressKey)).decoration?.hintText;
-    expect(hint, "Type a computer's name");
-    expect(tester.widgetList<Text>(find.byType(Text)).where((t) => (t.data ?? '').contains('Mac')), isEmpty);
+    expect(hint, "Type a computer's name or Machine ID");
+    expect(tester.widgetList<Text>(find.byType(Text))
+        .where((t) => (t.data ?? '').replaceAll('Machine ID', '').contains('Mac')), isEmpty); // 1.8 glossary term
     await tester.tap(find.text('Connect from outside the building'));
     await tester.pumpAndSettle();
     expect(find.textContaining('pick this Mac by name'), findsOneWidget);
@@ -225,7 +226,7 @@ void main() {
   testWidgets('Home leads with a name, never the word IP', (tester) async {
     await tester.pumpWidget(host(home(list: const [])));
     final hint = tester.widget<TextField>(find.byKey(MacHome.addressKey)).decoration?.hintText;
-    expect(hint, "Type a computer's name");
+    expect(hint, "Type a computer's name or Machine ID");
     final words = [hint ?? '', for (final t in tester.widgetList<Text>(find.byType(Text))) t.data ?? ''];
     expect(words.where(RegExp(r'\bIP\b').hasMatch), isEmpty);
   });
@@ -425,4 +426,25 @@ void main() {
       expect(find.text('Transfer files'), findsNothing);
     });
   });
+
+  // 1.8 (ADR 0005): the Machine ID is what another computer types to reach this one from anywhere.
+  testWidgets('a typed Machine ID is dialled as one, spaces or not', (tester) async {
+    final got = <String>[];
+    await tester.pumpWidget(host(MacHome(macs: const [], tailscaleAddress: () async => null, onConnect: got.add)));
+    await tester.enterText(find.byKey(MacHome.addressKey), '123 456 789');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    expect(got, ['123456789']);
+  });
+
+  testWidgets('outside the building: this computer\'s Machine ID first, Tailscale as the backup', (tester) async {
+    await tester.pumpWidget(host(MacHome(
+        macs: const [], tailscaleAddress: () async => null, onConnect: (_) {}, machineId: '123456789', hostedOn: false)));
+    await tester.tap(find.text('Connect from outside the building'));
+    await tester.pumpAndSettle();
+    expect(find.text('123 456 789'), findsOneWidget);
+    expect(find.textContaining('password made in Settings'), findsOneWidget);
+    expect(find.text('Or use Tailscale'), findsOneWidget);
+    expect(machineIdGroups('1234567890'), '1 234 567 890');
+  });
 }
+

@@ -4,9 +4,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/desktop/kit/access.dart';
 import 'package:flutter_hbb/desktop/kit/kit.dart';
+import 'package:flutter_hbb/desktop/kit/password.dart';
 import 'package:flutter_hbb/desktop/kit/setup.dart';
 
 Widget host(Widget w) => MaterialApp(theme: Kit.theme(), home: Scaffold(body: w));
+
+/// What the service hands back from Generate in these tests (src/password_lock.rs shape).
+const kMade = 'Abc23defGhjk45mnPqrs';
 
 /// Scrolls the button into view first, as a buyer would on a small window.
 Future<void> tapText(WidgetTester tester, String text) async {
@@ -25,7 +29,9 @@ SetupFlow flow({
   Future<bool> Function()? canBeReached,
   Future<void> Function()? allowReach,
   bool passwordSet = false,
-  Future<bool> Function(String)? setPassword,
+  bool? passwordGenerated,
+  Future<String> Function()? generatePassword,
+  bool passwordOnly = false,
   int startStep = 0,
   void Function(int)? onStep,
   VoidCallback? onDone,
@@ -47,7 +53,9 @@ SetupFlow flow({
       canBeReached: canBeReached ?? () async => false,
       allowReach: allowReach ?? () async {},
       passwordSet: passwordSet,
-      setPassword: setPassword ?? (_) async => true,
+      passwordGenerated: passwordGenerated ?? passwordSet,
+      generatePassword: generatePassword ?? () async => kMade,
+      passwordOnly: passwordOnly,
       startStep: startStep,
       onStep: onStep ?? (_) {},
       onDone: onDone ?? () {},
@@ -158,7 +166,7 @@ void main() {
           canBeReached: () async => false,
           allowReach: () async {},
           passwordSet: false,
-          setPassword: (_) async => true,
+          generatePassword: () async => kMade,
           onStep: steps.add,
           onDone: () {},
           welcome: false,
@@ -338,41 +346,39 @@ void main() {
     });
   });
 
-  group('screen 3: Unattended Password', () {
-    testWidgets('a blank or weak password is refused, a strong one saved', (tester) async {
-      final got = <String>[];
-      var done = 0;
+  group('screen 3: Unattended Password (made here, 1.8 ticket 05)', () {
+    testWidgets('Make a password shows it once; Finish comes after "I\'ve saved it"', (tester) async {
+      var made = 0, done = 0;
       await tester.pumpWidget(host(flow(
           startStep: 2,
-          setPassword: (p) async {
-            got.add(p);
-            return true;
+          generatePassword: () async {
+            made++;
+            return kMade;
           },
           onDone: () => done++)));
       expect(find.text('Step 3 of 3'), findsOneWidget);
-      for (final weak in ['', 'password']) {
-        await tester.enterText(find.byKey(SetupFlow.passwordKey), weak);
-        await tapText(tester, setupCopy['password.save']!);
-        await tester.pump();
-      }
-      expect(got, isEmpty);
-      await tester.enterText(find.byKey(SetupFlow.passwordKey), 'Edit2bay9');
-      await tapText(tester, setupCopy['password.save']!);
+      expect(find.byType(TextField), findsNothing, reason: 'nothing to type: Boring Remote makes it');
+      expect(find.text(setupCopy['done']!), findsNothing);
+      await tapText(tester, passwordCopy['make']!);
       await tester.pump();
-      expect(got, ['Edit2bay9']);
-      expect(find.text(setupCopy['password.saved']!), findsOneWidget);
-      expect(find.text('Edit2bay9'), findsNothing);
+      expect(made, 1);
+      expect(find.text(kMade), findsOneWidget);
+      expect(find.text(passwordCopy['shown.body']!), findsOneWidget);
+      await tapText(tester, passwordCopy['saved.button']!);
+      await tester.pump();
+      expect(find.text(kMade), findsNothing, reason: 'shown once');
+      expect(find.text(passwordCopy['saved']!), findsOneWidget);
       await tapText(tester, setupCopy['done']!);
       expect(done, 1);
     });
 
-    testWidgets('a failed save says to try again and does not finish', (tester) async {
-      await tester.pumpWidget(host(flow(startStep: 2, setPassword: (_) async => false)));
-      await tester.enterText(find.byKey(SetupFlow.passwordKey), 'Edit2bay9');
-      await tapText(tester, setupCopy['password.save']!);
+    testWidgets('a refusal says so, shows no password and does not finish', (tester) async {
+      await tester.pumpWidget(host(flow(startStep: 2, generatePassword: () async => '')));
+      await tapText(tester, passwordCopy['make']!);
       await tester.pump();
-      expect(find.text(setupCopy['password.failed']!), findsOneWidget);
+      expect(find.text(passwordCopy['failed']!), findsOneWidget);
       expect(find.text(setupCopy['done']!), findsNothing);
+      expect(find.byKey(UnattendedPasswordPanel.shownKey), findsNothing);
     });
 
     testWidgets('skipping says what it costs, then finishes', (tester) async {
@@ -386,12 +392,56 @@ void main() {
       expect(done, 1);
     });
 
-    testWidgets('opened again with a password set: Finish needs nothing typed', (tester) async {
+    testWidgets('opened again with a password made here: Finish needs nothing', (tester) async {
       var done = 0;
       await tester.pumpWidget(host(flow(startStep: 2, passwordSet: true, onDone: () => done++)));
-      expect(find.text(setupCopy['password.already']!), findsOneWidget);
+      expect(find.text(passwordCopy['typed']!), findsNothing);
+      expect(find.text(passwordCopy['remake']!), findsOneWidget);
       await tapText(tester, setupCopy['done']!);
       expect(done, 1);
+    });
+
+    testWidgets('a password typed in 1.7: asks for one made here, and Replace asks first', (tester) async {
+      var made = 0;
+      await tester.pumpWidget(host(flow(
+          startStep: 2,
+          passwordSet: true,
+          passwordGenerated: false,
+          generatePassword: () async {
+            made++;
+            return kMade;
+          })));
+      expect(find.text(passwordCopy['typed']!), findsOneWidget);
+      expect(find.text(setupCopy['done']!), findsNothing, reason: 'a typed password keeps Hosted off');
+      await tapText(tester, passwordCopy['remake']!);
+      await tester.pump();
+      expect(find.text(passwordCopy['confirm.title']!), findsOneWidget);
+      expect(made, 0, reason: 'nothing replaced before Replace');
+      await tapText(tester, passwordCopy['confirm.cancel']!);
+      await tester.pump();
+      expect(made, 0);
+      await tapText(tester, passwordCopy['remake']!);
+      await tester.pump();
+      await tapText(tester, passwordCopy['confirm.replace']!);
+      await tester.pump();
+      expect(made, 1);
+      expect(find.text(kMade), findsOneWidget);
+    });
+
+    testWidgets('1.8 first launch on a computer set up before: the password step alone, with Later', (tester) async {
+      var done = 0;
+      await tester.pumpWidget(host(flow(passwordOnly: true, welcome: true, ready: true, onDone: () => done++)));
+      expect(find.text(setupCopy['later.title']!), findsOneWidget);
+      expect(find.text(setupCopy['later.body']!), findsOneWidget);
+      expect(find.textContaining('Step '), findsNothing, reason: 'one screen, no welcome, no step count');
+      expect(find.text(setupCopy['welcome.title']!), findsNothing);
+      await tapText(tester, setupCopy['later']!);
+      await tester.pump();
+      expect(find.text(setupCopy['later.why']!), findsOneWidget);
+      await tapText(tester, setupCopy['skip.confirm']!);
+      await tester.pump();
+      expect(done, 1, reason: 'Later closes it; no Ready screen');
+      expect(SetupFlow.screenCount(SetupPlatform.mac), 3, reason: 'a first launch still has all three');
     });
   });
 
@@ -494,8 +544,7 @@ void main() {
       await tapText(tester, setupCopy['skip.confirm']!);
       await tester.pump();
       expect(find.text(setupCopy['password.title']!), findsOneWidget);
-      expect(find.text('Your other computers can get in with this password when no one is at this one.'),
-          findsOneWidget);
+      expect(find.text(setupCopy['password.body']!), findsOneWidget);
     });
 
     test('the rule commands: read without admin, add asks Windows once, path quoted', () {
@@ -550,16 +599,20 @@ void main() {
     });
   });
 
-  testWidgets('screen 3 asks for a password in plain words', (tester) async {
+  testWidgets('screen 3 offers to make the password in plain words', (tester) async {
     await tester.pumpWidget(host(flow(startStep: 2)));
-    expect(tester.widget<TextField>(find.byKey(SetupFlow.passwordKey)).decoration?.hintText, 'Type a password');
+    expect(find.byKey(UnattendedPasswordPanel.makeKey), findsOneWidget);
+    expect(find.text(passwordCopy['make']!), findsOneWidget);
   });
 
   test('no jargon in what the buyer reads', () {
     final banned = RegExp(r'\b(permission|permissions|accessibility api|port|firewall|ip|codec|tcc|daemon|id)\b',
         caseSensitive: false);
-    // "Accessibility" alone is allowed: it is the macOS label the buyer must click.
-    final hits = setupCopy.values.where(banned.hasMatch).toList();
+    // "Accessibility" alone is allowed: it is the macOS label the buyer must click. "Machine ID" is
+    // the one thing a buyer types on the other computer to reach this one (1.8, glossary).
+    final hits = [...setupCopy.values, ...passwordCopy.values]
+        .where((w) => banned.hasMatch(w.replaceAll('Machine ID', '')))
+        .toList();
     expect(hits, isEmpty);
   });
 

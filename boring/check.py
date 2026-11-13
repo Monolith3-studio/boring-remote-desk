@@ -2418,7 +2418,7 @@ PROVE = ("self.pk = pk.map(|k| hex(&k)); self.by_key = None; "
          "let Some(c) = self.pk.as_deref().and_then(|pk| t.by_pk(pk)) else { return };")
 TAKE_WAIT = ("match self.waiting.take() { Some(password_right) => { self.may_remember = password_right && others == 0; "
              "self.may_reinstate = others == 0; true } None => false, }")
-EFFECTIVE = ("let ok = if self.removed_key().is_some() { self.may_reinstate } else { self.may_remember }; "
+EFFECTIVE = ("let ok = if self.must_ask() { self.may_reinstate } else { self.may_remember }; "
              "if how == SignIn::Allowed && !ok { SignIn::ThisSessionOnly } else { how }")
 
 
