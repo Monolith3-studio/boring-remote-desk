@@ -105,6 +105,9 @@ void main() {
       expect(find.text('cut.mov'), findsNWidgets(2));
       expect(find.text('Footage'), findsNWidgets(2));
       expect(find.text('Movies'), findsNWidgets(2)); // location bar, one per pane
+      // The remote pane's drive list (v1.7 t27) polls up to 20 s for the other side's platform,
+      // which never comes here; let that poll run out before the page goes.
+      await tester.pump(const Duration(seconds: 21));
     });
   }
 }
