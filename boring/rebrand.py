@@ -51,7 +51,7 @@ UI_KEYS = [
     "None yet. A computer connecting for the first time needs a click here.",
     # ticket 09: the 1.8.0 first-launch setup screen (flutter/lib/desktop/widgets/password_setup.dart)
     "Set a Permanent password", "Later",
-    "Connecting by Machine ID stays off on this computer until it has a Permanent password. "
+    "Connecting by Machine ID stays off on this computer until it has a password made here with Generate. "
     "Tailscale connections keep working.",
 ]
 MACHINE_ID_LABEL = "Machine ID"  # the Target's ID on its home page (ticket 07, glossary)
@@ -1178,20 +1178,36 @@ PATCHES += [
 ]
 
 # --- 1.8.0 first launch: a Permanent password before Hosted access (ticket 09) --------
-# A Target with no Permanent password registers with no rendezvous server, so the Hosted
-# servers never learn its Machine ID (src/password_lock.rs hosted_servers). The Direct IP
-# listener is spawned before this loop and is never gated: the tailnet keeps working. The loop
-# re-reads the password every pass (CONNECT_TIMEOUT), so setting one turns Hosted on in seconds.
+# A Target without an app-generated Permanent password registers with no rendezvous server, so
+# the Hosted servers never learn its Machine ID (src/password_lock.rs hosted_on: the daemon's
+# marker, set only with a generated password). A 1.7.x typed password keeps the tailnet only. The
+# Direct IP listener is spawned before this loop and is never gated. The loop re-reads the gate
+# every pass (CONNECT_TIMEOUT), so Generate turns Hosted on in seconds; every tick re-reads it too.
 HOSTED_GATE = (
     "                let servers = crate::password_lock::hosted_servers(\n"
     "                    Config::get_rendezvous_servers(),\n"
-    "                    Config::has_permanent_password(),\n"
-    "                ); // boring-remote: no Permanent password, no Hosted servers (ticket 09)\n")
-HOSTED_OFF_ON_REMOVE = (
-    "                        // boring-remote: no Permanent password, no Hosted registration (ticket 09).\n"
-    "                        if updated && !Config::has_permanent_password() {\n"
-    "                            crate::RendezvousMediator::restart();\n"
-    "                        }\n")
+    "                    crate::password_lock::hosted_on(),\n"
+    "                ); // boring-remote: no generated Permanent password, no Hosted servers (ticket 09)\n")
+# Every tick of a live registration (TCP and UDP) re-checks the gate, so a password removed or
+# replaced by any path (IPC, config sync, in-process, file edit) drops the registration.
+_TICK = ("                _ = timer.tick() => {\n"
+         "                    if SHOULD_EXIT.load(Ordering::SeqCst) {\n"
+         "                        break;\n"
+         "                    }\n")
+TICK_EXIT = ("                    if !crate::password_lock::hosted_on() {\n"
+             "                        break; // boring-remote: generated password gone, off Hosted (ticket 09)\n"
+             "                    }\n")
+# The generator's own IPC write: the daemon sets the password and the Hosted marker together.
+GENERATED_ARM = (
+    "                } else if name == crate::password_lock::GENERATED_CONFIG {\n"
+    "                    // boring-remote: an app-generated password turns Hosted on (ticket 09).\n"
+    "                    updated = crate::password_lock::set_generated(&value);\n"
+    "                    let ack = if updated { \"Y\" } else { \"N\" }.to_owned();\n"
+    "                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);\n")
+_PW_ARM = '                } else if name == "permanent-password" {\n'
+CLEAR_MARKER = ("                        if updated {\n"
+                "                            crate::password_lock::clear_generated(); // boring-remote: Hosted off (ticket 09)\n"
+                "                        }\n")
 # The home page asks a Target with no Permanent password to generate one (password_setup.dart).
 SETUP_HOOK = ("    // boring-remote: no Permanent password yet, ask for one (ticket 09).\n"
               "    WidgetsBinding.instance.addPostFrameCallback((_) => showPasswordSetupIfNeeded());\n")
@@ -1199,8 +1215,10 @@ _UNILINKS = "    _uniLinksSubscription = listenUniLinks();\n"
 _SET_PW = "                        updated = Config::set_permanent_password(&value);\n"
 PATCHES += [
     ("src/rendezvous_mediator.rs", "                let servers = Config::get_rendezvous_servers();\n", HOSTED_GATE,
-     "no Hosted registration until a Permanent password is set"),
-    ("src/ipc.rs", _SET_PW, _SET_PW + HOSTED_OFF_ON_REMOVE, "removing the password drops the Hosted registration"),
+     "no Hosted registration until a generated Permanent password is set"),
+    ("src/rendezvous_mediator.rs", _TICK, _TICK + TICK_EXIT, "a live registration ends once the generated password is gone"),
+    ("src/ipc.rs", _PW_ARM, GENERATED_ARM + _PW_ARM, "the generator's password write sets the Hosted marker"),
+    ("src/ipc.rs", _SET_PW, _SET_PW + CLEAR_MARKER, "any other password write clears the Hosted marker"),
     (HOME, "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n",
      "import 'package:flutter_hbb/desktop/widgets/trusted_controllers.dart';\n"
      "import 'package:flutter_hbb/desktop/widgets/password_setup.dart';\n",
