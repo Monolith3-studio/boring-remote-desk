@@ -7,9 +7,21 @@
 //! then the Machine ID through the Hosted servers (RustDesk's punch-through, relay last). A typed
 //! address or tailnet name keeps today's Direct IP path, with no fallback.
 //!
-//! `plan` is pure; the I/O stays in `client.rs` (`boring_tailnet_first`, then upstream's
-//! rendezvous path).
-use std::{collections::HashMap, net::IpAddr};
+//! `plan` is pure; `tailnet_first` dials its tailnet attempt, and `client.rs` calls it with one
+//! thin hook before upstream's rendezvous path.
+use crate::trust_policy::is_tailnet;
+use hbb_common::{
+    anyhow::{anyhow, Error},
+    config::{Config, PeerConfig, RELAY_PORT},
+    log,
+    rendezvous_proto::ConnType,
+    socket_client::connect_tcp_local,
+    Stream,
+};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 
 /// Peer option holding a saved Machine ID's tailnet address.
 pub const TAILNET_OPTION: &str = "boring-tailnet-addr";
@@ -27,7 +39,7 @@ pub enum Attempt {
     /// A typed address or tailnet name: today's Direct IP path, nothing after it.
     DirectIp(String),
     /// A saved Machine ID's tailnet address, Direct IP, for `TAILNET_TIMEOUT_MS`.
-    Tailnet(String),
+    Tailnet(IpAddr),
     /// The Machine ID through the Hosted servers: punch-through first, relay last.
     Hosted(String),
 }
@@ -48,10 +60,6 @@ pub struct Reach {
     pub relay_only: bool,
 }
 
-fn is_tailnet(ip: IpAddr) -> bool {
-    crate::client::boring_is_tailnet(std::net::SocketAddr::new(ip, 0))
-}
-
 /// The attempts, in order. The caller stops at the first that connects.
 pub fn plan(peer: &PeerRecord, reach: Reach) -> Vec<Attempt> {
     if !crate::client::boring_is_machine_id(peer.id) {
@@ -61,11 +69,50 @@ pub fn plan(peer: &PeerRecord, reach: Reach) -> Vec<Attempt> {
     let saved = peer.tailnet.and_then(|a| a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip));
     if let Some(ip) = saved {
         if reach.tailnet_up && !reach.relay_only {
-            attempts.push(Attempt::Tailnet(ip.to_string()));
+            attempts.push(Attempt::Tailnet(ip));
         }
     }
     attempts.push(Attempt::Hosted(peer.id.to_owned()));
     attempts
+}
+
+/// Ticket 08's I/O: Direct IP to a saved Machine ID's tailnet address (`plan`), for
+/// `TAILNET_TIMEOUT_MS`. The stream and the address it reached, only when its local end is a
+/// tailnet address too (it went over WireGuard, not a default route or a SOCKS proxy). None for a
+/// port forward (its verify gate has no tailnet exemption) or when nothing answered: the caller
+/// goes on to the Hosted servers.
+pub async fn tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) -> Option<(Stream, IpAddr)> {
+    if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) || Config::get_socks().is_some() {
+        return None;
+    }
+    let options = PeerConfig::load(peer).options;
+    let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) };
+    let reach = Reach { tailnet_up: own_tailnet_addr().is_some(), relay_only };
+    for attempt in plan(&record, reach) {
+        let Attempt::Tailnet(ip) = attempt else { break };
+        let target = SocketAddr::new(ip, (RELAY_PORT + 1) as u16);
+        match connect_tcp_local(target, None, TAILNET_TIMEOUT_MS).await {
+            Ok(stream) if is_tailnet(stream.local_addr().ip()) => return Some((stream, ip)),
+            Ok(_) => log::warn!("tailnet address answered off the tailnet; trying the Hosted servers"),
+            Err(err) => log::info!("tailnet path didn't answer in time ({err}); trying the Hosted servers"),
+        }
+    }
+    None
+}
+
+/// The Hosted servers' rendezvous connection failed: the plain error naming them.
+pub fn hosted_down(err: Error) -> Error {
+    log::warn!("Hosted servers unreachable: {err}");
+    anyhow!(HOSTED_DOWN)
+}
+
+/// A connection error from the Hosted path, said plainly when it is our relay that failed.
+pub fn hosted_error(err: Error) -> Error {
+    if err.to_string().starts_with("Failed to connect via relay server") {
+        hosted_down(err)
+    } else {
+        err
+    }
 }
 
 /// The stream label the session shows: `TAILNET_STREAM` for a direct path whose local end is a
@@ -144,7 +191,7 @@ mod tests {
     fn tailnet_known_tries_the_tailnet_first_then_the_machine_id() {
         assert_eq!(
             saved(Some("100.101.102.103")),
-            vec![Attempt::Tailnet("100.101.102.103".into()), Attempt::Hosted(ID.into())]
+            vec![Attempt::Tailnet("100.101.102.103".parse().unwrap()), Attempt::Hosted(ID.into())]
         );
     }
 
@@ -185,9 +232,14 @@ mod tests {
     }
 
     #[test]
-    fn hosted_down_error_names_our_servers() {
-        assert!(HOSTED_DOWN.contains("rs.theboringremote.com"));
-        assert!(!HOSTED_DOWN.starts_with("Failed"), "start() would append 'Please try later'");
+    fn hosted_servers_or_relay_unreachable_says_so_naming_our_servers() {
+        let down = hosted_down(anyhow!("Connection refused (os error 61)")).to_string();
+        assert!(down.contains("rs.theboringremote.com"));
+        assert!(!down.starts_with("Failed"), "start() would append 'Please try later'");
+        let relay = hosted_error(anyhow!("Failed to connect via relay server: timed out"));
+        assert_eq!(relay.to_string(), HOSTED_DOWN);
+        // Anything else (wrong password, offline Target) keeps its own text.
+        assert_eq!(hosted_error(anyhow!("Remote desktop is offline")).to_string(), "Remote desktop is offline");
     }
 
     fn remembered(verified: bool, additions: &str) -> Option<String> {

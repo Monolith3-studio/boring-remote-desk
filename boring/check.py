@@ -740,7 +740,7 @@ GATE_KEY = ("crate::trust_policy::login_key(\n                            &lr,\n
 # The login is signed where it is sent, from the stream that carries it (ticket 07).
 SIGN_CALL = ("let challenge = lc.read().unwrap().hash.challenge.clone();\n"
              "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
-             "        let reached = crate::trust_policy::take_tailnet_stream(peer.local_addr());\n"
+             "        let reached = crate::trust_policy::take_reached(&mut lc.write().unwrap().boring_tailnet_stream, peer.local_addr());\n"
              "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), reached);\n    }\n"
              "    allow_err!(peer.send(&msg_out).await);")
 # A Machine ID runs only with the baked key, and an unverified one is refused without a prompt.
@@ -838,12 +838,13 @@ def password_lock_checks(c, locked):
     sessions = (fn_body(lock, "pub fn authed_sessions() -> usize {") or "").strip()
     key = re.search(r'pub const TRUSTED_OPTION: &str = "([^"]+)";', trust)
     guarded = str_array(c, lock, "SECURITY_OPTIONS", {"TRUSTED_OPTION": key and key.group(1)})
-    protected = str_array(c, lock, "PROTECTED_CONFIG")
+    gen_key = (re.search(r'pub const GENERATED_CONFIG: &str = "([^"]+)";', lock) or [None, None])[1]
+    protected = str_array(c, lock, "PROTECTED_CONFIG", {"GENERATED_CONFIG": gen_key})
     need = ("approve-mode", "verification-method", "allow-remote-config-modification", "access-mode", "whitelist")
     c.fact("a remote session can't change the password, PIN or security options",
            all(arms) and ipc.count(rebrand.IPC_GUARD) == 3 and options is not None and "remote_sessions == 0" in guard
            and sessions == "crate::server::AUTHED_CONNS.lock().unwrap().len()"
-           and set(protected) == {"permanent-password", "salt", "unlock-pin"}
+           and set(protected) - {gen_key} == {"permanent-password", "salt", "unlock-pin"}
            and None not in guarded and all(k in guarded for k in need),
            f"guarded arms {[a is not None for a in arms]}, options guard {options is not None}, "
            f"authed_sessions {sessions!r}, unresolved or missing {[k for k in need if k not in guarded]}")
@@ -1048,37 +1049,42 @@ def hosted_signing_checks(c, client, trust, squash):
 
 # Ticket 08, pinned here (not taken from rebrand.py).
 TAILNET_FIRST = (
-    "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {\n"
-    "            return Ok(((stream, true, None, None, \"TCP\"), (0, \"\".to_owned()), false));\n"
+    "        if let Some((stream, reached)) =\n"
+    "            crate::connect_plan::tailnet_first(peer, conn_type, interface.is_force_relay()).await\n"
+    "        {\n"
+    "            interface.get_lch().write().unwrap().boring_tailnet_stream = Some((stream.local_addr(), reached));\n"
+    "            return Ok(((stream, true, None, None, crate::connect_plan::TAILNET_STREAM), (0, \"\".to_owned()), false));\n"
     "        }\n")
-TAILNET_DIAL = ("if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) { return None; } "
+TAILNET_DIAL = ("if matches!(conn_type, ConnType::PORT_FORWARD | ConnType::RDP) || Config::get_socks().is_some() "
+                "{ return None; } "
                 "let options = PeerConfig::load(peer).options; "
                 "let record = PeerRecord { id: peer, tailnet: options.get(TAILNET_OPTION).map(String::as_str) }; "
-                "let reach = Reach { tailnet_up: crate::connect_plan::own_tailnet_addr().is_some(), relay_only }; "
-                "for attempt in plan(&record, reach) { let Attempt::Tailnet(addr) = attempt else { break }; "
-                "let Ok(ip) = addr.parse::<std::net::IpAddr>() else { break }; "
-                "match connect_tcp_local(check_port(&addr, RELAY_PORT + 1), None, TAILNET_TIMEOUT_MS).await { "
-                "Ok(stream) => { crate::trust_policy::note_tailnet_stream(stream.local_addr(), ip); return Some(stream); }")
+                "let reach = Reach { tailnet_up: own_tailnet_addr().is_some(), relay_only }; "
+                "for attempt in plan(&record, reach) { let Attempt::Tailnet(ip) = attempt else { break }; "
+                "let target = SocketAddr::new(ip, (RELAY_PORT + 1) as u16); "
+                "match connect_tcp_local(target, None, TAILNET_TIMEOUT_MS).await { "
+                "Ok(stream) if is_tailnet(stream.local_addr().ip()) => return Some((stream, ip)), "
+                "Ok(_) =>")
 TAILNET_PLAN = ("if !crate::client::boring_is_machine_id(peer.id) { return vec![Attempt::DirectIp(peer.id.to_owned())]; } "
                 "let mut attempts = Vec::new(); "
                 "let saved = peer.tailnet.and_then(|a| a.parse::<IpAddr>().ok()).filter(|ip| is_tailnet(*ip)); "
                 "if let Some(ip) = saved { if reach.tailnet_up && !reach.relay_only { "
-                "attempts.push(Attempt::Tailnet(ip.to_string())); } } "
+                "attempts.push(Attempt::Tailnet(ip)); } } "
                 "attempts.push(Attempt::Hosted(peer.id.to_owned())); attempts")
-TAILNET_EXEMPT = "let is_secured = is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());"
+TAILNET_MARK = "let tailnet_first = stream_type == crate::connect_plan::TAILNET_STREAM;"
+TAILNET_EXEMPT = "let is_secured = is_secured || tailnet_first;"
 REACHED = ("reached .filter(|ip| is_tailnet(*ip) && crate::client::boring_is_machine_id(peer)) "
            ".map(|ip| canonical(ip).to_string())")
-NOTED = ("if !is_tailnet(reached) { return; } let mut streams = TAILNET_STREAMS.lock().unwrap(); "
-         "streams.retain(|(l, _)| *l != local);")
+TAKE_REACHED = ("match *slot { Some((l, ip)) if l == local => { *slot = None; Some(ip) } _ => None, }")
 REMEMBERED = ("crate::connect_plan::save_reported_tailnet(\n                            &self.handler.get_id(),\n"
               "                            peer.is_secured(),\n                            &pi.platform_additions,\n"
               "                        );")
 TAILNET_REMEMBER_IF = "if !verified || !crate::client::boring_is_machine_id(id) {"
 HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
                " connection, or connect by Tailscale name or IP.")
-HOSTED_DOWN_MAP = ("let mut socket = socket.map_err(|err| {\n"
-                   '            log::warn!("Hosted servers unreachable: {err}");\n'
-                   "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n        })?;")
+HOSTED_DOWN_MAP = ("let socket = socket.map_err(crate::connect_plan::hosted_down); "
+                   "// boring-remote: say so, naming them (ticket 08)\n        let mut socket = socket?;")
+HOSTED_RELAY = "let err = crate::connect_plan::hosted_error(err);"
 PATH_LABEL = "let stream_type = crate::connect_plan::stream_label(stream_type, direct, peer.local_addr().ip());"
 
 
@@ -1104,9 +1110,12 @@ def tailnet_first_checks(c):
         why.append("_start doesn't try the tailnet address after the typed-name branch and before the Hosted servers")
     elif strip_tests_and_comments(body[guard:rendezvous]).count("return Ok((") != 2:
         why.append("something else returns between the tailnet attempt and the Hosted servers")
-    dial = squash(fn_body(code, "async fn boring_tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) -> Option<Stream> {"))
-    if TAILNET_DIAL not in dial:
-        why.append(f"boring_tailnet_first isn't Direct IP to the plan's tailnet address only: {dial[:80]!r}")
+    dial = squash(fn_body(plan_code, "pub async fn tailnet_first(peer: &str, conn_type: ConnType, relay_only: bool) "
+                                     "-> Option<(Stream, IpAddr)> {"))
+    if not dial.startswith(TAILNET_DIAL):
+        why.append(f"tailnet_first isn't Direct IP over the tailnet to the plan's tailnet address only: {dial[:80]!r}")
+    if "boring_tailnet_first" in code or "connect_tcp_local" in strip_tests_and_comments(body[first:rendezvous]):
+        why.append("the tailnet attempt isn't a thin hook into connect_plan")
     if squash(fn_body(plan_code, "pub fn plan(peer: &PeerRecord, reach: Reach) -> Vec<Attempt> {")) != TAILNET_PLAN:
         why.append("plan isn't: typed names Direct IP only; a Machine ID's saved tailnet address, then the Hosted servers")
     if "pub const TAILNET_TIMEOUT_MS: u64 = 3_000;" not in plan_code:
@@ -1117,17 +1126,15 @@ def tailnet_first_checks(c):
     why = []
     if squash(fn_body(trust, "pub fn reached_target(peer: &str, reached: Option<IpAddr>) -> Option<String> {")) != REACHED:
         why.append("reached_target signs something other than a Machine ID's tailnet address")
-    if not squash(fn_body(trust, "pub fn note_tailnet_stream(local: SocketAddr, reached: IpAddr) {")).startswith(NOTED):
-        why.append("note_tailnet_stream records a non-tailnet address or more than one entry per stream")
-    if "Some(streams.remove(i).1)" not in (fn_body(trust, "pub fn take_tailnet_stream(local: SocketAddr) -> Option<IpAddr> {") or ""):
-        why.append("the reached address isn't consumed when the login is sent")
-    if code.count("note_tailnet_stream(") != 1 or code.count("take_tailnet_stream(") != 1 \
-            or (code + io_loop).count("is_tailnet_stream(") != 1:
-        why.append("the tailnet-first stream is recorded, read or consumed somewhere else")
-    refuse = io_loop.find(REFUSE_IO)
-    if not 0 <= io_loop.find(TAILNET_EXEMPT) < refuse:
-        why.append("a tailnet-first stream isn't told apart before 07's unverified Machine-ID refusal")
-    if "boring_tailnet_target" in code or "boring_verified_target" in code:
+    if squash(fn_body(trust, "pub fn take_reached(slot: &mut Option<(SocketAddr, IpAddr)>, local: SocketAddr) -> Option<IpAddr> {")) != TAKE_REACHED:
+        why.append("take_reached isn't: only the stream the slot names, and once")
+    if code.count("boring_tailnet_stream =") != 1 or code.count(".boring_tailnet_stream") != 2 \
+            or "TAILNET_STREAMS" in trust or code.count("connect_plan::TAILNET_STREAM)") != 1:
+        why.append("the tailnet-first stream is marked, recorded or read somewhere else")
+    mark, use, refuse = io_loop.find(TAILNET_MARK), io_loop.find(TAILNET_EXEMPT), io_loop.find(REFUSE_IO)
+    if not (0 <= mark < io_loop.find(PATH_LABEL)) or not (0 <= use < refuse) or io_loop.count("tailnet_first") != 2:
+        why.append("the tailnet-first mark isn't the stream type _start returned, or isn't what passes 07's refusal")
+    if "boring_verified_target" in code:
         why.append("a per-session field is back")
     c.fact("a tailnet-first login signs only the address its own stream reached, at send time (ticket 08)",
            not why, "; ".join(why))
@@ -1141,7 +1148,7 @@ def tailnet_first_checks(c):
            0 <= peer_info.find(REMEMBERED) < peer_info.find("self.set_peer_info(&pi);")
            and f"{squash(TAILNET_REMEMBER_IF)} return; }}" in remember
            and save.startswith("if !(secured && crate::client::boring_is_machine_id(id)) { return; }")
-           and plan_code.count("TAILNET_OPTION.to_owned()") == 1 and code.count("TAILNET_OPTION") == 2
+           and plan_code.count("TAILNET_OPTION.to_owned()") == 1 and "TAILNET_OPTION" not in code
            and 0 <= reported < conn.find("pi.platform_additions = serde_json::to_string(&platform_additions)"),
            remember[:80])
 
@@ -1150,7 +1157,9 @@ def tailnet_first_checks(c):
     missing = [p.name for p in langs for k in (HOSTED_DOWN, rebrand.TAILNET_LABEL)
                if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" else 1)]
     c.fact(f"Hosted servers unreachable: a plain error naming {HOSTED} (ticket 08)",
-           HOSTED_DOWN_MAP in inner and "socket?;" not in inner and HOSTED in HOSTED_DOWN
+           HOSTED_DOWN_MAP in inner and inner.count("socket?;") == 1 and HOSTED in HOSTED_DOWN
+           and HOSTED_RELAY in (fn_body(code, "    pub async fn start(\n") or "")
+           and 'starts_with("Failed to connect via relay server")' in plan_code
            and f'pub const HOSTED_DOWN: &str = "{HOSTED_DOWN}";' in plan_code and rebrand.HOSTED_DOWN == HOSTED_DOWN
            and bool(langs) and not missing, ", ".join(missing[:5]))
 
@@ -1388,41 +1397,79 @@ def exposure_checks(c, cfg):
 
 
 def first_launch_checks(c):
-    """Ticket 09: a Target with no Permanent password stays off the Hosted servers (its Machine ID
-    is never registered) while Direct IP over the tailnet keeps working."""
+    """Ticket 09: a Target without an app-generated Permanent password stays off the Hosted servers
+    (its Machine ID is never registered) while Direct IP over the tailnet keeps working."""
     med = c.read("src/rendezvous_mediator.rs")
+    ipc = c.read("src/ipc.rs")
     lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
     body = fn_body(med, "pub async fn start_all() {") or ""
+    flat = lambda sig: re.sub(r"\s+", "", fn_body(lock, sig) or "")
     gate = re.search(r"let servers = crate::password_lock::hosted_servers\(\s*Config::get_rendezvous_servers\(\),"
-                     r"\s*Config::has_permanent_password\(\),\s*\);", body)
-    helper = re.sub(r"\s+", "", fn_body(lock, "pub fn hosted_servers(servers: Vec<String>, password_set: bool)"
-                                            " -> Vec<String> {") or "")
+                     r"\s*crate::password_lock::hosted_on\(\),\s*\);", body)
+    helper = flat("pub fn hosted_servers(servers: Vec<String>, password_set: bool) -> Vec<String> {")
+    ready = flat("pub fn hosted_ready(marker: &str, has_password: bool) -> bool {")
+    on = flat("pub fn hosted_on() -> bool {")
     spawn = re.search(r"let server_cloned = server\.clone\(\);\s*tokio::spawn\(async move \{\s*"
                       r"direct_server\(server_cloned\)\.await;\s*\}\);", body)
     loop = body.find("for host in servers.clone() {")
-    c.fact("no Permanent password, no Hosted servers: the Target registers its Machine ID only once a password "
-           "is set; Direct IP keeps listening (ticket 09)",
+    c.fact("no app-generated Permanent password, no Hosted servers: the Target registers its Machine ID only once "
+           "the generator's marker is set; Direct IP keeps listening (ticket 09)",
            gate is not None and 0 <= gate.end() < loop and body.count("Config::get_rendezvous_servers()") == 1
            and med.count("Self::start(server, host)") == 1 and helper == "ifpassword_set{servers}else{Vec::new()}"
+           and ready == 'marker=="Y"&&has_password'
+           and on == "hosted_ready(&Config::get_option(GENERATED_OPTION),Config::has_permanent_password())"
            and spawn is not None and spawn.start() < body.find("\n        loop {\n"),
-           f"gate {gate is not None}, helper {helper!r}, Direct IP ungated {spawn is not None}")
-    remove = re.search(r"updated = Config::set_permanent_password\(&value\);\s*(?://[^\n]*\s*)?"
-                       r"if updated && !Config::has_permanent_password\(\) \{\s*crate::RendezvousMediator::restart\(\);"
-                       r"\s*\}", c.read("src/ipc.rs"))
-    c.fact("removing the Permanent password drops the Hosted registration (ticket 09)", remove is not None)
+           f"gate {gate is not None}, helper {helper!r}, ready {ready!r}, on {on!r}, Direct IP ungated {spawn is not None}")
+
+    ticks = re.findall(r"_ = timer\.tick\(\) => \{\s*if SHOULD_EXIT\.load\(Ordering::SeqCst\) \{\s*break;\s*\}"
+                       r"\s*if !crate::password_lock::hosted_on\(\) \{\s*break;", med)
+    c.fact("a live Hosted registration ends within a tick once the generated password is gone, whatever removed it "
+           "(ticket 09)", len(ticks) == 2 == med.count("_ = timer.tick() => {"), f"{len(ticks)} of 2 ticks")
+
+    key = re.search(r'pub const GENERATED_CONFIG: &str = "([^"]+)";', lock)
+    opt = re.search(r'pub const GENERATED_OPTION: &str = "([^"]+)";', lock)
+    protected = str_array(c, lock, "PROTECTED_CONFIG", {"GENERATED_CONFIG": key and key.group(1)})
+    arm = re.search(r"\} else if name == crate::password_lock::GENERATED_CONFIG \{\s*(?://[^\n]*\s*)?"
+                    r"updated = crate::password_lock::set_generated\(&value\);\s*let ack = if updated", ipc)
+    clear = re.search(r"updated = Config::set_permanent_password\(&value\);\s*if updated \{\s*"
+                      r"crate::password_lock::clear_generated\(\);", ipc)
+    setgen = fn_body(lock, "pub fn set_generated(password: &str) -> bool {") or ""
+    order = [setgen.find(n) for n in ("if !generated_write_allowed(", "authed_sessions()",
+                                      "Config::is_disable_change_permanent_password()",
+                                      "if !Config::set_permanent_password(password) {",
+                                      "Config::set_option(GENERATED_OPTION.to_owned(), \"Y\".to_owned());")]
+    allowed = flat("pub fn generated_write_allowed(password: &str, remote_sessions: usize, change_disabled: bool) -> bool {")
+    guard = fn_body(lock, "pub fn guard_options(") or ""
+    pinned = guard.find("pin_option(&mut incoming, current, GENERATED_OPTION);")
+    gen = flat("pub fn generate_and_set() -> String {")
+    c.fact("only an app-generated password sets the Hosted marker: the daemon writes it with the password, any other "
+           "password write clears it, and no Options write or remote session sets it (ticket 09)",
+           key and opt and key.group(1) in protected and arm and clear
+           and -1 not in order and order == sorted(order)
+           and allowed == ("!change_disabled&&config_write_allowed(GENERATED_CONFIG,remote_sessions)"
+                           "&&password.len()==LEN&&password.bytes().all(|b|ALPHABET.contains(&b))")
+           and 0 <= pinned < guard.find("if remote_sessions == 0")
+           and "ifsend_generated(pw.clone()){" in gen and "set_permanent_password" not in gen,
+           f"protected {protected}, generated arm {arm is not None}, typed clears {clear is not None}, "
+           f"set_generated order {order}, options pin {pinned}")
 
     home, setup = c.read(rebrand.HOME), c.read("flutter/lib/desktop/widgets/password_setup.dart")
     init = fn_body(home[home.find("class _DesktopHomePageState"):], "void initState() {") or ""
     ask = fn_body(setup, "Future<void> showPasswordSetupIfNeeded() async {") or ""
-    is_set = re.sub(r"\s+", "", fn_body(setup, "Future<bool> permanentPasswordSet() async {") or "")
-    order = [ask.find(s) for s in ("if (await permanentPasswordSet()) return;", "gFFI.dialogManager.show(",
+    is_set = re.sub(r"\s+", "", fn_body(setup, "Future<bool> generatedPasswordSet() async {") or "")
+    dart_opt = re.search(r"const kBoringPasswordGenerated = '([^']+)';", setup)
+    order = [ask.find(s) for s in ("if (await generatedPasswordSet()) return;", "gFFI.dialogManager.show(",
+                                   'if ((await bind.mainGetCommon(key: "permanent-password-set")) == "true") {',
+                                   "final go = await confirmReplacePassword();", "if (go == null) return;",
                                    "final pass = await bind.mainGeneratePermanentPassword();",
                                    "if (pass.isEmpty) {", "close();", "showGeneratedPasswordOnce(pass);")]
-    c.fact("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs the "
-           "generator and shows the password once; never again once one is set (ticket 09)",
+    c.fact("1.8.0 first launch: a Target without an app-generated Permanent password gets the setup screen, which "
+           "runs the generator (asking first if a password is set) and shows it once; never again once one is "
+           "generated (ticket 09)",
            "addPostFrameCallback((_) => showPasswordSetupIfNeeded());" in init
            and "import 'package:flutter_hbb/desktop/widgets/password_setup.dart';" in home
-           and is_set == 'return(awaitbind.mainGetCommon(key:"permanent-password-set"))=="true";'
+           and is_set == "returnbind.mainGetOption(key:kBoringPasswordGenerated)=='Y';"
+           and dart_opt is not None and opt is not None and dart_opt.group(1) == opt.group(1)
            and -1 not in order and order == sorted(order),
            f"hooked {'showPasswordSetupIfNeeded' in init}, set check {is_set!r}, order {order}")
 

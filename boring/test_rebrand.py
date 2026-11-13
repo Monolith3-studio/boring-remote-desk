@@ -1290,8 +1290,8 @@ class RebrandSeam(unittest.TestCase):
 
     def test_no_tailnet_attempt_before_the_hosted_servers_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "        if let Some(stream) = boring_tailnet_first(peer, conn_type, interface.is_force_relay()).await {",
-                  "        if let Some(stream) = None::<Stream> {")
+        self.edit("src/client.rs", "            crate::connect_plan::tailnet_first(peer, conn_type, interface.is_force_relay()).await\n",
+                  "            None::<(Stream, std::net::IpAddr)>\n")
         self.assert_check_fails(self.FIRST)
 
     def test_slow_tailnet_attempt_fails_check(self):
@@ -1312,16 +1312,41 @@ class RebrandSeam(unittest.TestCase):
                   "        let _ = Attempt::DirectIp(peer.id.to_owned());\n")
         self.assert_check_fails(self.FIRST)
 
+    def test_tailnet_attempt_through_a_socks_proxy_fails_check(self):
+        # review S1: through a proxy, whatever the proxy reaches at that 100.x answers.
+        self.rebrand()
+        self.edit("src/connect_plan.rs", " || Config::get_socks().is_some()", "")
+        self.assert_check_fails(self.FIRST)
+
+    def test_tailnet_stream_kept_off_the_tailnet_fails_check(self):
+        # review S1: a SYN that left by the default route (carrier CGNAT, another tailnet) isn't WireGuard.
+        self.rebrand()
+        self.edit("src/connect_plan.rs", "Ok(stream) if is_tailnet(stream.local_addr().ip()) => return Some((stream, ip)),",
+                  "Ok(stream) => return Some((stream, ip)),")
+        self.assert_check_fails(self.FIRST)
+
+    def test_tailnet_dial_injected_into_client_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n",
+                  "        let _ = connect_tcp_local(\"100.64.0.1:21118\", None, 3000).await;\n"
+                  "        let other_server = interface.get_lch().read().unwrap().other_server.clone();\n")
+        self.assert_check_fails(self.FIRST)
+
     def test_reached_address_kept_after_the_login_fails_check(self):
         self.rebrand()
-        self.edit("src/trust_policy.rs", "    Some(streams.remove(i).1)\n", "    Some(streams[i].1)\n")
+        self.edit("src/trust_policy.rs", "            *slot = None;\n", "")
         self.assert_check_fails(self.TAILNET_SIGNED)
 
-    def test_tailnet_stream_read_elsewhere_fails_check(self):
+    def test_reached_address_signed_on_another_stream_fails_check(self):
+        # review S2: the slot counts only for the stream it names.
         self.rebrand()
-        self.edit("src/client.rs", "        let reached = crate::trust_policy::take_tailnet_stream(",
-                  "        let _ = crate::trust_policy::is_tailnet_stream(peer.local_addr());\n"
-                  "        let reached = crate::trust_policy::take_tailnet_stream(")
+        self.edit("src/trust_policy.rs", "        Some((l, ip)) if l == local => {", "        Some((_, ip)) => {")
+        self.assert_check_fails(self.TAILNET_SIGNED)
+
+    def test_tailnet_mark_set_elsewhere_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", '        let mut socket = socket?;\n',
+                  '        let mut socket = socket?;\n        let _ = (crate::connect_plan::TAILNET_STREAM);\n')
         self.assert_check_fails(self.TAILNET_SIGNED)
 
     def test_controller_signing_a_saved_lan_address_fails_check(self):
@@ -1332,8 +1357,7 @@ class RebrandSeam(unittest.TestCase):
 
     def test_every_unverified_machine_id_let_through_fails_check(self):
         self.rebrand()
-        self.edit("src/client/io_loop.rs", "is_secured || crate::trust_policy::is_tailnet_stream(peer.local_addr());",
-                  "true;")
+        self.edit("src/client/io_loop.rs", "let is_secured = is_secured || tailnet_first;", "let is_secured = true;")
         self.assert_check_fails(self.TAILNET_SIGNED)
 
     def test_unverified_session_recording_a_tailnet_address_fails_check(self):
@@ -1349,7 +1373,12 @@ class RebrandSeam(unittest.TestCase):
 
     def test_rendezvous_error_passed_through_fails_check(self):
         self.rebrand()
-        self.edit("src/client.rs", "            anyhow!(crate::connect_plan::HOSTED_DOWN)\n", "            err\n")
+        self.edit("src/client.rs", "        let socket = socket.map_err(crate::connect_plan::hosted_down);", "")
+        self.assert_check_fails(self.DOWN)
+
+    def test_relay_failure_passed_through_fails_check(self):
+        self.rebrand()
+        self.edit("src/client.rs", "                let err = crate::connect_plan::hosted_error(err);", "")
         self.assert_check_fails(self.DOWN)
 
     def test_hosted_down_error_not_naming_our_servers_fails_check(self):
@@ -1367,19 +1396,22 @@ class RebrandSeam(unittest.TestCase):
         self.edit("flutter/lib/common.dart", "  if (streamType == 'Tailnet') {\n", "  if (false) {\n")
         self.assert_check_fails(self.PATH)
     # --- ticket 09: 1.8.0 first launch sets a Permanent password ---------------------
-    HOSTED_GATE = ("no Permanent password, no Hosted servers: the Target registers its Machine ID only once "
-                   "a password is set; Direct IP keeps listening (ticket 09)")
-    HOSTED_OFF_ON_REMOVE = "removing the Permanent password drops the Hosted registration (ticket 09)"
+    HOSTED_GATE = ("no app-generated Permanent password, no Hosted servers: the Target registers its Machine ID "
+                   "only once the generator's marker is set; Direct IP keeps listening (ticket 09)")
+    MARKER = ("only an app-generated password sets the Hosted marker: the daemon writes it with the password, "
+              "any other password write clears it, and no Options write or remote session sets it (ticket 09)")
+    TICK = "a live Hosted registration ends within a tick once the generated password is gone, whatever removed it (ticket 09)"
+    LOCK = "src/password_lock.rs"
 
     def test_hosted_gate_facts_pass_after_rebrand(self):
         self.rebrand()
         r = run(CHECK, self.root)
-        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+        for fact in (self.HOSTED_GATE, self.MARKER, self.TICK):
             self.assertIn(f"PASS {fact}", r.stdout)
 
     def test_hosted_gate_facts_fail_on_clean_upstream_tree(self):
         r = run(CHECK, self.root)
-        for fact in (self.HOSTED_GATE, self.HOSTED_OFF_ON_REMOVE):
+        for fact in (self.HOSTED_GATE, self.MARKER, self.TICK):
             self.assertIn(f"FAIL {fact}", r.stdout)
 
     def test_registering_without_a_password_fails_check(self):
@@ -1387,9 +1419,20 @@ class RebrandSeam(unittest.TestCase):
         self.edit("src/rendezvous_mediator.rs", rebrand.HOSTED_GATE, "                let servers = Config::get_rendezvous_servers();\n")
         self.assert_check_fails(self.HOSTED_GATE)
 
+    def test_gate_on_any_password_fails_check(self):
+        # A 1.7.x typed password must not turn Hosted on (review M1).
+        self.rebrand()
+        self.edit("src/rendezvous_mediator.rs", "crate::password_lock::hosted_on(),", "Config::has_permanent_password(),")
+        self.assert_check_fails(self.HOSTED_GATE)
+
+    def test_gate_ignoring_the_marker_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, '    marker == "Y" && has_password\n', "    has_password\n")
+        self.assert_check_fails(self.HOSTED_GATE)
+
     def test_gate_helper_ignoring_the_password_fails_check(self):
         self.rebrand()
-        self.edit("src/password_lock.rs", "    if password_set {\n", "    if true {\n")
+        self.edit(self.LOCK, "    if password_set {\n", "    if true {\n")
         self.assert_check_fails(self.HOSTED_GATE)
 
     def test_direct_ip_behind_the_password_gate_fails_check(self):
@@ -1400,13 +1443,39 @@ class RebrandSeam(unittest.TestCase):
         self.edit(med, spawn, "        if Config::has_permanent_password() {\n" + spawn + "        }\n")
         self.assert_check_fails(self.HOSTED_GATE)
 
-    def test_password_removal_keeping_the_registration_fails_check(self):
+    def test_registration_kept_after_the_password_goes_fails_check(self):
         self.rebrand()
-        self.edit("src/ipc.rs", rebrand.HOSTED_OFF_ON_REMOVE, "")
-        self.assert_check_fails(self.HOSTED_OFF_ON_REMOVE)
+        self.edit("src/rendezvous_mediator.rs", rebrand.TICK_EXIT, "")
+        self.assert_check_fails(self.TICK)
 
-    SETUP_SCREEN = ("1.8.0 first launch: a Target with no Permanent password gets the setup screen, which runs "
-                    "the generator and shows the password once; never again once one is set (ticket 09)")
+    def test_typed_password_keeping_the_marker_fails_check(self):
+        self.rebrand()
+        self.edit("src/ipc.rs", rebrand.CLEAR_MARKER, "")
+        self.assert_check_fails(self.MARKER)
+
+    def test_marker_writable_during_a_session_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, '&["permanent-password", GENERATED_CONFIG, ', '&["permanent-password", ')
+        self.assert_check_fails(self.MARKER)
+
+    def test_marker_settable_through_options_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, "    pin_option(&mut incoming, current, GENERATED_OPTION);\n", "")
+        self.assert_check_fails(self.MARKER)
+
+    def test_generator_using_the_typed_password_path_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, "send_generated(pw.clone())", "crate::ui_interface::set_permanent_password_with_result(pw.clone())")
+        self.assert_check_fails(self.MARKER)
+
+    def test_daemon_marking_any_password_fails_check(self):
+        self.rebrand()
+        self.edit(self.LOCK, "    if !generated_write_allowed(\n", "    if false && !generated_write_allowed(\n")
+        self.assert_check_fails(self.MARKER)
+
+    SETUP_SCREEN = ("1.8.0 first launch: a Target without an app-generated Permanent password gets the setup screen, "
+                    "which runs the generator (asking first if a password is set) and shows it once; never again "
+                    "once one is generated (ticket 09)")
     SETUP = "flutter/lib/desktop/widgets/password_setup.dart"
 
     def test_setup_screen_fact_passes_after_rebrand(self):
@@ -1421,9 +1490,21 @@ class RebrandSeam(unittest.TestCase):
         self.edit(rebrand.HOME, rebrand.SETUP_HOOK, "")
         self.assert_check_fails(self.SETUP_SCREEN)
 
-    def test_setup_screen_shown_with_a_password_already_set_fails_check(self):
+    def test_setup_screen_shown_with_a_generated_password_fails_check(self):
         self.rebrand()
-        self.edit(self.SETUP, "  if (await permanentPasswordSet()) return;\n", "")
+        self.edit(self.SETUP, "  if (await generatedPasswordSet()) return;\n", "")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_skipped_for_a_typed_password_fails_check(self):
+        # A 1.7.x typed password still gets the screen (review M1).
+        self.rebrand()
+        self.edit(self.SETUP, "  return bind.mainGetOption(key: kBoringPasswordGenerated) == 'Y';\n",
+                  "  return (await bind.mainGetCommon(key: \"permanent-password-set\")) == \"true\";\n")
+        self.assert_check_fails(self.SETUP_SCREEN)
+
+    def test_setup_screen_replacing_a_password_without_asking_fails_check(self):
+        self.rebrand()
+        self.edit(self.SETUP, "        final go = await confirmReplacePassword();\n        if (go == null) return;\n", "")
         self.assert_check_fails(self.SETUP_SCREEN)
 
     def test_setup_screen_not_showing_the_password_once_fails_check(self):

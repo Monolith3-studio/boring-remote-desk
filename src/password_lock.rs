@@ -11,16 +11,21 @@
 //!   Settings window can't loosen them. Out of scope: a Controller that runs its own code as
 //!   the logged-in user can talk to the daemon directly; nothing here stops that.
 //!
-//! - `hosted_servers`: a Target with no permanent password registers with no rendezvous server,
-//!   so the Hosted servers never learn its Machine ID and nobody reaches it by ID (ticket 09).
-//!   Direct IP over the tailnet is a separate listener and keeps working.
+//! - `hosted_servers` / `hosted_on`: a Target registers with the Hosted servers only once it has a
+//!   password this app generated (ticket 09). The daemon sets `GENERATED_OPTION` together with
+//!   that password (`set_generated`, IPC `GENERATED_CONFIG`); any other password write clears it,
+//!   no Options write can set it, and no remote session can send `GENERATED_CONFIG`. A 1.7.x typed
+//!   password keeps the tailnet only. Direct IP is a separate listener and keeps working.
 //!
 //! The decisions are pure; `generate_and_set` and `authed_sessions` are the thin wiring.
 use base::config::keys;
 use hbb_common::{
+    config::Config,
     log,
     rand::{rngs::OsRng, Rng},
 };
+#[cfg(not(target_os = "android"))]
+use hbb_common::tokio;
 use std::collections::HashMap;
 
 /// No 0/O, 1/l/I: safe to read aloud or copy by hand.
@@ -33,7 +38,12 @@ pub const PERMANENT_ONLY: &str = "use-permanent-password";
 pub const LOCK_GONE_ERROR: &str = "Connection not allowed";
 
 /// Config writes (IPC `Data::Config`) refused during a remote session.
-pub const PROTECTED_CONFIG: &[&str] = &["permanent-password", "salt", "unlock-pin"];
+pub const PROTECTED_CONFIG: &[&str] = &["permanent-password", GENERATED_CONFIG, "salt", "unlock-pin"];
+
+/// IPC `Data::Config` name: set this generated password and mark it generated (ticket 09).
+pub const GENERATED_CONFIG: &str = "boring-generated-password";
+/// The daemon's marker: "Y" while the permanent password is one this app generated.
+pub const GENERATED_OPTION: &str = "boring-password-generated";
 
 /// Options (IPC `Data::Options`) a remote session can't change. Locked ones are here too,
 /// in case a lock is ever dropped.
@@ -92,19 +102,63 @@ pub fn guard_options(
     current: &HashMap<String, String>,
     remote_sessions: usize,
 ) -> HashMap<String, String> {
+    pin_option(&mut incoming, current, GENERATED_OPTION);
     if remote_sessions == 0 {
         return incoming;
     }
     for key in SECURITY_OPTIONS {
-        match current.get(*key) {
-            Some(v) => incoming.insert(key.to_string(), v.clone()),
-            None => incoming.remove(*key),
-        };
+        pin_option(&mut incoming, current, key);
     }
     incoming
 }
 
-/// The rendezvous servers to register with: none until a permanent password is set.
+fn pin_option(incoming: &mut HashMap<String, String>, current: &HashMap<String, String>, key: &str) {
+    match current.get(key) {
+        Some(v) => incoming.insert(key.to_string(), v.clone()),
+        None => incoming.remove(key),
+    };
+}
+
+/// True when this Target may register with the Hosted servers: its password is app-generated.
+pub fn hosted_ready(marker: &str, has_password: bool) -> bool {
+    marker == "Y" && has_password
+}
+
+pub fn hosted_on() -> bool {
+    hosted_ready(&Config::get_option(GENERATED_OPTION), Config::has_permanent_password())
+}
+
+/// Whether the daemon takes `password` as a generated one: the generator's shape, changes allowed,
+/// no remote session open.
+pub fn generated_write_allowed(password: &str, remote_sessions: usize, change_disabled: bool) -> bool {
+    !change_disabled
+        && config_write_allowed(GENERATED_CONFIG, remote_sessions)
+        && password.len() == LEN
+        && password.bytes().all(|b| ALPHABET.contains(&b))
+}
+
+/// Daemon side of `GENERATED_CONFIG`: the password and its marker, together.
+pub fn set_generated(password: &str) -> bool {
+    if !generated_write_allowed(
+        password,
+        authed_sessions(),
+        Config::is_disable_change_permanent_password(),
+    ) {
+        return false;
+    }
+    if !Config::set_permanent_password(password) {
+        return false;
+    }
+    Config::set_option(GENERATED_OPTION.to_owned(), "Y".to_owned());
+    true
+}
+
+/// Any other password write (typed, removed, reset by hand): Hosted off until Generate.
+pub fn clear_generated() {
+    Config::set_option(GENERATED_OPTION.to_owned(), String::new());
+}
+
+/// The rendezvous servers to register with: none until `hosted_on`.
 pub fn hosted_servers(servers: Vec<String>, password_set: bool) -> Vec<String> {
     if password_set {
         servers
@@ -122,12 +176,47 @@ pub fn authed_sessions() -> usize {
 /// Empty if the daemon refused it. The password is never logged.
 pub fn generate_and_set() -> String {
     let pw = generate();
-    if crate::ui_interface::set_permanent_password_with_result(pw.clone()) {
+    if send_generated(pw.clone()) {
         pw
     } else {
         log::warn!("generated permanent password refused by the daemon");
         String::new()
     }
+}
+
+/// Hands a generated password to the daemon as `GENERATED_CONFIG` and waits for its ACK.
+#[cfg(not(target_os = "android"))]
+fn send_generated(pw: String) -> bool {
+    match send_generated_async(pw) {
+        Ok(ok) => {
+            if ok {
+                if let Err(e) = crate::ipc::sync_permanent_password_storage_from_daemon() {
+                    log::warn!("permanent password storage sync after generate: {e}");
+                }
+            }
+            ok
+        }
+        Err(e) => {
+            log::warn!("generated permanent password: IPC: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::main(flavor = "current_thread")]
+async fn send_generated_async(pw: String) -> hbb_common::ResultType<bool> {
+    let mut c = crate::ipc::connect(1_000, "").await?;
+    c.send(&crate::ipc::Data::Config((GENERATED_CONFIG.to_owned(), Some(pw)))).await?;
+    if let Some(crate::ipc::Data::Config((name, Some(v)))) = c.next_timeout(1_000).await? {
+        return Ok(name == GENERATED_CONFIG && v.trim() == "Y");
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "android")]
+fn send_generated(pw: String) -> bool {
+    set_generated(&pw)
 }
 
 #[cfg(test)]
@@ -244,5 +333,42 @@ mod tests {
     fn a_password_registers_with_the_hosted_servers() {
         let hosted = vec!["rs.theboringremote.com".to_owned()];
         assert_eq!(hosted_servers(hosted.clone(), true), hosted);
+    }
+
+    #[test]
+    fn hosted_needs_the_generated_marker_and_a_password() {
+        assert!(hosted_ready("Y", true));
+        assert!(!hosted_ready("", true), "a 1.7.x typed password keeps Hosted off");
+        assert!(!hosted_ready("Y", false), "marker left behind with no password");
+        assert!(!hosted_ready("N", true));
+    }
+
+    #[test]
+    fn daemon_marks_only_a_generator_shaped_password_with_no_session() {
+        let pw = generate();
+        assert!(generated_write_allowed(&pw, 0, false));
+        assert!(!generated_write_allowed(&pw, 1, false), "remote session open");
+        assert!(!generated_write_allowed(&pw, 0, true), "changes disabled");
+        assert!(!generated_write_allowed("hunter2", 0, false));
+        assert!(!generated_write_allowed("ABCDEFGHJKLMNPQRSTU0", 0, false), "0 is not in the alphabet");
+        assert!(!generated_write_allowed(&format!("{pw}A"), 0, false));
+    }
+
+    #[test]
+    fn generated_password_write_refused_during_a_session() {
+        assert!(PROTECTED_CONFIG.contains(&GENERATED_CONFIG));
+        assert!(!config_write_allowed(GENERATED_CONFIG, 1));
+    }
+
+    #[test]
+    fn options_write_never_sets_or_clears_the_marker() {
+        let none = HashMap::new();
+        let forged = map(&[(GENERATED_OPTION, "Y"), ("theme", "dark")]);
+        let out = guard_options(forged, &none, 0);
+        assert_eq!(out.get(GENERATED_OPTION), None);
+        assert_eq!(out.get("theme").map(String::as_str), Some("dark"));
+        let current = map(&[(GENERATED_OPTION, "Y")]);
+        let out = guard_options(HashMap::new(), &current, 0);
+        assert_eq!(out.get(GENERATED_OPTION).map(String::as_str), Some("Y"));
     }
 }
