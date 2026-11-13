@@ -956,6 +956,10 @@ PATCHES += [
      "the Target shows its Machine ID"),
     ("src/server/connection.rs", _PW_OK, TRUST_GATE + _PW_OK,
      "unknown Controller waits for a click after the right password"),
+    # the gate reads &lr after upstream's match moves fields out of lr.union (E0382)
+    ("src/server/connection.rs", "            match lr.union {\n",
+     "            match lr.union.clone() { // boring-remote: lr stays whole for the trust gate\n",
+     "login request stays whole for the trust gate"),
     ("src/server/connection.rs", _AUTHORIZE,
      _AUTHORIZE.replace("                            conn.set_conn_audit", ACCEPT_GATE
                         + "                            conn.set_conn_audit", 1),
