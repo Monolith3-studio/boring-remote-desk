@@ -2538,6 +2538,7 @@ def review_v18_checks(c):
             "link.filter(|id| crate::client::boring_is_machine_id(id)).map(str::to_owned)"):
         why.append("signed_target")
     if "crate::trust_policy::link_target(&lc.read().unwrap().boring_link_ids, peer.local_addr());" not in client \
+            or "crate::trust_policy::sign_login(lr, &challenge, peer.is_secured(), link);" not in client \
             or client.count("crate::trust_policy::note_link(&mut interface.get_lch().write().unwrap().boring_link_ids, stream.local_addr(), who);") != 2 \
             or "pub boring_link_ids: Vec<(std::net::SocketAddr, String)>," not in client:
         why.append("a Direct Link's verified Target ID doesn't reach its login")

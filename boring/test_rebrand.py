@@ -1833,7 +1833,9 @@ class RebrandSeam(unittest.TestCase):
         facts = (check.REVIEW_M1, check.REVIEW_S1, check.REVIEW_S2, check.REVIEW_S3, check.REVIEW_S4,
                  check.REVIEW_S6, check.REVIEW_S7)
         r = run(CHECK, self.root)
-        for fact in facts:
+        # S1, S3 and S7 live in our own files (base::trust, direct_link, connect_plan), there on a raw
+        # checkout too; the rest need rebrand's hooks.
+        for fact in (check.REVIEW_M1, check.REVIEW_S2, check.REVIEW_S4, check.REVIEW_S6):
             self.assertIn(f"FAIL {fact}", r.stdout)
         self.rebrand()
         r = run(CHECK, self.root)
