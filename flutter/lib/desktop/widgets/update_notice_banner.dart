@@ -182,15 +182,11 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
         margin: const EdgeInsets.only(top: 20),
         padding: const EdgeInsets.all(20),
         color: Theme.of(context).colorScheme.primary,
-        child: Row(children: [
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Expanded(
               child: Text("That update didn't take. You're still on $v.",
                   style: TextStyle(color: onFill, fontSize: 14))),
-          IconButton(
-            tooltip: 'Dismiss',
-            icon: Icon(Icons.close, color: onFill, size: 18),
-            onPressed: () => setState(() => _dismissed = v),
-          ),
+          _dismiss(onFill, v),
         ]),
       );
     }
@@ -201,52 +197,61 @@ class _UpdateNoticeBannerState extends State<UpdateNoticeBanner> {
       margin: const EdgeInsets.only(top: 20),
       padding: const EdgeInsets.all(20),
       color: Theme.of(context).colorScheme.primary,
-      child: Row(children: [
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Boring Remote $v is out.',
+      // The home page's left pane is 200 px wide: the words get the full width and
+      // the buttons go underneath, or a Row squeezes the text to one letter per line.
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(
+            child: Text('Boring Remote $v is out.',
                 style: TextStyle(color: onFill, fontSize: 14)),
-            if (_error != null)
-              Text(_error!, style: TextStyle(color: onFill, fontSize: 13)),
-            if (showKeyField) ...[
-              Text('Have your License key? Paste it here to install.',
-                  style: TextStyle(color: onFill, fontSize: 13)),
-              Material(
-                color: Theme.of(context).colorScheme.surface,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  child: LicenseKeyField(
-                    initialKey: '',
-                    setKey: (k) async {
-                      final s = await widget.setKey!(k);
-                      if (s == 'valid' && mounted) setState(() => _keyOk = true);
-                      return s;
-                    },
-                  ),
-                ),
+          ),
+          // Below the Minimum version the notice can't be dismissed.
+          if (!n.belowMin) _dismiss(onFill, v),
+        ]),
+        if (_error != null)
+          Text(_error!, style: TextStyle(color: onFill, fontSize: 13)),
+        if (showKeyField) ...[
+          Text('Have your License key? Paste it here to install.',
+              style: TextStyle(color: onFill, fontSize: 13)),
+          Material(
+            color: Theme.of(context).colorScheme.surface,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: LicenseKeyField(
+                initialKey: '',
+                setKey: (k) async {
+                  final s = await widget.setKey!(k);
+                  if (s == 'valid' && mounted) setState(() => _keyOk = true);
+                  return s;
+                },
               ),
-            ],
-          ]),
+            ),
+          ),
+        ],
+        Align(
+          alignment: Alignment.centerLeft,
+          child: canInstall
+              ? TextButton(
+                  onPressed: (_live || _installing) ? null : _install,
+                  child: Text(_live ? 'Finish your session to update' : 'Install update',
+                      style: TextStyle(color: onFill)),
+                )
+              : TextButton(
+                  onPressed: () => widget.openUrl(Uri.parse(kBoringUpdatePageUrl)),
+                  child: Text('Get update', style: TextStyle(color: onFill)),
+                ),
         ),
-        if (canInstall)
-          TextButton(
-            onPressed: (_live || _installing) ? null : _install,
-            child: Text(_live ? 'Finish your session to update' : 'Install update',
-                style: TextStyle(color: onFill)),
-          )
-        else
-          TextButton(
-            onPressed: () => widget.openUrl(Uri.parse(kBoringUpdatePageUrl)),
-            child: Text('Get update', style: TextStyle(color: onFill)),
-          ),
-        // Below the Minimum version the notice can't be dismissed.
-        if (!n.belowMin)
-          IconButton(
-            tooltip: 'Dismiss',
-            icon: Icon(Icons.close, color: onFill, size: 18),
-            onPressed: () => setState(() => _dismissed = v),
-          ),
       ]),
     );
   }
+
+  // A compact close button: a full 48 px IconButton takes a quarter of the pane.
+  Widget _dismiss(Color color, String v) => IconButton(
+        tooltip: 'Dismiss',
+        visualDensity: VisualDensity.compact,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+        icon: Icon(Icons.close, color: color, size: 18),
+        onPressed: () => setState(() => _dismissed = v),
+      );
 }

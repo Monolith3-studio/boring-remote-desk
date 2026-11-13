@@ -17,6 +17,27 @@
 //! whatever the approve mode (connection.rs, rebrand T04_ALWAYS_ASK and its gate). It stays
 //! Trusted and keeps its token, so switching off gives back the silent way in. Only Settings on
 //! this Mac changes the switch; nothing a Controller sends does.
+//!
+//! 1.8.0 (Hosted servers, ADR 0005; ticket 06, trust binding option B), on the same one list:
+//!
+//! - The Controller's own key. A 1.8 Controller signs each login with its persistent Ed25519 key
+//!   (the one it signs its ID with as a Target) over [`login_message`]: this connection's
+//!   challenge, the Target's Machine ID and its own ID. It signs only over a stream whose Target
+//!   it verified (a Direct Link pinned to that Machine ID, or the Hosted servers' word under the
+//!   baked server key); the Target takes its own Machine ID as the signed name only on a keyed
+//!   stream (src/trust_policy.rs). Allow stores that key (`pk`) with the entry, next to the token
+//!   when there is one. On the Hosted path there is no token exchange: the key is what finds the
+//!   entry ([`Admission::prove`]). A Machine ID, name or hwid alone never does.
+//! - A new Controller needs Allow on this computer even with the right Unattended Password
+//!   (spec stories 13 and 16): the password alone no longer stores or lets in a stranger. Allow
+//!   stores it only when its password checked out and no other session is open (the click could
+//!   come from a Controller driving this computer). No password set here: Allow lets it in for
+//!   that session only.
+//! - A Trusted Controller found by its key still gives the Unattended Password (Hosted is open to
+//!   anyone who has a Machine ID); one found by its token on a Direct Link comes in silently, as
+//!   in 1.7.
+//! - Remove ends that Controller's live sessions. While any session is open, Settings can only
+//!   tighten the list (Remove, Always ask on), never loosen it ([`edit_in_session`]).
 
 use crate::message_proto::{message, Message, PublicKey};
 use hbb_common::{
@@ -25,12 +46,13 @@ use hbb_common::{
     password_security::{decrypt_str_or_original, encrypt_str_or_original, symmetric_crypt},
     protobuf::Message as _,
     serde_json,
-    sodiumoxide::{base64, crypto::hash::sha256, randombytes::randombytes, utils::memcmp},
+    sodiumoxide::{base64, crypto::hash::sha256, crypto::sign, randombytes::randombytes, utils::memcmp},
     ResultType, Stream,
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    convert::TryInto,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
@@ -76,6 +98,19 @@ pub(crate) fn parse_or_default<T: Default + serde::de::DeserializeOwned>(json: &
     }
 }
 
+/// What the pre-port 1.8.0 build wrote to the same option: `id:hex-key`, comma separated (never
+/// released). Read as no Trusted Controllers, so each of those Controllers is asked once more.
+fn is_pre_port_list(raw: &str) -> bool {
+    let raw = raw.trim();
+    !raw.starts_with('[')
+        && raw.split(',').all(|e| {
+            let (id, key) = e.split_once(':').unwrap_or((e, ""));
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && (key.is_empty() || key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+}
+
 fn digest(token: &[u8]) -> Vec<u8> {
     sha256::hash(token).0.to_vec()
 }
@@ -104,7 +139,15 @@ pub struct TrustedController {
     /// a list with none switched on is byte for byte what 1.7.0 wrote and reads.
     #[serde(default, skip_serializing_if = "is_false")]
     pub always_ask: bool,
+    /// 1.8: the Controller's own Ed25519 public key (hex), proven by its signed login when it was
+    /// let in. Absent on every 1.7 entry and never written empty, so a 1.7 list saves unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pk: String,
 }
+
+/// `key` of an entry stored with no token (let in over the Hosted path, where there is no token
+/// exchange): this prefix plus its `pk`. Never hex, so no token can ever match it ([`Trusted::check`]).
+pub const PK_KEY_PREFIX: &str = "pk:";
 
 /// The Target's Trusted Controllers (Settings → Advanced → Trusted Controllers lists and removes).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,7 +166,7 @@ impl Trusted {
     /// For writing: unset is an empty list, unreadable is None, so it is never written over
     /// (a list rebuilt from nothing would drop every entry's switch).
     pub fn parse_strict(json: &str) -> Option<Self> {
-        if json.trim().is_empty() {
+        if json.trim().is_empty() || is_pre_port_list(json) {
             return Some(Self::default());
         }
         serde_json::from_str(json).ok().map(|list| Trusted { list, ..Default::default() })
@@ -163,8 +206,8 @@ impl Trusted {
         hit
     }
 
-    fn add(&mut self, key: &[u8], name: &str) {
-        let key = hex(key);
+    fn add(&mut self, key: &str, name: &str, pk: &str) {
+        let key = key.to_owned();
         // A Controller that dropped its token (Forget, a reinstall) comes back as a stranger. If
         // it uses the name of one switched to always ask, it is stored switched on too. A name is
         // self-reported, so it never lets anyone in (ADR 0005); here it can only take away. With
@@ -172,7 +215,30 @@ impl Trusted {
         let always_ask =
             self.new_always_ask || !name.is_empty() && self.list.iter().any(|t| t.always_ask && t.name == name);
         self.list.retain(|t| t.key != key);
-        self.list.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false, always_ask });
+        self.list.push(TrustedController { key, name: name.to_owned(), added: now(), removed: false, always_ask, pk: pk.to_owned() });
+    }
+
+    /// The entry holding the Controller key `pk` (hex), removed or not. One key, one entry.
+    pub fn by_pk(&self, pk: &str) -> Option<&TrustedController> {
+        if pk.len() != 64 {
+            return None;
+        }
+        self.list.iter().find(|c| c.pk == pk)
+    }
+
+    /// A 1.7 entry (token only) whose Controller now proved its own key: store the key with it,
+    /// once. Never over another key, and never a key another entry already holds.
+    fn bind_pk(&mut self, key: &str, pk: &str) -> bool {
+        if pk.len() != 64 || self.list.iter().any(|c| c.pk == pk) {
+            return false;
+        }
+        match self.list.iter_mut().find(|c| c.key == key && c.pk.is_empty()) {
+            Some(c) => {
+                c.pk = pk.to_owned();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Settings' "Always ask for password" for the listed Controller with `key` (a removed one has
@@ -198,6 +264,16 @@ impl Trusted {
             }
             None => false,
         }
+    }
+
+    /// Reset password's "Also remove every Trusted Controller": all of them, as Remove does.
+    pub fn remove_all(&mut self) -> bool {
+        let mut any = false;
+        for t in self.list.iter_mut().filter(|t| !t.removed) {
+            t.removed = true;
+            any = true;
+        }
+        any
     }
 
     /// Allow on this Mac for a removed Controller: its token is Trusted again (still always ask,
@@ -228,7 +304,8 @@ pub enum SignIn {
 
 /// What the Target learned in the exchange: already Trusted, Trusted but always asked for the
 /// password (its name), removed from Trusted Controllers (its key), or the hash of the token it
-/// just issued, waiting for approval.
+/// just issued, waiting for approval. 1.8: and what the Controller's proven key found
+/// ([`Admission::prove`]), whether this login waits on Allow here, and what Allow may store.
 #[derive(Debug, Clone, Default)]
 pub struct Admission {
     trusted: Option<String>,
@@ -244,6 +321,26 @@ pub struct Admission {
     seen_edits: u64,
     /// This sign-in stored it switched on (review M-new): it stays, see [`Admission::approve_into`].
     stays: bool,
+    /// 1.8: the Controller key this login proved (hex), and the entry it found with no token.
+    pk: Option<String>,
+    by_key: Option<ByKey>,
+    /// 1.8: waiting on Allow here; `true` when the Unattended Password checked out first.
+    waiting: Option<bool>,
+    /// 1.8, set when Allow lands ([`Admission::take_wait`]): Allow may store a new Controller (its
+    /// password was right and no other session is open) / may trust a removed one again.
+    may_remember: bool,
+    may_reinstate: bool,
+}
+
+/// 1.8: what a proven Controller key found on the list, when no token said who this is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ByKey {
+    /// Listed: in with the Unattended Password, no Allow needed. Its name and key.
+    Trusted(String, String),
+    /// Listed, "Always ask for password": the Unattended Password and nothing else.
+    AlwaysAsk(String, String),
+    /// Removed: waits for Allow here, whatever password it brings. Its key.
+    Removed(String),
 }
 
 /// Settings edits saved so far in this process; a live session looks at the list again only
@@ -294,15 +391,17 @@ pub struct AskInfo {
 
 impl Admission {
     /// For the ask: "trusted", "removed" or "new", and the key prefix (empty when trusted, or
-    /// when no exchange ran).
+    /// when no exchange ran and no key was proven).
     pub fn ask_info(&self, ip: &str) -> AskInfo {
         let prefix = |k: &str| k.get(..KEY_PREFIX_LEN).unwrap_or(k).to_owned();
-        let (trust, key) = if self.trusted.is_some() || self.always_ask.is_some() {
+        let (trust, key) = if self.trusted.is_some() || self.always_ask() || self.skips_click() {
             ("trusted", String::new())
-        } else if let Some(k) = &self.removed {
+        } else if let Some(k) = self.removed_key() {
             ("removed", prefix(k))
+        } else if let Some(d) = self.pending.as_deref() {
+            ("new", prefix(&hex(d)))
         } else {
-            ("new", self.pending.as_deref().map(|d| prefix(&hex(d))).unwrap_or_default())
+            ("new", self.pk.as_deref().map(|pk| prefix(&format!("{PK_KEY_PREFIX}{pk}"))).unwrap_or_default())
         };
         AskInfo { boring_trust: trust.to_owned(), boring_key: key, boring_ip: ip.to_owned() }
     }
@@ -312,16 +411,60 @@ impl Admission {
         self.trusted.is_some()
     }
 
-    /// Presented a token this Mac issued and then removed: the session waits for Allow here,
-    /// whatever password it brings (src/server/connection.rs, rebrand T04_TRUSTED_SKIP).
+    /// Presented a token this Mac issued and then removed, or (1.8) proved the key of a removed
+    /// entry: the session waits for Allow here, whatever password it brings (src/server/connection.rs,
+    /// rebrand T04_TRUSTED_SKIP).
     pub fn must_ask(&self) -> bool {
-        self.removed.is_some()
+        self.removed_key().is_some()
     }
 
-    /// Presented a token this Mac trusts, switched to always ask: it gets in by the Unattended
-    /// Password and nothing else (src/server/connection.rs, rebrand T04_ALWAYS_ASK).
+    fn removed_key(&self) -> Option<&str> {
+        match &self.by_key {
+            Some(ByKey::Removed(k)) if self.removed.is_none() => Some(k),
+            _ => self.removed.as_deref(),
+        }
+    }
+
+    /// Presented a token this Mac trusts, switched to always ask, or (1.8) proved such an entry's
+    /// key: it gets in by the Unattended Password and nothing else (src/server/connection.rs,
+    /// rebrand T04_ALWAYS_ASK).
     pub fn always_ask(&self) -> bool {
-        self.always_ask.is_some()
+        self.always_ask.is_some() || matches!(self.by_key, Some(ByKey::AlwaysAsk(..)))
+    }
+
+    /// 1.8: a Trusted Controller found by its proven key (no token): once its Unattended Password
+    /// checks out it is in with no Allow here (rebrand TRUST_GATE). Never for a key alone.
+    pub fn skips_click(&self) -> bool {
+        matches!(self.by_key, Some(ByKey::Trusted(..)))
+    }
+
+    /// 1.8, on each login request: `pk` is the Controller key this login proved (src/trust_policy.rs
+    /// `login_key`, None for no or a bad signature). With no token deciding who this is, the key
+    /// finds its entry: listed, always ask, or removed. A token's verdict always stands; the key
+    /// only rides along with it, to be stored once ([`Admission::approve`]).
+    pub fn prove(&mut self, pk: Option<[u8; 32]>, t: &Trusted) {
+        self.pk = pk.map(|k| hex(&k));
+        self.by_key = None;
+        if self.trusted.is_some() || self.always_ask.is_some() || self.removed.is_some() {
+            return;
+        }
+        let Some(c) = self.pk.as_deref().and_then(|pk| t.by_pk(pk)) else { return };
+        self.by_key = Some(if c.removed {
+            ByKey::Removed(c.key.clone())
+        } else if c.always_ask {
+            ByKey::AlwaysAsk(c.name.clone(), c.key.clone())
+        } else {
+            ByKey::Trusted(c.name.clone(), c.key.clone())
+        });
+    }
+
+    /// The Trusted Controllers key this session is matched on while it runs: its token's entry,
+    /// the one its key found, or the one Allow just stored.
+    fn session_key(&self) -> Option<&str> {
+        self.key.as_deref().or(match &self.by_key {
+            Some(ByKey::Trusted(_, k)) | Some(ByKey::AlwaysAsk(_, k)) => Some(k.as_str()),
+            _ => None,
+        })
     }
 
     /// connection.rs: this session gave this Mac's Unattended Password (not a one-time code).
@@ -329,19 +472,47 @@ impl Admission {
         self.password_right = true;
     }
 
+    /// 1.8: this login now waits on Allow here (`password_right`: its Unattended Password checked
+    /// out first, so Allow may store it). connection.rs (rebrand) at every ask it shows.
+    pub fn wait_for_allow(&mut self, password_right: bool) {
+        self.waiting = Some(password_right);
+    }
+
+    /// 1.8: whether this connection is waiting on Allow (a new login request on it then ends it,
+    /// so a click can't land on a different login than the one the ask showed).
+    pub fn waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+
+    /// 1.8: Allow landed (the connection window's Authorize). True only for a login that waits
+    /// on it; it stops waiting. `others`: authorised sessions open right now. With another one
+    /// open the click could come from a Controller driving this computer, so it lets this one in
+    /// but stores nothing.
+    pub fn take_wait(&mut self, others: usize) -> bool {
+        match self.waiting.take() {
+            Some(password_right) => {
+                self.may_remember = password_right && others == 0;
+                self.may_reinstate = others == 0;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The last word before any sign-in lets this session in (rebrand T04_ALWAYS_ASK_GATE): no for
     /// an always-ask Controller that has not given the Unattended Password, whatever got it this
     /// far (a click, switch sides, a sign-in path upstream adds later). Yes for everyone else.
     pub fn may_let_in(&self) -> bool {
-        self.always_ask.is_none() || self.password_right
+        !self.always_ask() || self.password_right
     }
 
     /// connection.rs, once a second while the session runs (rebrand T04_ALWAYS_ASK_KICK): true
     /// once Settings switched this Controller to always ask after it got in without the
-    /// Unattended Password, so the session ends now. Reads the list only after an edit.
+    /// Unattended Password, or (1.8) removed it, so the session ends now. Reads the list only
+    /// after an edit.
     pub fn lost_trust(&mut self) -> bool {
         let edits = EDITS.load(Ordering::Acquire);
-        if self.key.is_none() || edits == self.seen_edits {
+        if self.session_key().is_none() || edits == self.seen_edits {
             return false;
         }
         self.seen_edits = edits;
@@ -349,22 +520,48 @@ impl Admission {
     }
 
     fn lost_trust_in(&self, t: &Trusted) -> bool {
-        let Some(key) = self.key.as_deref() else { return false };
-        !self.password_right && !self.stays && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)
+        let Some(key) = self.session_key() else { return false };
+        t.list.iter().any(|c| c.key == key && (c.removed || !self.password_right && !self.stays && c.always_ask))
     }
 
-    /// The session got in. If someone clicked Allow here or the Unattended Password was right,
-    /// the token just issued becomes Trusted under `name`; any other sign-in leaves it worthless.
+    /// What `how` may store (1.8): a new Controller only by Allow after its Unattended Password
+    /// checked out, with no other session open; a removed one only by Allow with no other session
+    /// open. Anything else lets this session in and stores nothing.
+    fn effective(&self, how: SignIn) -> SignIn {
+        let ok = if self.removed_key().is_some() { self.may_reinstate } else { self.may_remember };
+        if how == SignIn::Allowed && !ok {
+            SignIn::ThisSessionOnly
+        } else {
+            how
+        }
+    }
+
+    /// The session got in. If someone clicked Allow here (after the right password, 1.8), the
+    /// token just issued and the key just proven become Trusted under `name`; any other sign-in
+    /// leaves them worthless. A token-trusted Controller that proved its key gets it stored.
     pub fn approve(&mut self, how: SignIn, name: &str) {
         if self.trusted.is_some() {
+            if let (Some(key), Some(pk)) = (self.key.clone(), self.pk.clone()) {
+                if let Ok(true) = edit_list(|t| {
+                    let bound = t.bind_pk(&key, &pk);
+                    Ok((bound, bound))
+                }) {
+                    hbb_common::log::info!("Direct Link: Trusted Controller {:?} proved its own key; stored", name);
+                }
+            }
             hbb_common::log::info!("Direct Link: Trusted Controller {:?} came straight in", name);
             return;
         }
-        if self.always_ask.is_some() {
-            hbb_common::log::info!("Direct Link: Trusted Controller {:?} gave the Unattended Password (always ask)", name);
+        if self.always_ask() {
+            hbb_common::log::info!("Trusted Controller {:?} gave the Unattended Password (always ask)", name);
             return;
         }
-        let was_removed = self.removed.is_some();
+        if self.skips_click() {
+            hbb_common::log::info!("Trusted Controller {:?} proved its key and gave the Unattended Password", name);
+            return;
+        }
+        let was_removed = self.must_ask();
+        let how = self.effective(how);
         // Under the edit lock, on the list as it is now; an unreadable list is not written over,
         // so this one stays out of it (asked again next time) and the log says why.
         let stored = match edit_list(|t| {
@@ -373,12 +570,12 @@ impl Admission {
         }) {
             Ok(stored) => stored,
             Err(e) => {
-                hbb_common::log::warn!("Direct Link: {:?} not stored as Trusted: {}", name, e);
+                hbb_common::log::warn!("{:?} not stored as Trusted: {}", name, e);
                 false
             }
         };
         hbb_common::log::info!(
-            "Direct Link: {:?} got in by {:?}{}; Trusted now: {}",
+            "{:?} got in by {:?}{}; Trusted now: {}",
             name,
             how,
             if was_removed { " after being removed" } else { "" },
@@ -389,28 +586,39 @@ impl Admission {
     fn approve_into(&mut self, t: &mut Trusted, how: SignIn, name: &str) -> bool {
         // Always ask: its entry stays exactly as Settings left it, and no token is issued, so no
         // sign-in can make it come in silently again.
-        if self.always_ask.is_some() {
+        if self.always_ask() {
             return false;
         }
         // A removed Controller is Trusted again only by Allow here, never by a password.
-        if let Some(key) = self.removed.as_ref() {
+        if let Some(key) = self.removed_key().map(str::to_owned) {
             if how != SignIn::Allowed {
                 return false;
             }
-            let ok = t.reinstate(key, name);
-            self.key = self.removed.take();
+            let ok = t.reinstate(&key, name);
+            if let Some(pk) = self.pk.as_deref() {
+                t.bind_pk(&key, pk);
+            }
+            self.removed = None;
+            self.by_key = None;
+            self.key = Some(key);
             self.stored_as_always_ask(t, name);
             return ok;
         }
-        match self.pending.take() {
-            Some(key) if how != SignIn::ThisSessionOnly => {
-                t.add(&key, name);
-                self.key = Some(hex(&key));
-                self.stored_as_always_ask(t, name);
-                true
-            }
-            _ => false,
+        // 1.8: only Allow here stores a new Controller; the password alone lets nobody new in.
+        if how != SignIn::Allowed {
+            self.pending = None;
+            return false;
         }
+        let pk = self.pk.clone().filter(|pk| t.by_pk(pk).is_none()).unwrap_or_default();
+        let key = match self.pending.take() {
+            Some(d) => hex(&d),
+            None if !pk.is_empty() => format!("{PK_KEY_PREFIX}{pk}"),
+            None => return false,
+        };
+        t.add(&key, name, &pk);
+        self.key = Some(key);
+        self.stored_as_always_ask(t, name);
+        true
     }
 
     /// Stored switched on by this very sign-in (New computers always ask, the name of one switched
@@ -433,6 +641,8 @@ impl Admission {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Edit {
     Remove { key: String },
+    /// 1.8: Reset password's "Also remove every Trusted Controller".
+    RemoveAll,
     Allow { key: String },
     /// On needs this Mac's Unattended Password, typed by whoever is at this Mac (H1, see [`edit`]).
     AlwaysAsk {
@@ -451,10 +661,14 @@ pub const WRONG_PASSWORD: &str = "That isn't this computer's Unattended Password
 pub const NO_PASSWORD_SET: &str = "Set an Unattended Password on this computer first.";
 pub const SALT_FAILED: &str = "The Unattended Password couldn't be updated, so nothing was changed.";
 pub const NO_SERVICE: &str = "Boring Remote's background service didn't answer, so nothing was changed.";
+/// 1.8: a change that lets more in (Allow, Always ask off) while someone is connected: the click
+/// could be theirs (they drive this computer's screen).
+pub const IN_SESSION: &str = "Someone is connected to this computer right now. Try again after they disconnect.";
 
 /// `edit` applied to the list as stored now (`raw`): the new list, and whether turning always
-/// ask on means the password's salt has to turn over first. Nothing here is saved.
-fn plan_edit(raw: &str, edit: &Edit) -> Result<(Trusted, bool), &'static str> {
+/// ask on means the password's salt has to turn over first. Nothing here is saved. `sessions`:
+/// authorised sessions open right now; with any open, only edits that let fewer in go through.
+fn plan_edit(raw: &str, edit: &Edit, sessions: usize) -> Result<(Trusted, bool), &'static str> {
     let mut t = Trusted::parse_strict(raw).ok_or(UNREADABLE)?;
     let listed = |t: &Trusted, key: &str| t.list.iter().any(|c| c.key == key && !c.removed);
     let rotate = match edit {
@@ -464,6 +678,11 @@ fn plan_edit(raw: &str, edit: &Edit) -> Result<(Trusted, bool), &'static str> {
             }
             false
         }
+        Edit::RemoveAll => {
+            t.remove_all();
+            false
+        }
+        Edit::Allow { .. } if sessions > 0 => return Err(IN_SESSION),
         Edit::Allow { key } => {
             let name = t.list.iter().find(|c| c.key == *key && c.removed).map(|c| c.name.clone());
             match name {
@@ -477,6 +696,9 @@ fn plan_edit(raw: &str, edit: &Edit) -> Result<(Trusted, bool), &'static str> {
                 return Err(NOT_ON_LIST);
             }
             let was = t.list.iter().any(|c| c.key == *key && c.always_ask);
+            if !*on && was && sessions > 0 {
+                return Err(IN_SESSION);
+            }
             if *on && !was && password.is_empty() {
                 return Err(NEED_PASSWORD);
             }
@@ -552,13 +774,20 @@ fn edit_list<R>(f: impl FnOnce(&mut Trusted) -> Result<(R, bool), &'static str>)
     Ok(r)
 }
 
-/// The service's answer to Settings' edit `request` (JSON [`Edit`]): `{"ok":true}`, or
-/// `{"ok":false,"error":...}` with nothing changed. src/ipc.rs calls it (rebrand T04_EDIT_IPC).
+/// The service's answer to Settings' edit `request` (JSON [`Edit`]) with no session open (the
+/// one-process mobile path).
 pub fn edit(request: &str) -> String {
+    edit_in_session(request, 0)
+}
+
+/// The service's answer to Settings' edit `request` (JSON [`Edit`]): `{"ok":true}`, or
+/// `{"ok":false,"error":...}` with nothing changed. src/ipc.rs calls it with the authorised
+/// sessions open now (rebrand T04_EDIT_IPC): while any is, only edits that let fewer in apply.
+pub fn edit_in_session(request: &str, sessions: usize) -> String {
     let result = match serde_json::from_str::<Edit>(request) {
         Err(_) => Err(UNREADABLE),
         Ok(edit) => edit_list(|t| {
-            let (planned, rotate) = plan_edit(&t.to_json(), &edit)?;
+            let (planned, rotate) = plan_edit(&t.to_json(), &edit, sessions)?;
             if rotate {
                 if let Edit::AlwaysAsk { password, .. } = &edit {
                     rotate_salt(password)?;
@@ -592,6 +821,46 @@ fn keep_live(options: &mut HashMap<String, String>, live: &str) {
     } else {
         options.insert(TRUSTED_OPTION.to_owned(), live.to_owned());
     }
+}
+
+// --- 1.8: the Controller's signed login (ticket 06, trust binding option B) -----------------
+
+/// Leads every signed login. The leading zero byte is never a valid protobuf tag, so a signed
+/// login can't be read as a `SignedId` (`IdPk`), which the same key signs as a Target.
+const LOGIN_DOMAIN: &[u8] = b"\0boring-remote trusted Controller login v1\0";
+
+/// The bytes a Controller signs: the domain, then the Target's challenge, the Target's Machine ID
+/// and its own ID, each length-prefixed. None for a challenge no Target makes (they are short
+/// alphanumeric strings): the Target picks the challenge, so the Controller signs nothing else.
+pub fn login_message(challenge: &str, target: &str, controller: &str) -> Option<Vec<u8>> {
+    let challenge_ok =
+        !challenge.is_empty() && challenge.len() <= 64 && challenge.bytes().all(|b| b.is_ascii_alphanumeric());
+    if !challenge_ok {
+        return None;
+    }
+    let mut m = LOGIN_DOMAIN.to_vec();
+    for part in [challenge, target, controller] {
+        m.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        m.extend_from_slice(part.as_bytes());
+    }
+    Some(m)
+}
+
+/// The Controller's signature over this login, from its secret key. None without a usable key
+/// or challenge.
+pub fn login_signature(challenge: &str, target: &str, controller: &str, sk: &[u8]) -> Option<Vec<u8>> {
+    let sk = sign::SecretKey(sk.try_into().ok()?);
+    Some(sign::sign(&login_message(challenge, target, controller)?, &sk))
+}
+
+/// The pure verifier: `pk`, if `sig` is its signature over this login (`challenge`, `target`,
+/// `controller`). None for no signature (a 1.7 Controller), a bad one, or one made for another
+/// challenge, Target or Controller ID.
+pub fn proven_key(controller: &str, pk: &[u8], sig: &[u8], challenge: &str, target: &str) -> Option<[u8; 32]> {
+    let key: [u8; 32] = pk.try_into().ok()?;
+    let want = login_message(challenge, target, controller)?;
+    let signed = sign::verify(sig, &sign::PublicKey(key)).ok()?;
+    (signed == want).then_some(key)
 }
 
 fn frame(token: &[u8]) -> Message {
@@ -766,7 +1035,7 @@ mod tests {
     async fn removing_a_trusted_controller_revokes_its_token() {
         let mut trusted = Trusted::default();
         let (mut a, issued) = connect(&trusted, None).await;
-        a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left");
+        a.approve_into(&mut trusted, SignIn::Allowed, "Stage Left");
         let key = trusted.list()[0].key.clone();
         assert!(trusted.remove(&key));
         let (again, _) = connect(&trusted, issued).await;
@@ -840,12 +1109,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_controller_is_not_forced_to_the_ask() {
-        // ADR 0005 unchanged for strangers: the Unattended Password still works and trusts.
+    async fn the_password_alone_never_stores_a_new_controller() {
+        // 1.8 (spec stories 13, 16): a stranger with the right Unattended Password still needs
+        // Allow here; the password lets nobody new in and stores nothing.
         let mut trusted = Trusted::default();
-        let (mut a, _) = connect(&trusted, None).await;
-        assert!(!a.must_ask());
-        assert!(a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left"));
+        let (mut a, issued) = connect(&trusted, None).await;
+        assert!(!a.must_ask() && !a.skips_click());
+        assert!(!a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left"));
+        assert!(trusted.list().is_empty());
+        let (b, _) = connect(&trusted, issued).await;
+        assert!(!b.is_trusted(), "its token is worth nothing");
     }
 
     #[tokio::test]
@@ -961,12 +1234,12 @@ mod tests {
         let (mut trusted, _, _) = always_ask_controller().await;
         let (mut back, _) = connect(&trusted, None).await;
         assert!(!back.always_ask() && !back.is_trusted());
-        assert!(back.approve_into(&mut trusted, SignIn::UnattendedPassword, "Edit Bay 2"));
+        assert!(back.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2"));
         assert_eq!(trusted.list().len(), 2);
         assert!(trusted.list().iter().all(|c| c.always_ask), "the new entry is switched on too");
 
         let (mut other, _) = connect(&trusted, None).await;
-        assert!(other.approve_into(&mut trusted, SignIn::UnattendedPassword, "Stage Left"));
+        assert!(other.approve_into(&mut trusted, SignIn::Allowed, "Stage Left"));
         assert!(!trusted.list().iter().find(|c| c.name == "Stage Left").unwrap().always_ask);
         let (mut nameless, _) = connect(&trusted, None).await;
         assert!(nameless.approve_into(&mut trusted, SignIn::Allowed, ""));
@@ -1001,7 +1274,7 @@ mod tests {
         // switch on it starts asking; off (the default) it comes in silently next time, as 1.7.0.
         let mut trusted = Trusted { new_always_ask: true, ..Default::default() };
         let (mut a, _) = connect(&trusted, None).await;
-        assert!(a.approve_into(&mut trusted, SignIn::UnattendedPassword, "Renamed Laptop"));
+        assert!(a.approve_into(&mut trusted, SignIn::Allowed, "Renamed Laptop"));
         assert!(trusted.list()[0].always_ask);
         let mut trusted = Trusted::default();
         let (mut b, _) = connect(&trusted, None).await;
@@ -1016,25 +1289,25 @@ mod tests {
     #[test]
     fn settings_edits_apply_to_the_list_as_it_is_now() {
         let raw = TRUST_FILE_1_7_0; // aa11 listed, bb22 removed
-        let (t, rotate) = plan_edit(raw, &always_ask("aa11", true, "pw")).unwrap();
+        let (t, rotate) = plan_edit(raw, &always_ask("aa11", true, "pw"), 0).unwrap();
         assert!(rotate, "on: the salt turns over, so every saved password stops working");
         assert!(t.list()[0].always_ask);
-        let (again, rotate) = plan_edit(&t.to_json(), &always_ask("aa11", true, "pw")).unwrap();
+        let (again, rotate) = plan_edit(&t.to_json(), &always_ask("aa11", true, "pw"), 0).unwrap();
         assert!(!rotate && again == t, "already on: nothing to do");
-        let (t, rotate) = plan_edit(&t.to_json(), &always_ask("aa11", false, "")).unwrap();
+        let (t, rotate) = plan_edit(&t.to_json(), &always_ask("aa11", false, ""), 0).unwrap();
         assert!(!rotate);
         assert_eq!(t.to_json(), TRUST_FILE_1_7_0, "off: back to what 1.7.0 wrote");
-        assert_eq!(plan_edit(raw, &always_ask("aa11", true, "")).unwrap_err(), NEED_PASSWORD);
-        assert_eq!(plan_edit(raw, &always_ask("bb22", true, "pw")).unwrap_err(), NOT_ON_LIST, "removed: no switch");
-        assert_eq!(plan_edit(raw, &always_ask("cc33", false, "")).unwrap_err(), NOT_ON_LIST);
+        assert_eq!(plan_edit(raw, &always_ask("aa11", true, ""), 0).unwrap_err(), NEED_PASSWORD);
+        assert_eq!(plan_edit(raw, &always_ask("bb22", true, "pw"), 0).unwrap_err(), NOT_ON_LIST, "removed: no switch");
+        assert_eq!(plan_edit(raw, &always_ask("cc33", false, ""), 0).unwrap_err(), NOT_ON_LIST);
 
-        let (t, _) = plan_edit(raw, &Edit::Remove { key: "aa11".into() }).unwrap();
+        let (t, _) = plan_edit(raw, &Edit::Remove { key: "aa11".into() }, 0).unwrap();
         assert!(t.list().is_empty());
         assert!(t.list.iter().find(|c| c.key == "aa11").unwrap().removed, "kept, hidden (A2 step 5)");
-        assert_eq!(plan_edit(raw, &Edit::Remove { key: "bb22".into() }).unwrap_err(), NOT_ON_LIST);
-        let (t, _) = plan_edit(raw, &Edit::Allow { key: "bb22".into() }).unwrap();
+        assert_eq!(plan_edit(raw, &Edit::Remove { key: "bb22".into() }, 0).unwrap_err(), NOT_ON_LIST);
+        let (t, _) = plan_edit(raw, &Edit::Allow { key: "bb22".into() }, 0).unwrap();
         assert_eq!(t.list().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Edit Bay 2", "Stage Left"]);
-        assert_eq!(plan_edit(raw, &Edit::Allow { key: "aa11".into() }).unwrap_err(), NOT_ON_LIST);
+        assert_eq!(plan_edit(raw, &Edit::Allow { key: "aa11".into() }, 0).unwrap_err(), NOT_ON_LIST);
 
         // What Settings sends (kit/trust.dart trustEdit).
         let sent = r#"{"op":"always_ask","key":"aa11","on":true,"password":"pw"}"#;
@@ -1046,11 +1319,11 @@ mod tests {
     fn an_unreadable_list_is_never_written_over() {
         for bad in ["not json", "{}", r#"[{"key":1}]"#] {
             assert_eq!(Trusted::parse_strict(bad), None, "{}", bad);
-            assert_eq!(plan_edit(bad, &Edit::Remove { key: "aa11".into() }).unwrap_err(), UNREADABLE, "{}", bad);
-            assert_eq!(plan_edit(bad, &always_ask("aa11", false, "")).unwrap_err(), UNREADABLE, "{}", bad);
+            assert_eq!(plan_edit(bad, &Edit::Remove { key: "aa11".into() }, 0).unwrap_err(), UNREADABLE, "{}", bad);
+            assert_eq!(plan_edit(bad, &always_ask("aa11", false, ""), 0).unwrap_err(), UNREADABLE, "{}", bad);
         }
         assert_eq!(Trusted::parse_strict(""), Some(Trusted::default()), "unset is an empty list");
-        assert_eq!(plan_edit("", &Edit::Remove { key: "aa11".into() }).unwrap_err(), NOT_ON_LIST);
+        assert_eq!(plan_edit("", &Edit::Remove { key: "aa11".into() }, 0).unwrap_err(), NOT_ON_LIST);
     }
 
     #[test]
@@ -1107,7 +1380,7 @@ mod tests {
     /// tells the Controller to keep no password, so the next connect has to type it.
     #[tokio::test]
     async fn a_session_stored_as_always_ask_stays_and_its_controller_keeps_no_password() {
-        for how in [SignIn::Allowed, SignIn::UnattendedPassword] {
+        for how in [SignIn::Allowed] {
             let mut t = Trusted { new_always_ask: true, ..Default::default() };
             let (mut a, _) = connect(&t, None).await;
             assert!(!a.always_ask(), "{:?}", how);
@@ -1119,7 +1392,7 @@ mod tests {
         // By name.
         let (mut t, _, _) = always_ask_controller().await;
         let (mut back, _) = connect(&t, None).await;
-        assert!(back.approve_into(&mut t, SignIn::UnattendedPassword, "Edit Bay 2"));
+        assert!(back.approve_into(&mut t, SignIn::Allowed, "Edit Bay 2"));
         assert!(back.always_ask() && !back.lost_trust_in(&t));
         // Allow on a removed one that was on.
         let (mut t, token, key) = always_ask_controller().await;
@@ -1153,5 +1426,183 @@ mod tests {
         assert_eq!(tokens.get("987654321"), None);
         tokens.forget("123456789");
         assert_eq!(tokens.get("123456789"), None);
+    }
+
+    // --- 1.8: the Controller's own key on the same Trusted list (ticket 06, option B) -------
+
+    fn keypair() -> (Vec<u8>, [u8; 32]) {
+        let (pk, sk) = sign::gen_keypair();
+        (sk.0.to_vec(), pk.0)
+    }
+
+    /// A login as a 1.8 Controller signs it: this challenge, the Target's Machine ID, its own ID.
+    fn signed(sk: &[u8], pk: &[u8; 32], challenge: &str, target: &str, me: &str) -> Option<[u8; 32]> {
+        let sig = login_signature(challenge, target, me, sk).unwrap();
+        proven_key(me, pk, &sig, challenge, target)
+    }
+
+    #[test]
+    fn a_signed_login_proves_its_key_only_for_this_challenge_target_and_controller() {
+        let (sk, pk) = keypair();
+        let sig = login_signature("Ab3dE9", "123456789", "987654321", &sk).unwrap();
+        assert_eq!(proven_key("987654321", &pk, &sig, "Ab3dE9", "123456789"), Some(pk));
+        for (me, ch, target) in [("111", "Ab3dE9", "123456789"), ("987654321", "Zz9", "123456789"),
+                                 ("987654321", "Ab3dE9", "555555555")] {
+            assert_eq!(proven_key(me, &pk, &sig, ch, target), None, "{} {} {}", me, ch, target);
+        }
+        let (_, other) = keypair();
+        assert_eq!(proven_key("987654321", &other, &sig, "Ab3dE9", "123456789"), None, "another key");
+        assert_eq!(proven_key("987654321", &pk, b"", "Ab3dE9", "123456789"), None, "no signature (1.7)");
+        assert_eq!(login_message("", "1", "2"), None);
+        assert_eq!(login_message("no spaces", "1", "2"), None, "a challenge no Target makes");
+        // Never readable as a SignedId: a zero byte leads it.
+        assert_eq!(login_message("a", "b", "c").unwrap()[0], 0);
+    }
+
+    #[tokio::test]
+    async fn hosted_new_controller_is_stored_by_its_key_on_allow_and_found_by_it_next_time() {
+        let (sk, pk) = keypair();
+        let mut t = Trusted::default();
+        let mut a = Admission::default(); // Hosted: no token exchange
+        a.prove(signed(&sk, &pk, "c1", "123", "9"), &t);
+        assert!(!a.skips_click() && !a.must_ask() && !a.always_ask());
+        assert_eq!(a.ask_info("").boring_key, format!("{PK_KEY_PREFIX}{}", hex(&pk))[..KEY_PREFIX_LEN]);
+        assert!(a.approve_into(&mut t, SignIn::Allowed, "Laptop"));
+        let c = &t.list()[0];
+        assert_eq!((c.key.as_str(), c.pk.as_str()), (format!("{PK_KEY_PREFIX}{}", hex(&pk)).as_str(), hex(&pk).as_str()));
+        assert!(t.check(&[0u8; 32]).is_none() && unhex(&c.key).is_none(), "no token matches a key entry");
+
+        let t = Trusted::parse(&t.to_json());
+        let mut b = Admission::default();
+        b.prove(signed(&sk, &pk, "c2", "123", "9"), &t);
+        assert!(b.skips_click(), "its key, proven again: no Allow needed once the password checks out");
+        assert!(!b.is_trusted(), "never the silent token way in");
+        assert_eq!(b.ask_info("").boring_trust, "trusted");
+        // Another Controller claiming the same ID with its own key is a stranger.
+        let (sk2, pk2) = keypair();
+        let mut c = Admission::default();
+        c.prove(signed(&sk2, &pk2, "c3", "123", "9"), &t);
+        assert!(!c.skips_click());
+        // No signature, or none at all: a stranger.
+        let mut d = Admission::default();
+        d.prove(None, &t);
+        assert!(!d.skips_click());
+    }
+
+    #[tokio::test]
+    async fn allow_stores_only_after_the_right_password_with_no_other_session_open() {
+        let (sk, pk) = keypair();
+        for (password_right, others, stored) in [(true, 0, true), (false, 0, false), (true, 1, false)] {
+            let mut a = Admission::default();
+            a.prove(signed(&sk, &pk, "c1", "123", "9"), &Trusted::default());
+            a.wait_for_allow(password_right);
+            assert!(a.waiting());
+            assert!(a.take_wait(others));
+            assert!(!a.waiting() && !a.take_wait(others), "one Allow per ask");
+            let mut t = Trusted::default();
+            assert_eq!(a.approve_into(&mut t, a.effective(SignIn::Allowed), "Laptop"), stored,
+                       "password {} others {}", password_right, others);
+            assert_eq!(t.list().len(), stored as usize);
+        }
+        // Allow that nothing waits on is no Allow.
+        assert!(!Admission::default().take_wait(0));
+    }
+
+    #[tokio::test]
+    async fn a_proven_key_finds_always_ask_and_removed_entries_too() {
+        let (sk, pk) = keypair();
+        let mut t = Trusted::default();
+        let mut a = Admission::default();
+        a.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        a.approve_into(&mut t, SignIn::Allowed, "Laptop");
+        let key = t.list()[0].key.clone();
+        t.set_always_ask(&key, true);
+        let mut b = Admission::default();
+        b.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        assert!(b.always_ask() && !b.skips_click() && !b.may_let_in());
+        b.unattended_password_right();
+        assert!(b.may_let_in());
+        assert!(!b.approve_into(&mut t.clone(), SignIn::Allowed, "x"), "always ask: nothing stored");
+
+        t.set_always_ask(&key, false);
+        t.remove(&key);
+        let mut c = Admission::default();
+        c.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        assert!(c.must_ask() && !c.skips_click());
+        assert_eq!(c.ask_info("").boring_trust, "removed");
+        assert!(!c.approve_into(&mut t, SignIn::UnattendedPassword, "Laptop"), "the password does not undo Remove");
+        c.wait_for_allow(false);
+        c.take_wait(1);
+        assert_eq!(c.effective(SignIn::Allowed), SignIn::ThisSessionOnly, "another session open: not reinstated");
+        c.wait_for_allow(false);
+        c.take_wait(0);
+        assert!(c.approve_into(&mut t, c.effective(SignIn::Allowed), "Laptop"));
+        assert_eq!(t.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_token_decides_and_its_controller_key_is_stored_with_it_once() {
+        let (sk, pk) = keypair();
+        let mut trusted = Trusted::default();
+        let (mut a, issued) = connect(&trusted, None).await;
+        a.prove(signed(&sk, &pk, "c", "1", "9"), &trusted);
+        assert!(a.approve_into(&mut trusted, SignIn::Allowed, "Edit Bay 2"));
+        assert_eq!(trusted.list()[0].pk, hex(&pk), "Allow over a Direct Link stores token and key together");
+
+        // A 1.7 entry (token only): the token decides; the key it proves is stored once.
+        let mut t17 = Trusted::default();
+        let (mut b, token) = connect(&t17, None).await;
+        b.approve_into(&mut t17, SignIn::Allowed, "Old Mac");
+        assert!(t17.list()[0].pk.is_empty());
+        let key = t17.list()[0].key.clone();
+        let (mut c, _) = connect(&t17, token.clone()).await;
+        c.prove(signed(&sk, &pk, "c", "1", "9"), &t17);
+        assert!(c.is_trusted() && !c.skips_click(), "the token's verdict stands");
+        assert!(t17.bind_pk(&key, &hex(&pk)));
+        let (_, pk2) = keypair();
+        assert!(!t17.bind_pk(&key, &hex(&pk2)), "never over another key");
+        assert!(!trusted.bind_pk(&trusted.list()[0].key.clone(), &hex(&pk)), "already stored");
+        let _ = issued;
+    }
+
+    #[tokio::test]
+    async fn remove_ends_that_controllers_session() {
+        let (sk, pk) = keypair();
+        let mut t = Trusted::default();
+        let mut a = Admission::default();
+        a.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        a.approve_into(&mut t, SignIn::Allowed, "Laptop");
+        let key = t.list()[0].key.clone();
+        let mut b = Admission::default();
+        b.prove(signed(&sk, &pk, "c", "1", "9"), &t);
+        b.unattended_password_right();
+        assert!(!b.lost_trust_in(&t));
+        t.remove(&key);
+        assert!(b.lost_trust_in(&t), "removed while connected, password or not: ended");
+        assert!(a.lost_trust_in(&t), "the session that was just stored too");
+    }
+
+    #[test]
+    fn while_someone_is_connected_settings_only_tightens_the_list() {
+        let raw = TRUST_FILE_1_7_0; // aa11 listed, bb22 removed
+        assert_eq!(plan_edit(raw, &Edit::Allow { key: "bb22".into() }, 1).unwrap_err(), IN_SESSION);
+        assert!(plan_edit(raw, &Edit::Remove { key: "aa11".into() }, 1).is_ok());
+        assert!(plan_edit(raw, &always_ask("aa11", true, "pw"), 1).is_ok());
+        let (on, _) = plan_edit(raw, &always_ask("aa11", true, "pw"), 0).unwrap();
+        assert_eq!(plan_edit(&on.to_json(), &always_ask("aa11", false, ""), 1).unwrap_err(), IN_SESSION);
+        let (all, _) = plan_edit(raw, &Edit::RemoveAll, 1).unwrap();
+        assert!(all.list().is_empty());
+        assert_eq!(serde_json::from_str::<Edit>(r#"{"op":"remove_all"}"#).unwrap(), Edit::RemoveAll);
+    }
+
+    #[test]
+    fn a_1_7_list_with_keys_reads_in_1_7_and_the_pre_port_list_is_asked_again() {
+        // What 1.8 writes for a token entry with its key: 1.7.1 ignores the unknown field.
+        let with_pk = r#"[{"key":"aa11","name":"Edit Bay 2","added":1761955200,"pk":"00"}]"#;
+        assert_eq!(Trusted::parse(with_pk).list()[0].pk, "00");
+        assert_eq!(Trusted::parse(TRUST_FILE_1_7_0).to_json(), TRUST_FILE_1_7_0, "no key: nothing written");
+        let pre = format!("123456789:{},987654321", "ab".repeat(32));
+        assert_eq!(Trusted::parse_strict(&pre), Some(Trusted::default()));
+        assert_eq!(Trusted::parse_strict("not json"), None, "anything else stays unreadable");
     }
 }

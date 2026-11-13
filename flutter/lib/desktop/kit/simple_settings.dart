@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'kit.dart';
+import 'password.dart';
 
 /// Where a buyer gets Boring Remote for another computer (ticket 15).
 const kDownloadUrl = 'https://theboringremote.com/download';
@@ -18,20 +19,17 @@ class SettingsLink {
 /// passes data and callbacks.
 class SimpleSettings extends StatefulWidget {
   static const nameKey = Key('simple-settings-name');
-  static const passwordKey = Key('simple-settings-password');
-
-  /// Same rule as the full settings' password dialog. A blank or default password never ships (ADR 0002).
-  static bool strongEnough(String p) =>
-      p.length >= 8 &&
-      p.contains(RegExp(r'[0-9]')) &&
-      p.contains(RegExp(r'[A-Z]')) &&
-      p.contains(RegExp(r'[a-z]'));
 
   final String macName;
   final Future<void> Function(String name) onRename;
 
+  /// The Unattended Password (1.8 ticket 05): Boring Remote makes it (kit/password.dart). Set now,
+  /// made here (Hosted access on), the service's generator, and Replace's "remove every Trusted
+  /// Controller" (null hides it). A blank or default password never ships (ADR 0002).
   final bool passwordSet;
-  final Future<bool> Function(String password) setPassword;
+  final bool passwordGenerated;
+  final Future<String> Function() generatePassword;
+  final Future<void> Function()? removeTrusted;
 
   /// Other computers can get in: the service runs (v1.7 t17: its own switch, never tied to login).
   final bool remoteAccess;
@@ -67,7 +65,9 @@ class SimpleSettings extends StatefulWidget {
     required this.macName,
     required this.onRename,
     required this.passwordSet,
-    required this.setPassword,
+    this.passwordGenerated = false,
+    required this.generatePassword,
+    this.removeTrusted,
     required this.remoteAccess,
     required this.onRemoteAccess,
     this.openAtLogin,
@@ -88,10 +88,7 @@ class SimpleSettings extends StatefulWidget {
 
 class _SimpleSettingsState extends State<SimpleSettings> {
   late final _name = TextEditingController(text: widget.macName);
-  final _password = TextEditingController();
-  bool _editingPassword = false;
-  bool? _savedPassword; // set once a save here succeeds, until the page passes a new passwordSet
-  String? _passwordError;
+  bool? _savedPassword; // set once a password made here is saved, until the page passes a new passwordSet
   bool _confirmStop = false; // remote access off: say what it stops before it does
   bool? _openAtLogin; // what this page last set, until the page passes a new value
   bool _linkCopied = false;
@@ -106,28 +103,7 @@ class _SimpleSettingsState extends State<SimpleSettings> {
   @override
   void dispose() {
     _name.dispose();
-    _password.dispose();
     super.dispose();
-  }
-
-  Future<void> _savePassword() async {
-    final p = _password.text;
-    if (!SimpleSettings.strongEnough(p)) {
-      setState(() => _passwordError = 'At least 8 characters, with a capital, a small letter and a number.');
-      return;
-    }
-    final ok = await widget.setPassword(p);
-    if (!mounted) return;
-    setState(() {
-      if (ok) {
-        _password.clear();
-        _editingPassword = false;
-        _savedPassword = true;
-        _passwordError = null;
-      } else {
-        _passwordError = "Couldn't save that password. Try again.";
-      }
-    });
   }
 
   Widget _passwordSection(TextTheme t) {
@@ -141,38 +117,13 @@ class _SimpleSettingsState extends State<SimpleSettings> {
             ? 'Set. Your other computers can get in with it when no one is here.'
             : 'Not set. Someone has to be at this ${KitWords.one} to click Allow each time.'),
         const SizedBox(height: Kit.s2),
-        if (!_editingPassword)
-          OutlinedButton(
-            onPressed: () => setState(() => _editingPassword = true),
-            child: Text(isSet ? 'Change password' : 'Set password'),
-          )
-        else ...[
-          TextField(
-            key: SimpleSettings.passwordKey,
-            controller: _password,
-            obscureText: true,
-            autofocus: true,
-            decoration: const InputDecoration(hintText: 'Type a new password'),
-            onSubmitted: (_) => _savePassword(),
-          ),
-          if (_passwordError != null) ...[
-            const SizedBox(height: Kit.s2),
-            Text(_passwordError!, style: t.bodySmall),
-          ],
-          const SizedBox(height: Kit.s2),
-          Row(children: [
-            OutlinedButton(onPressed: _savePassword, child: const Text('Save password')),
-            const SizedBox(width: Kit.s2),
-            TextButton(
-              onPressed: () => setState(() {
-                _password.clear();
-                _editingPassword = false;
-                _passwordError = null;
-              }),
-              child: const Text('Cancel'),
-            ),
-          ]),
-        ],
+        UnattendedPasswordPanel(
+          passwordSet: isSet,
+          generated: _savedPassword == true || widget.passwordGenerated,
+          generate: widget.generatePassword,
+          removeTrusted: widget.removeTrusted,
+          onSaved: () => setState(() => _savedPassword = true),
+        ),
       ],
     );
   }

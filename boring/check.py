@@ -4,16 +4,21 @@
 Usage:  python3 boring/check.py [ROOT]
 
 Reads the tree after boring/rebrand.py has run and asserts what the spec asks
-for: name, bundle IDs, empty servers, Direct IP on, tailnet + private-LAN whitelist (ADR 0003), listener
-on all interfaces, allow-only-conn-window-open available and off, sync / NAT
-test / updater unreachable, LAN discovery on (ADR 0003) (ADR 0004: only the version file, its .sig and fulfillment /update), no RustDesk public server named in shipped code,
-no hwcodec/vram in any build invocation, Mac build with file copy-paste, the
-Windows MSI (name, exe, art sizes, license, icon, no RustDesk text, release on
-tags), no RustDesk name, link or logo a person sees on Mac or Windows (strings,
-translations, app metadata, every logo slot; AGPL notices in the Legal dialog, license and source link), that
-the connect box takes an IP or a tailnet name and never reaches the ID/rendezvous
-path, and that the protocol files are upstream's. It only reads the tree.
-Idempotence is proved by test_rebrand.py and the CI clean-diff step.
+for: name, bundle IDs, the Hosted servers as the only servers with every override forced to
+them, their key baked in from boring/server-key.pub (ADR 0005), no global whitelist (the Direct
+Link listener answers Tailscale and private LAN only, ADR 0003), Direct IP on, listener on all
+interfaces, allow-only-conn-window-open available and off, sync / NAT test / updater unreachable,
+LAN discovery on (ADR 0003) (ADR 0004: only the version file, its .sig and fulfillment /update),
+no RustDesk public server named in shipped code, no GitHub Actions workflow, no hwcodec/vram in
+any build invocation, Mac build with file copy-paste, the Windows MSI (name, exe, art sizes,
+license, icon, no RustDesk text), no RustDesk name, link or logo a person sees on Mac or Windows
+(strings, translations, app metadata, every logo slot; AGPL notices in the Legal dialog, license
+and source link), that the connect box takes a name or IP as a Direct Link only and lets only a
+Machine ID reach the Hosted servers (after its own pinned Direct Link), that the Target shows its
+Machine ID, that the protocol files are upstream's plus our two LoginRequest fields, that a Target
+without a generated Unattended Password stays off the Hosted servers and Setup asks for one, and
+that the Update keeps 1.7.x's config (ticket 09). It only reads the tree.
+Idempotence is proved by test_rebrand.py and build-mac's second-run step.
 
 Prints one PASS/FAIL line per fact, then
     rebrand check: <n> passed, <m> failed
@@ -43,6 +48,28 @@ LINK_LOGS = [
     ("flutter/lib/main.dart", 'debugPrint("launch args: $args");'),
 ]
 PUBLIC_SERVER = re.compile(r"\b(?:rs-[a-z0-9-]+|api|admin)\.rustdesk\.com\b")
+# ADR 0005, pinned here (not taken from rebrand.py): the one rendezvous/relay host the app
+# knows, and the key file the build bakes. RustDesk's public servers' key never ships.
+HOSTED = "rs.theboringremote.com"
+SERVER_KEY = pathlib.Path(__file__).resolve().parent / "server-key.pub"
+# The Hosted servers' public key itself, pinned: a key swapped in server-key.pub and baked by the
+# rebrand fails here. Where the servers repo sits next to this one, its copy must match too.
+PINNED_KEY = "2hUye2snQY5Roz1FXgypyJQwCjUuNcIX08ukFeo6TYk="
+SERVERS_REPO_KEY = pathlib.Path(__file__).resolve().parents[2] / "boring-remote-servers/keys/id_ed25519.pub"
+RUSTDESK_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="
+# Ticket 09, pinned here (not taken from rebrand.py): what 1.7.x shipped. The config (saved
+# machines, settings, trusted list) lives in ~/Library/Preferences/<ORG>.<APP_NAME> on Mac and
+# %APPDATA%\<APP_NAME> on Windows; the License key is a local option. Change any and the
+# 1.8.0 Update starts from an empty config.
+SHIPPED_ORG, SHIPPED_APP, SHIPPED_KEY_OPTION = "io.boringlabs", "BoringRemote", "boring-license-key"
+# Calls that clear saved machines or settings in bulk; nothing we add may make them.
+CONFIG_WIPE = re.compile(r"PeerConfig::remove\(|\b(?:Config|Config2|LocalConfig)::set\(|set_options\(\s*"
+                         r"(?:HashMap::new\(\)|Default::default\(\))|Config::path\(|mainRemovePeer|mainForgetPassword")
+CONFIG_PATH = re.compile(r"Preferences|AppData|\.toml\b")
+FORCE_SERVERS = ("if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
+                 " // boring-remote: the Hosted servers only")
+FORCE_SERVER = ('if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
+                " // boring-remote: the Hosted servers only")
 # Upstream update endpoints and GitHub releases URLs never appear in shipped code
 # (ADR 0004 keeps this from ADR 0003; see updater_checks for the allowlist).
 _U = r"[^\s\"'`)]*"
@@ -54,6 +81,7 @@ VERSION_URL_DECL = re.compile(r'pub const VERSION_URL: &str = "(https://boringla
 BANNED = re.compile(r"hwcodec|vram")
 BUILD_CALL = re.compile(r"build\.py|cargo\b|FEATURES")
 HBB = rebrand.HBB
+RELEASE_SCRIPT = "boring/release/build-mac"  # the local release (spec slice 7); GitHub never builds
 
 
 class Check:
@@ -201,23 +229,43 @@ def license_after_preprocess(root, app_name):
 
 
 PROTOCOL_HASHES = pathlib.Path(__file__).resolve().parent / "protocol.sha256"
+# Our two LoginRequest fields (ticket 06), pinned here rather than taken from rebrand.py, so
+# renumbering or retyping them there (onto a number upstream may use) fails until this changes
+# too, on purpose: it is a protocol change for trusted Controllers (boring/REBASE.md).
+OUR_PROTO_FIELDS = ("  bytes boring_controller_pk = 1000;\n", "  bytes boring_login_sig = 1001;\n")
 
 
 def protocol_matches(root):
-    """(ok, why): the tree's .proto files are exactly those in protocol.sha256, unchanged.
+    """(ok, why): the tree's .proto files are exactly those in protocol.sha256, plus our one addition.
 
-    The hashes are upstream's at our base, taken with LF endings so a CRLF
-    checkout matches; a rebase that changes a proto updates them (boring/REBASE.md)."""
+    The hashes are upstream's at our base, taken with LF endings so a CRLF checkout matches; a
+    rebase that changes a proto updates them (boring/REBASE.md). Our only change is
+    rebrand.PROTO_PATCH (two LoginRequest fields, ticket 06): it has to be there exactly once,
+    and with it undone the file has to hash to upstream's, so nothing else in it moved."""
     want = dict(reversed(l.split(maxsplit=1)) for l in PROTOCOL_HASHES.read_text().splitlines() if l.strip())
-    have = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
-            for p in root.rglob("*.proto") if p.is_file() and not p.relative_to(root).as_posix().startswith(
-                ("target/", ".git/"))}
+    rel_ours, old, new, _ = rebrand.PROTO_PATCH
+    have, why = {}, []
+    fields = tuple(l for l in new.splitlines(keepends=True)
+                   if l.strip() and not l.lstrip().startswith(("//", "}")) and l not in old)
+    if fields != OUR_PROTO_FIELDS or old != "  string avatar = 17;\n}\n":
+        why.append(f"our LoginRequest fields aren't the pinned ones: {fields}")
+    for p in root.rglob("*.proto"):
+        rel = p.relative_to(root).as_posix()
+        if not p.is_file() or rel.startswith(("target/", ".git/")):
+            continue
+        data = p.read_bytes().replace(b"\r\n", b"\n")
+        if rel == rel_ours:
+            text = data.decode("utf-8")
+            if text.count(new) != 1:
+                why.append(f"{rel}: our LoginRequest fields missing or changed")
+            data = text.replace(new, old, 1).encode("utf-8")
+        have[rel] = hashlib.sha256(data).hexdigest()
     bad = sorted(f for f in want.keys() | have.keys() if want.get(f) != have.get(f))
-    return not bad, ", ".join(bad)
+    return not bad and not why, ", ".join(why + bad)
 
 
-def msi_checks(c, workflows):
-    """Windows installer: name, exe, art, license, no RustDesk text, release on tags."""
+def msi_checks(c):
+    """Windows installer: name, exe, art, license, no RustDesk text."""
     pkg = c.root / MSI_DIR
     wxs = c.read(f"{MSI_DIR}/Package.wxs")
     pre = c.read("res/msi/preprocess.py")
@@ -253,19 +301,10 @@ def msi_checks(c, workflows):
     c.fact(f"product icon is {SHOWN}'s", all(
         (c.root / p).is_file() and (c.root / p).read_bytes() == icon
         for p in ("res/icon.ico", "flutter/windows/runner/resources/app_icon.ico")))
-    amyuni = [w.name for w in workflows if "usbmmidd" in w.read_text()]
+    amyuni = [RELEASE_SCRIPT] if "usbmmidd" in c.read(RELEASE_SCRIPT) else []
     if 'Custom Action="RemoveAmyuniIdd"' in c.read(f"{MSI_DIR}/Components/RustDesk.wxs"):
         amyuni.append("RustDesk.wxs")
     c.fact("no Amyuni driver in the build or the installer", not amyuni, ", ".join(amyuni))
-
-    ours = "".join(w.read_text() for w in workflows if w.name.startswith(rebrand.OUR_WORKFLOW_PREFIX))
-    c.fact("tags publish a GitHub release with the MSI and its sha256",
-           "startsWith(github.ref, 'refs/tags/')" in ours and "preprocess.py" in ours
-           and ".msi.sha256" in ours and "contents: write" in ours)
-    # PowerShell's Set-Content ends lines with CRLF; sha256sum -c on Ubuntu then looks for "x.msi\r"
-    writers = [l.strip() for l in ours.splitlines() if ".sha256" in l and re.search(r"Set-Content|Out-File|>", l)]
-    c.fact("MSI .sha256 is written with LF, so sha256sum -c passes on Linux",
-           writers and all("-NoNewline" in l and '`n"' in l for l in writers), str(writers))
 
 
 # --- branding: what a person sees on Mac and Windows ------------------------
@@ -564,6 +603,10 @@ def branding_checks(c):
 
 DIRECT_LINK = "libs/base/src/direct_link.rs"
 CONNECT_ENCRYPTED = "Direct Link is always encrypted and pinned, Tailscale too; plaintext refused both ends (ADR 0005, 0004 amendment)"
+# A Machine ID is digits only: never an address, a tailnet name or id@server (another server).
+MACHINE_ID_TEST = "!peer.is_empty() && peer.len() <= 20 && peer.bytes().all(|b| b.is_ascii_digit())"
+CONNECT_DIRECT = ("connect box: a name or IP is a Direct Link only; only a Machine ID reaches the Hosted servers, "
+                  "after its own Direct Link")
 ROUTE_AROUND = re.compile(r"rendezvous|RENDEZVOUS|_start_inner|other_server|is_domain_port_str|get_lch")
 
 
@@ -580,8 +623,9 @@ def tailnet_exprs():
 
 
 def connect_checks(c):
-    """v1.7 t03: the connect box takes a name or IP for a Direct Link (own address, then
-    Tailscale, ADR 0004), never an ID, and off Tailscale it is encrypted or refused (ADR 0005)."""
+    """v1.7 t03 + 1.8 ticket 08: a name or IP is a Direct Link only (own address, then Tailscale,
+    ADR 0004; encrypted or refused, ADR 0005), never the ID path; only a Machine ID goes on to the
+    Hosted servers (ADR 0005 hosted), after its own Direct Link attempt."""
     client = c.read("src/client.rs")
     body = fn_body(client, "    async fn _start(\n") or ""
     guard = body.find(rebrand.DIRECT_LINK_CALL)
@@ -590,19 +634,25 @@ def connect_checks(c):
     tops = [l.strip() for l in pre.splitlines() if l.startswith("        ") and not l.startswith("         ")]
     why = []
     if guard < 0:
-        why.append("no unconditional Direct Link return in _start")
+        why.append("no Direct Link return for names and IPs in _start")
     if ROUTE_AROUND.search(pre):
         why.append(f"_start touches the ID path first: {ROUTE_AROUND.findall(pre)}")
     if "if config::is_incoming_only()" not in pre or any(not t.startswith(("if ", "}", "bail!")) for t in tops):
         why.append(f"only the incoming-only branch may come before the Direct Link: {tops}")
-    if guard >= 0 and ("return Ok((" not in block or "else" in block or "?;" not in block):
-        why.append("the Direct Link block does not always return")
+    head = block.split("crate::connect_plan::direct_first", 1)[0]
+    if guard >= 0 and (not head.lstrip().startswith("if !boring_is_machine_id(peer) {") or "return Ok((" not in head
+                       or "else" in block or "?;" not in head or block.count("return Ok((") != 2):
+        why.append("the name/IP Direct Link block does not always return, or not first")
+    is_id = re.sub(r"\s+", " ", fn_body(client, "pub(crate) fn boring_is_machine_id(peer: &str) -> bool {") or "").strip()
+    if is_id != MACHINE_ID_TEST:
+        why.append(f"a Machine ID isn't digits only: {is_id!r}")
     calls = [m.start() for m in re.finditer(r"Self::_start_inner\(", client)]
     start = client.find("    async fn _start(\n")
     if not calls or any(not (start < i < start + len(body) + 200) for i in calls) or \
             len(re.findall(r"::_start\(", client)) != 1:
         why.append("_start / _start_inner are called from somewhere else")
-    c.fact("connect box never reaches the ID/rendezvous path", not why, "; ".join(why))
+    c.fact(CONNECT_DIRECT, not why,
+           "; ".join(why))
 
     link = c.read(DIRECT_LINK)
     plan = fn_body(link, "pub async fn plan_for(") or ""
@@ -647,6 +697,19 @@ def connect_checks(c):
             or "                            true,\n" not in rebrand.T03_LISTENER:
         why.append("target: the direct listener does not ask for encryption on every Direct Link")
     c.fact(CONNECT_ENCRYPTED, not why, "; ".join(why))
+
+    home = c.read(rebrand.HOME)
+    board = fn_body(home, "buildIDBoard(BuildContext context) {") or ""
+    get_id = re.sub(r"\s+", " ", fn_body(c.read(HBB), "pub fn get_id() -> String {") or "").strip()
+    builtin = re.search(r"static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = (.*?);\n", c.read(HBB))
+    c.fact("the Target shows its Machine ID and keeps it across restarts (made once, then read from its config)",
+           "      if (!isOutgoingOnly) buildIDBoard(context),\n" in home
+           and f'translate("{rebrand.MACHINE_ID_LABEL}")' in board and "controller: model.serverId," in board
+           and get_id == ("let mut id = CONFIG.read().unwrap().id.clone(); if id.is_empty() { "
+                          "if let Some(tmp) = Config::gen_id() { id = tmp; Config::set_id(&id); } } id")
+           and "config.store();" in (fn_body(c.read(HBB), "pub fn set_id(id: &str) {") or "")
+           and builtin is not None and rust_map(c.read(HBB), "BUILTIN_SETTINGS") == {"disable-change-id": "Y"},
+           f"label {'Machine ID' if rebrand.MACHINE_ID_LABEL in board else 'missing'}, get_id {get_id[:60]!r}")
 
     langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
     missing = [f"{p.name}: {text[:30]}" for p in langs for text in rebrand.CONNECT_ERROR_KEYS
@@ -736,7 +799,7 @@ def simple_settings_checks(c):
     c.fact("port forward, terminal and camera use kit tokens only", not off, "; ".join(off[:10]))
     settings = c.read(rebrand.SETTINGS)
     needles = ["simple_settings.dart", "if ((isMacOS || isWindows) && !_boringAdvanced) {", "SimpleSettings(",
-               "setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),",
+               "generatePassword: () => bind.mainGeneratePermanentPassword(),",
                "label: 'All settings',", "child: const Text('Back to Settings'),"]
     missing = [n for n in needles if n not in settings]
     c.fact("Mac Settings is one simple page with Advanced behind it", not missing, "; ".join(missing))
@@ -755,11 +818,11 @@ def setup_checks(c):
         (home, "SetupFlow("),
         (home, f"const nameKey = '{rebrand.BORING_MAC_NAME_OPTION}';"),
         (home, "onName: (n) => bind.mainSetOption(key: nameKey, value: n),"),
-        (home, "setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),"),
+        (home, "generatePassword: () => bind.mainGeneratePermanentPassword(),"),
         (c.read(rebrand.SETTINGS), "onRunSetup: () =>"),
         (kit, "?Privacy_ScreenCapture'"),
         (kit, "?Privacy_Accessibility'"),
-        (kit, "SimpleSettings.strongEnough("),
+        (kit, "UnattendedPasswordPanel("),
         (kit, "?Privacy_ListenEvent'"),  # t21: the third switch
         (home, "canMonitorInput: () => bind.mainIsCanInputMonitoring(prompt: false),"),
         (home, "welcome: setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption)),"),
@@ -859,14 +922,14 @@ def windows_checks(c):
 
     notice, run = c.read("src/update_notice.rs"), c.read("src/update_install_run.rs")
     feed = c.read("libs/base/src/update_feed.rs")
-    wf = c.read(".github/workflows/boring-build.yml")
+    # The feed's Windows entry was written by the deleted workflow; it comes back with a local Windows
+    # release script (ticket 11). The app side stays checked.
     needles = [
         ("libs/base/src/update_feed.rs", feed, '#[cfg(target_os = "windows")]\npub const THIS: Platform = Platform::Windows;'),
         ("src/update_notice.rs", notice, "base::update_feed::release_for(body, base::update_feed::THIS)"),
         ("src/update_notice.rs", notice, "store.set(KEY_LAST_PKG_URL, package_url(&body));"),
         ("src/update_install_run.rs", run, "crate::platform::update_to(p)"),
         ("src/update_install_run.rs", run, "LocalConfig::get_option(crate::update_notice::KEY_LAST_PKG_URL)"),
-        ("boring-build.yml", wf, "boring/min-version feed-out feed-out/BoringRemote-*-windows-x64*.msi"),
     ]
     missing = [f"{rel}: {n}" for rel, text, n in needles if n not in text]
     c.fact("Windows reads its own signed feed entry and installs the checked MSI (ADR 0007)",
@@ -894,10 +957,11 @@ def trust_checks(c, cfg):
     ]
     missing = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
     conn = c.read("src/server/connection.rs")
-    # The trusted skip must sit inside the login decision, right before the approve-mode ask.
+    # The trusted skip must sit inside the login decision, right before the no-password gate (1.8) and
+    # the approve-mode ask.
     i, j = conn.find(rebrand.T04_TRUSTED_SKIP), conn.find("if (password::approve_mode() == ApproveMode::Click")
-    if i < 0 or conn[i + len(rebrand.T04_TRUSTED_SKIP):j].strip():
-        missing.append("connection.rs: trusted skip is not right before the approve-mode ask")
+    if i < 0 or conn[i + len(rebrand.T04_TRUSTED_SKIP):j].strip() != rebrand.NO_PASSWORD_GATE.strip():
+        missing.append("connection.rs: trusted skip is not right before the no-password gate and the approve-mode ask")
     c.fact("LAN trust wired: token exchange both ends, approval prompt, Trusted Controllers (v1.7 t04)",
            not missing, "; ".join(missing))
 
@@ -918,9 +982,10 @@ def trust_checks(c, cfg):
 
     grant = fn_body(rs, "    fn approve_into(") or ""
     once = [n for n, ok in [
-        ("Allow and the Unattended Password map to lasting trust, everything else to this session",
+        ("Allow and the Unattended Password are told apart, everything else is this session",
          rebrand.T04_GRANT in conn and "_ => base::trust::SignIn::ThisSessionOnly," in rebrand.T04_GRANT),
-        ("approve_into stores nothing for ThisSessionOnly", "Some(key) if how != SignIn::ThisSessionOnly => {" in grant),
+        ("approve_into stores a new Controller only on Allow (1.8), nothing for ThisSessionOnly",
+         "if how != SignIn::Allowed {\n            self.pending = None;\n            return false;\n        }" in grant),
     ] if not ok]
     c.fact("a one-time code lets a Controller in for that session only (ADR 0005)", not once, "; ".join(once))
 
@@ -928,7 +993,7 @@ def trust_checks(c, cfg):
         ("connection.rs sends a removed Controller to the ask before any password path",
          "if self.boring_trust.must_ask() {" in rebrand.T04_TRUSTED_SKIP and rebrand.T04_TRUSTED_SKIP in conn),
         ("approve_into re-trusts a removed Controller only on Allow",
-         "if how != SignIn::Allowed {" in grant and "t.reinstate(key, name)" in grant),
+         "if how != SignIn::Allowed {" in grant and "t.reinstate(&key, name)" in grant),
         ("Remove in Settings keeps the entry, hidden, so the token is still known",
          "t.removed = true;" in (fn_body(rs, "    pub fn remove(") or "")
          and "if !t.remove(key) {" in (fn_body(rs, "fn plan_edit(") or "")),
@@ -941,7 +1006,9 @@ def trust_checks(c, cfg):
     for name in ("DEFAULT_SETTINGS", "OVERWRITE_SETTINGS", "HARD_SETTINGS", "BUILTIN_SETTINGS",
                  "DEFAULT_LOCAL_SETTINGS", "OVERWRITE_LOCAL_SETTINGS"):
         m = re.search(rf"pub static ref {name}: RwLock<HashMap<String, String>> = (.*?);\n", cfg, re.S)
-        if not m or PASSWORDISH.search(m.group(1)):
+        # 1.8 ticket 05: the lock that leaves only the Unattended Password names a password and carries none.
+        shipped = m and m.group(1).replace('("verification-method", "use-permanent-password")', "")
+        if not m or PASSWORDISH.search(shipped):
             why.append(f"{name} ships a value: {m and m.group(1)[:80]}")
     for base in ("src", "libs", "flutter/lib"):
         for p in sorted((c.root / base).rglob("*")):
@@ -987,19 +1054,21 @@ def always_ask_checks(c, conn, rs, dart):
         ("wrong passwords go through upstream's attempt limits",
          "let (failure, res) = self.check_failure(0).await;" in ask
          and "self.update_failure_with_scope(failure, false, 0, FailureScope::Default);" in ask),
-        ("nothing but that password marks the session as having given it",
-         conn.count("self.boring_trust.unattended_password_right();") == 1
-         and ask.find("ConnAuditPrimaryAuth::PermanentPassword") < ask.find("unattended_password_right()")),
+        ("nothing but that password marks the session as having given it (always ask, and 1.8's trust gate after "
+         "the permanent-only password check)",
+         conn.count("self.boring_trust.unattended_password_right();") == 2
+         and ask.find("ConnAuditPrimaryAuth::PermanentPassword") < ask.find("unattended_password_right()")
+         and "self.boring_trust.unattended_password_right();" in trust_gate(conn)),
         ("a gate before any sign-in completes keeps it out otherwise",
          "if !self.boring_trust.may_let_in() {" in gate and gate in logon
          and logon.find(gate) < logon.find("self.authorized = true;")
-         and "self.always_ask.is_none() || self.password_right" in (fn_body(rs, "    pub fn may_let_in(") or "")),
+         and "!self.always_ask() || self.password_right" in (fn_body(rs, "    pub fn may_let_in(") or "")),
         ("its token is checked as always ask before as Trusted, and no fresh token goes out",
          -1 < answer.find("Some(t) if !t.removed && t.always_ask =>") < answer.find("Some(t) if !t.removed =>")
          and "stream.send(&frame(&[])).await?;" in answer.split("Some(t) if !t.removed && t.always_ask =>", 1)[-1]
          .split("Some(t) if !t.removed =>", 1)[0]),
         ("no sign-in changes an always-ask entry",
-         grant.lstrip().split("// A removed Controller", 1)[0].count("if self.always_ask.is_some() {\n            return false;\n        }") == 1),
+         grant.lstrip().split("// A removed Controller", 1)[0].count("if self.always_ask() {\n            return false;\n        }") == 1),
         ("off unless set, and off is never written (1.7.0 lists load unchanged)",
          '#[serde(default, skip_serializing_if = "is_false")]\n    pub always_ask: bool,' in rs),
         ("Settings switches it through the service's edit, as Remove",
@@ -1010,7 +1079,7 @@ def always_ask_checks(c, conn, rs, dart):
          and rebrand.T04_ALWAYS_ASK_TUNNEL + rebrand.T04_ALWAYS_ASK_TUNNEL_AT
          in (fn_body(conn, "    async fn try_port_forward_loop(") or "")
          and rebrand.T04_ALWAYS_ASK_TUNNEL_TIMER in conn
-         and "!self.password_right && !self.stays && t.list.iter().any(|c| c.key == key && !c.removed && c.always_ask)"
+         and "t.list.iter().any(|c| c.key == key && (c.removed || !self.password_right && !self.stays && c.always_ask))"
          in (fn_body(rs, "    fn lost_trust_in(") or "")),
         ("a sign-in that stores it switched on keeps that session and sends the marker",
          "self.stored_as_always_ask(t, name);" in grant and grant.count("self.stored_as_always_ask(t, name);") == 2
@@ -1018,7 +1087,7 @@ def always_ask_checks(c, conn, rs, dart):
     ] if not ok]
     c.fact(ALWAYS_ASK, not bad, "; ".join(bad))
 
-    edit, rotate = fn_body(rs, "pub fn edit(request: &str) -> String {") or "", fn_body(rs, "fn rotate_salt(") or ""
+    edit, rotate = fn_body(rs, "pub fn edit_in_session(request: &str, sessions: usize) -> String {") or "", fn_body(rs, "fn rotate_salt(") or ""
     salt = [n for n, ok in [
         ("turning it on turns the salt over first, or nothing is saved",
          -1 < edit.find("rotate_salt(password)?;") < edit.find("t.list = planned.list;")
@@ -1160,7 +1229,7 @@ def ask_info_checks(c, kit, trust):
              (rebrand.SERVER_MODEL, "trust: client.boringTrust, key: client.boringKey, ip: client.boringIp)")]
     bad = [f"{rel}: {n.strip().splitlines()[0]}" for rel, n in hooks if n not in c.read(rel)]
     ask = fn_body(rs, "    pub fn ask_info(&self, ip: &str) -> AskInfo {") or ""
-    if '("removed", prefix(k))' not in ask or '"new", self.pending' not in ask:
+    if '("removed", prefix(k))' not in ask or '("new", prefix(&hex(d)))' not in ask:
         bad.append("trust.rs ask_info does not name removed and new by their keys")
     r = re.search(r"pub const KEY_PREFIX_LEN: usize = (\d+);", rs)
     d = re.search(r"const kTrustKeyPrefixLen = (\d+);", trust)
@@ -1317,7 +1386,7 @@ def target_word_checks(c):
             for m in [OTHER_END_MAC.search(line)] if m]
     home_kit, home, link = c.read("flutter/lib/desktop/kit/mac_home.dart"), c.read(rebrand.HOME), c.read(DIRECT_LINK)
     why = [f"Mac about the other end: {h}" for h in hits[:8]]
-    for need in ("'Connect to a computer'", '"Type a computer\'s name"', "Text('Computers',",
+    for need in ("'Connect to a computer'", '"Type a computer\'s name or Machine ID"', "Text('Computers',",
                  "To reach this $one from another network", "pick this $one by name"):
         if need not in home_kit:
             why.append(f"Home lost {need}")
@@ -1620,7 +1689,7 @@ def home_checks(c):
 
     # Ticket 12 follow-ups: Windows Setup names the computer by its Windows name (scutil is Mac only),
     # and the reach check counts the installer's rule only when it is for this exe.
-    page = fn_body(c.read(rebrand.HOME), "Widget boringSetupPage({required VoidCallback onDone}) {") or ""
+    page = fn_body(c.read(rebrand.HOME), "Widget boringSetupPage({required VoidCallback onDone, bool passwordOnly = false}) {") or ""
     named = "            : isWindows // v1.7 review: Windows' own computer name; scutil is Mac only\n" \
             "                ? Future.value(windowsComputerName(Platform.environment, Platform.localHostname))\n" \
             "            : Process.run('scutil', ['--get', 'ComputerName'])"
@@ -1664,7 +1733,7 @@ def bundle_checks(c):
     bundle, old, apps = rebrand.MAC_BUNDLE, rebrand.OLD_MAC_BUNDLE, f"/Applications/{rebrand.MAC_BUNDLE}"
     xc = dict(re.findall(r"(?m)^(\w+) = (.*)$", c.read("flutter/macos/Runner/Configs/AppInfo.xcconfig")))
     scheme = c.read("flutter/macos/Runner.xcodeproj/xcshareddata/xcschemes/Runner.xcscheme")
-    wf = c.read(".github/workflows/boring-build.yml")
+    build_mac = c.read("boring/release/build-mac")
     bad = [n for n, ok in [
         (f"PRODUCT_NAME is {xc.get('PRODUCT_NAME')}", xc.get("PRODUCT_NAME") == SHOWN),
         (f"EXECUTABLE_NAME is {xc.get('EXECUTABLE_NAME')}", xc.get("EXECUTABLE_NAME") == APP),
@@ -1672,7 +1741,7 @@ def bundle_checks(c):
         ("scheme", set(re.findall(r'BuildableName = "([^"]*\.app)"', scheme)) == {bundle}),
         ("build.py service copy", f'"./build/macos/Build/Products/Release/{bundle}/Contents/MacOS/"' in c.read("build.py")),
         ("verify-dmg.sh", f'APP="{bundle}"' in c.read("boring/dmg/verify-dmg.sh")),
-        ("workflow", f'"flutter/build/macos/Build/Products/Release/{bundle}"' in wf and f"Release/{old}" not in wf),
+        ("build-mac", f'"$SRC/flutter/build/macos/Build/Products/Release/{bundle}"' in build_mac and old not in build_mac),
     ] if not ok]
     c.fact(f"Mac bundle is {bundle}; its exe stays {APP} (t17)", not bad, "; ".join(bad))
 
@@ -1924,8 +1993,745 @@ def root_bundle_checks(c):
     c.fact(ROOT_BUNDLE, not bad, "; ".join(bad))
 
 
+def workflow_guard(c):
+    """No GitHub Actions: any file under .github/workflows/, on disk or tracked in git, fails.
+    Releases build on the Studio (boring/release/build-mac). .github/patches/ is fine."""
+    wf = c.root / ".github/workflows"
+    found = {p.relative_to(c.root).as_posix() for p in wf.rglob("*") if p.is_file()} if wf.is_dir() else set()
+    if (c.root / ".git").exists():
+        r = subprocess.run(["git", "-C", str(c.root), "ls-files", "--", ".github/workflows"],
+                           capture_output=True, text=True)
+        found |= set(r.stdout.split())
+    c.fact("no GitHub Actions workflow (.github/workflows/ is empty)", not found, ", ".join(sorted(found)))
+
+
+THROTTLED_LOGIN = re.compile(
+    r"let \(failure, res\) = self\.check_failure\(0\)\.await;\s*if !res \{\s*return true;\s*\}\s*"
+    r"if !self\.validate_password\([^)]*\) \{\s*"
+    r"self\.update_failure_with_scope\(failure, false, 0, FailureScope::Default\);")
+LOGON = "send_logon_response_and_keep_alive().await"
+# The prompt-and-wait tail both gates copy from upstream's click branch.
+CLICK_WAIT = (r"#\[cfg\(not\(any\(target_os = \"android\", target_os = \"ios\"\)\)\)\]\s*"
+              r"if should_use_terminal_os_login_scope\(self\.terminal, &lr\.os_login\.username\) \{\s*"
+              r"if let Some\(keep_alive\) = self\.prepare_terminal_login_for_authorization\(\)\.await \{\s*"
+              r"return keep_alive;\s*\}\s*\}\s*"
+              r"self\.try_start_cm\(lr\.my_id, lr\.my_name, false\);\s*"
+              r"if hbb_common::get_version_number\(&lr\.version\)\s*>= hbb_common::get_version_number\(\"1\.2\.0\"\)\s*\{\s*"
+              r"self\.send_login_error\(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS\)\.await;\s*\}\s*return true;")
+BUMP = r"self\.update_failure_with_scope\(failure, false, 0, FailureScope::Default\);"
+# The key a login proves, folded into its Admission before any Trusted check (base::trust).
+PROVE_CALL = ("self.boring_trust.prove(\n                crate::trust_policy::login_key(\n"
+              "                    &lr.my_id,\n                    &lr.boring_controller_pk,\n"
+              "                    &lr.boring_login_sig,\n                    &self.hash.challenge,\n"
+              "                    &Config::get_id(),\n                    self.stream.is_secured(),\n"
+              "                ),\n                &base::trust::Trusted::load(),\n            );")
+# Ticket 07, the Controller side: the login is signed where it is sent, from the stream that carries it.
+SIGN_CALL = ("let challenge = lc.read().unwrap().hash.challenge.clone();\n"
+             "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
+             "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured());\n    }\n"
+             "    allow_err!(peer.send(&msg_out).await);")
+# A Machine ID runs only with the baked key; an unverified one is refused without a prompt, and a
+# verified one keeps the key it was first verified with.
+KEY_GUARD = ("if boring_is_machine_id(peer) && !crate::trust_policy::baked_key(key) {\n"
+             '            bail!("Boring Remote checks Machine IDs against its own servers only");\n        }')
+REFUSE_IO = ("let boring_refused = if !is_secured && crate::client::boring_is_machine_id(&self.handler.get_id()) {\n"
+             "                    Some(crate::client::BORING_UNVERIFIED)\n                } else if is_secured\n"
+             "                    && crate::client::boring_is_machine_id(&self.handler.get_id())\n"
+             "                    && !crate::connect_plan::pin_target(&self.handler.get_id(), pk.as_deref())\n"
+             "                {\n                    Some(base::direct_link::IDENTITY_CHANGED)\n")
+REFUSE_PF = ("if !stream.is_secured() && crate::client::boring_is_machine_id(id) {\n"
+             "        bail!(crate::client::BORING_UNVERIFIED);\n    }\n"
+             "    if stream.is_secured() && crate::client::boring_is_machine_id(id) && "
+             "!crate::connect_plan::pin_target(id, _pk.as_deref()) {\n"
+             "        bail!(base::direct_link::IDENTITY_CHANGED);\n    }\n"
+             "    if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {")
+
+
+def option_consts(c):
+    """OPTION_* name -> option key, from base's keys.rs and the hbb_common keys it re-exports."""
+    text = c.read("libs/base/src/config/keys.rs") + c.read(HBB)
+    return dict(re.findall(r'pub const (OPTION_\w+): &str = "([^"]*)";', text))
+
+
+def str_array(c, text, name, extra=None):
+    """The resolved items of `pub const <name>: &[&str] = &[...]`, None for one that doesn't resolve."""
+    m = re.search(rf"pub const {name}: &\[&str\] = &\[(.*?)\];", text, re.S)
+    if not m:
+        return []
+    consts = {**option_consts(c), **(extra or {})}
+    return [i[1:-1] if i.startswith('"') else consts.get(i.split("::")[-1])
+            for i in re.findall(r'"[^"]*"|[\w:]+', m.group(1))]
+
+
+def no_password_gate(conn):
+    """(gate start, click branch start, the no-password block or None)."""
+    gate = conn.find("if crate::password_lock::refuse_login(")
+    click = conn.find("if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)")
+    unset = re.search(r"if !Config::has_permanent_password\(\) \{(.*?)" + CLICK_WAIT + r"\s*\}",
+                      conn[gate:click] if 0 <= gate < click else "", re.S)
+    return gate, click, unset
+
+
+def trust_gate(conn):
+    """The trust gate's text, if it sits after the password check and before the reset and logon."""
+    check = conn.find("if !self.validate_password(")
+    gate = conn.find("self.boring_trust.unattended_password_right();\n"
+                     "                    if !self.boring_trust.skips_click() {", check)
+    reset = conn.find("self.update_failure_with_scope(failure, true, 0, FailureScope::Default);", check)
+    logon = conn.find("if !self." + LOGON + " {", check)
+    ok = 0 <= check < gate < reset < logon and "LOGIN_MSG_PASSWORD_WRONG" in conn[check:gate]
+    return conn[gate:reset] if ok else ""
+
+
+def password_lock_checks(c, locked):
+    """Ticket 05: permanent password only, refused without one, throttled, fixed during a session."""
+    c.fact("one-time password off: only the permanent password is accepted",
+           locked.get("verification-method") == "use-permanent-password", locked.get("verification-method"))
+    # The option only hides settings in the UI (common.dart canBeBlocked ignores it in full access
+    # mode, and the home page's Set Password doesn't check it); the daemon's session guard holds them.
+    c.fact("allow-remote-config-modification locked off (a UI hint; the session guard holds the settings)",
+           locked.get("allow-remote-config-modification") == "N", locked.get("allow-remote-config-modification"))
+
+    conn = c.read("src/server/connection.rs")
+    lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
+    gate, click, unset = no_password_gate(conn)
+    refuse = fn_body(lock, "pub fn refuse_login(verification_method: &str) -> bool {")
+    live = "if crate::password_lock::refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD)) {"
+    c.fact("no Unattended Password: no unattended access, only Allow on the Target, for that session only",
+           0 <= gate < click and conn[gate:].startswith(live) and "return false;" in conn[gate:click]
+           and unset is not None
+           and re.search(BUMP + r"\s*self\.boring_trust\.wait_for_allow\(false\);", unset.group(1)) is not None
+           and refuse is not None and refuse.strip() == "verification_method != PERMANENT_ONLY",
+           f"gate at {gate}, click branch at {click}, no-password click path {unset is not None}, "
+           f"refuse_login {refuse!r}")
+
+    throttle = fn_body(conn, "async fn check_failure_with_scope(") or ""
+    always = re.search(r"let \(failure, res\) = self\.check_failure\(0\)\.await;\s*if !res \{\s*return true;\s*\}\s*"
+                       r"if self\.validate_password\(allow_logon_screen_password\)", conn)
+    ok = (THROTTLED_LOGIN.search(conn) is not None and always is not None and conn.count("self.validate_password(") == 2
+          and '"Too many wrong attempts"' in throttle and '"Please try 1 minute later"' in throttle
+          and "let res = if failure.2 > 30 {" in throttle and "} else if time == failure.0 && failure.1 > 6 {" in throttle
+          and "self.check_failure_with_scope(i, FailureScope::Default)"
+          in (fn_body(conn, "async fn check_failure(&mut self, i: usize)") or ""))
+    c.fact("wrong passwords are still throttled before and after every password check", ok)
+
+    ipc = c.read("src/ipc.rs")
+    arms = [re.search(rf'name == "{k}" \{{\s*if {re.escape(rebrand.IPC_GUARD)} \{{\s*log::warn!\(', ipc)
+            for k in ("permanent-password", "salt", "unlock-pin")]
+    options = re.search(r"let value = crate::password_lock::guard_options\(\s*value,\s*&Config::get_options\(\),"
+                        r"\s*crate::password_lock::authed_sessions\(\),\s*\);\s*" + re.escape(rebrand.T04_KEEP_LIST.lstrip()), ipc)
+    guard = fn_body(lock, "pub fn config_write_allowed(name: &str, remote_sessions: usize) -> bool {") or ""
+    sessions = (fn_body(lock, "pub fn authed_sessions() -> usize {") or "").strip()
+    base_trust = c.read("libs/base/src/trust.rs")
+    consts = {n: (re.search(rf'pub const {n}: &str = "([^"]+)";', base_trust) or [None, None])[1]
+              for n in ("TRUSTED_OPTION", "NEW_ALWAYS_ASK_OPTION")}
+    guarded = str_array(c, lock, "SECURITY_OPTIONS", consts)
+    gen_key = (re.search(r'pub const GENERATED_CONFIG: &str = "([^"]+)";', lock) or [None, None])[1]
+    protected = str_array(c, lock, "PROTECTED_CONFIG", {"GENERATED_CONFIG": gen_key})
+    need = ("approve-mode", "verification-method", "allow-remote-config-modification", "access-mode", "whitelist",
+            consts["TRUSTED_OPTION"], consts["NEW_ALWAYS_ASK_OPTION"])
+    c.fact("a remote session can't change the password, PIN or security options",
+           all(arms) and ipc.count(rebrand.IPC_GUARD) == 3 and options is not None and "remote_sessions == 0" in guard
+           and sessions == "crate::server::AUTHED_CONNS.lock().unwrap().len()"
+           and set(protected) - {gen_key} == {"permanent-password", "salt", "unlock-pin"}
+           and None not in guarded and all(k in guarded for k in need),
+           f"guarded arms {[a is not None for a in arms]}, options guard {options is not None}, "
+           f"authed_sessions {sessions!r}, unresolved or missing {[k for k in need if k not in guarded]}")
+    sync = re.search(r"Data::SyncConfig\(Some\(configs\)\) => \{\s*(?://[^\n]*\s*)*if crate::password_lock::authed_sessions\(\) > 0 \{"
+                     r"\s*log::warn!\([^)]*\);\s*return;\s*\}\s*let \(config, config2\) = \*configs;", ipc)
+    c.fact("a remote session can't replace the whole config (Data::SyncConfig refused)", sync is not None)
+
+    alphabet = re.search(r'pub const ALPHABET: &\[u8\] = b"([^"]*)";', lock)
+    length = re.search(r"pub const LEN: usize = (\d+);", lock)
+    gen = fn_body(lock, "pub fn generate() -> String {") or ""
+    gen_with = re.sub(r"\s+", "", fn_body(lock, "pub fn generate_with<R: Rng>(rng: &mut R) -> String {") or "")
+    hooks = [("src/lib.rs", "mod password_lock;"), ("src/flutter_ffi.rs", "pub fn main_generate_permanent_password()"),
+             (rebrand.HOME, "showGeneratedPasswordOnce(pass)")]
+    missing = [f"{rel}: {needle}" for rel, needle in hooks if needle not in c.read(rel)]
+    c.fact("generated password: OS RNG, 16+ characters, no look-alike characters, wired to Set Password",
+           alphabet and length and int(length.group(1)) >= 16 and not set("0O1lI") & set(alphabet.group(1))
+           and "OsRng" in gen and gen_with == "(0..LEN).map(|_|ALPHABET[rng.gen_range(0..ALPHABET.len())]aschar).collect()"
+           and not missing, "; ".join(missing) or gen_with)
+
+    home = c.read(rebrand.HOME)
+    dialog = fn_body(home, "void setPasswordDialog({VoidCallback? notEmptyCallback}) async {") or ""
+    sizes = [int(n) for n in re.findall(r"MinCharactersValidationRule\((\d+)\)", dialog)]
+    validate = dialog.find("rules.where((r) => !r.validate(pass))")
+    actions = re.search(r"return \[\s*cancelButton,\s*if \(localPasswordSet\) removeButton,\s*okButton,\s*"
+                        r"generateButton,\s*\];", dialog)
+    c.fact("a typed password needs 16+ characters; Generate (Reset once set) is the main action",
+           sizes and min(sizes) >= 16 and 0 <= validate < dialog.find("mainSetPermanentPasswordWithResult(password: pass)")
+           and actions is not None and 'permanentPasswordSet ? "Reset" : "Generate"' in dialog,
+           f"min length {sizes}, Generate last {actions is not None}")
+
+    shown = c.read("flutter/lib/desktop/widgets/generated_password.dart")
+    once = fn_body(shown, "void showGeneratedPasswordOnce(String password) {") or ""
+    copy = fn_body(shown, "void copyPasswordBriefly(String password) {") or ""
+    c.fact("the new password closes only on I've saved it, and Reset asks before replacing",
+           "\"I've saved it\", onPressed: close" in once and "onSubmit" not in once and "onCancel" not in once
+           and "clickMaskDismiss" not in once and "copyPasswordBriefly(password)" in once
+           and re.search(r"if \(permanentPasswordSet\) \{\s*final go = await confirmReplacePassword\(\);\s*"
+                         r"if \(go == null\) return;", dialog) is not None)
+    c.fact("a copied password leaves the clipboard after a minute",
+           "Clipboard.setData(ClipboardData(text: password));" in copy
+           and "Timer(const Duration(seconds: 60)," in copy and "if (now?.text == password)" in copy
+           and "Clipboard.setData(const ClipboardData(text: ''))" in copy)
+    c.fact("one-time password label hidden when it is off (desktop and mobile)",
+           'translate(showOneTime ? "One-time Password" : "Password"),' in home
+           and "translate(showOneTime ? 'One-time Password' : 'Password')," in c.read(rebrand.MOBILE_SERVER))
+
+    langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
+    # Keys English shows as they are aren't in en.rs (AGENTS.md); every other file has each once.
+    en_only = [rebrand.MACHINE_ID_LABEL, rebrand.UNVERIFIED]
+    missing = [f"{p.name}: {k}" for p in langs for k in rebrand.UI_KEYS + en_only
+               if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" and k in en_only else 1)]
+    c.fact("new UI strings (tickets 05, 06, 07, 09) have a key in every translation file", langs and not missing,
+           ", ".join(missing[:5]))
+
+
+def logon_sites(conn, locked):
+    """Every way into a session: (count, [unexplained sites])."""
+    sites = [m.start() for m in re.finditer(r"if !(?:self|conn)\." + re.escape(LOGON), conn)]
+    why = {
+        "Allow, after the trust gate's take_wait":
+            lambda before: before[-1800:].rfind("if !conn.boring_trust.take_wait(crate::password_lock::authed_sessions()) {")
+            > before[-1800:].rfind("ipc::Data::Authorize => {") >= 0,
+        "recent session: only a one-time password login records one, and that is locked off":
+            lambda before: before.endswith("} else if self.is_recent_session(false) {\n                ")
+            and locked.get("verification-method") == "use-permanent-password",
+        "right password, after the trust gate":
+            lambda before: before.rstrip().endswith("self.update_failure_with_scope(failure, true, 0, FailureScope::Default);")
+            and before[-2500:].rfind("if !self.boring_trust.skips_click() {") > before[-2500:].rfind("if !self.validate_password(") >= 0,
+        "2FA, only after a gated logon asked for it":
+            lambda before: before[-1500:].rfind("if !self.awaiting_2fa {") > before[-1500:].rfind("message::Union::Auth2fa(tfa)") >= 0
+            and conn.count("self.awaiting_2fa = true;") == 1
+            and "self.awaiting_2fa = true;" in (fn_body(conn, "async fn send_logon_response_and_keep_alive(&mut self) -> bool {") or ""),
+        "switch sides this computer asked for (uuid match)":
+            lambda before: "if uuid == uuid_old {" in before[-1500:],
+        "always ask (1.7): this computer's Unattended Password, and nothing else":
+            lambda before: before.rstrip().endswith("self.boring_trust.unattended_password_right();")
+            and before[-1500:].rfind("if self.boring_trust.always_ask() {") >= 0,
+        "a token this computer issued and still trusts (1.7 Direct Link)":
+            lambda before: before.rstrip().endswith("if self.boring_trust.is_trusted() {"),
+    }
+    unexplained = [s for s in sites if sum(bool(ok(conn[:s])) for ok in why.values()) != 1]
+    return len(sites), unexplained
+
+
+def proof_checks(c, conn, trust):
+    """Trust binding (option B) on the merged list: the Controller signs each login with its own key
+    pair over this challenge, the Target's Machine ID and its own ID, only over a stream it verified
+    as that Machine ID; the Target proves the key only for its own Machine ID on a keyed stream."""
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    policy = strip_tests_and_comments(c.read("src/trust_policy.rs"))
+    proven = squash(fn_body(trust, "pub fn proven_key(controller: &str, pk: &[u8], sig: &[u8], challenge: &str, target: &str) -> Option<[u8; 32]> {"))
+    message = fn_body(trust, "pub fn login_message(challenge: &str, target: &str, controller: &str) -> Option<Vec<u8>> {") or ""
+    login_key = squash(fn_body(policy, "pub fn login_key("))
+    why = []
+    if proven != ("let key: [u8; 32] = pk.try_into().ok()?; let want = login_message(challenge, target, controller)?; "
+                  "let signed = sign::verify(sig, &sign::PublicKey(key)).ok()?; (signed == want).then_some(key)"):
+        why.append("proven_key doesn't verify the signature over this login")
+    if login_key != ("if !secured || !crate::client::boring_is_machine_id(own_id) { return None; } "
+                     "base::trust::proven_key(my_id, pk, sig, challenge, own_id)"):
+        why.append(f"login_key is {login_key[:90]!r}")
+    if PROVE_CALL not in conn or not 0 <= conn.find(PROVE_CALL) < conn.find(rebrand.T04_ALWAYS_ASK):
+        why.append("the key this login proves isn't checked before the always-ask and Trusted checks")
+    if not re.search(r'const LOGIN_DOMAIN: &\[u8\] = b"\\0[^"]*";', trust):
+        why.append("the signed login has no zero-led domain (could read as a SignedId)")
+    if not re.search(r"let challenge_ok =\s*!challenge\.is_empty\(\) && challenge\.len\(\) <= 64 && "
+                     r"challenge\.bytes\(\)\.all\(\|b\| b\.is_ascii_alphanumeric\(\)\);\s*if !challenge_ok \{\s*return None;",
+                     message):
+        why.append("the Controller would sign any challenge a Target sends")
+    c.fact("a Trusted login by key needs that key's signature over this login, for this Target; a known ID alone "
+           "never skips Allow", not why, "; ".join(why))
+
+    client = c.read("src/client.rs")
+    built = fn_body(client, "async fn send_login(") or ""
+    hash_fn = fn_body(client, "pub async fn handle_hash(") or ""
+    signing = squash(fn_body(policy, "pub fn sign_login(lr: &mut LoginRequest, challenge: &str, secured: bool) {"))
+    lib = c.read("src/lib.rs")
+    why = []
+    if not 0 <= built.find(rebrand.SIGN_LOGIN) < built.find("allow_err!(peer.send(&msg_out).await);"):
+        why.append("send_login doesn't sign before sending")
+    if rebrand.HASH_FIRST_NEW.split("    true\n")[0] not in hash_fn:
+        why.append("handle_hash sends the login before it stores the challenge")
+    want = ('let Some(target) = signed_target(&lr.username, secured) else { return; }; '
+            'if base::trust::login_message(challenge, &target, &lr.my_id).is_none() { return; } '
+            '#[cfg(any(target_os = "android", target_os = "ios"))] let pair = Some(Config::get_key_pair()); '
+            '#[cfg(not(any(target_os = "android", target_os = "ios")))] let pair = Config::get_existing_key_pair(); '
+            'let Some((sk, pk)) = pair else { return; }; '
+            'if let Some(sig) = base::trust::login_signature(challenge, &target, &lr.my_id, &sk) { '
+            'lr.boring_controller_pk = pk.into(); lr.boring_login_sig = sig.into(); }')
+    if signing != want:
+        why.append("sign_login isn't the service's key pair over (challenge, Target's Machine ID, own ID)")
+    if SIGN_CALL not in built or "sign_login(" in (fn_body(client, "    fn create_login_msg(") or ""):
+        why.append("the login isn't signed from the stream that carries it")
+    if not re.search(r"(?<!Target side only\n)mod trust_policy;", lib):
+        why.append("trust_policy is left out of iOS Controllers")
+    c.fact("Controllers sign each login with their own key (this challenge, the Target's Machine ID, their ID)",
+           not why, "; ".join(why))
+    hosted_signing_checks(c, client, policy, squash)
+
+
+def hosted_signing_checks(c, client, trust, squash):
+    """Tickets 07 + 08: a Machine-ID login is signed only over a stream keyed to the Target it
+    verified (a pinned Direct Link to that Machine ID, or the servers' word under the baked key),
+    decided from that stream when the login is sent. A Machine ID never runs with another key, an
+    unverified one is refused (no Continue), and a verified one keeps its pinned key."""
+    why = []
+    if squash(fn_body(trust, "pub fn baked_key(key: &str) -> bool {")) != \
+            "key.is_empty() || key == hbb_common::config::RS_PUB_KEY":
+        why.append("baked_key accepts another key")
+    signed = squash(fn_body(trust, "pub fn signed_target(peer: &str, secured: bool) -> Option<String> {"))
+    if signed != "(secured && crate::client::boring_is_machine_id(peer)).then(|| peer.to_owned())":
+        why.append(f"signed_target is {signed[:90]!r}")
+    code = strip_tests_and_comments(client)
+    start = fn_body(code, "    pub async fn start(\n") or ""
+    if not 0 <= start.find(KEY_GUARD) < start.find("Self::_start("):
+        why.append("Client::start lets a Machine ID run with a key that isn't the baked one")
+    if "boring_verified_target" in code or "verified_target(" in trust:
+        why.append("a verified flag is kept per session again (shared by its connections)")
+    io_loop = strip_tests_and_comments(c.read("src/client/io_loop.rs"))
+    pf = strip_tests_and_comments(c.read("src/port_forward.rs"))
+    io_refuse, io_prompt = io_loop.find(REFUSE_IO), io_loop.find("client::confirm_insecure_connection(")
+    if not (0 <= io_refuse < io_prompt and io_loop.count("confirm_insecure_connection(") == 1
+            and pf.count(REFUSE_PF) == pf.count("confirm_insecure_connection(") == 2):
+        why.append("an unverified Machine-ID session can still be continued past the insecure prompt, "
+                   "or a verified one isn't held to its pinned key")
+    secure = fn_body(code, "    async fn secure_connection(\n") or ""
+    vouched = re.search(r"let rs_pk = get_rs_pk\(if key\.is_empty\(\) \{\s*config::RS_PUB_KEY\s*\} else \{\s*key\s*\}\);", secure)
+    target_key = re.search(r"if let Ok\(\(id, pk\)\) = decode_id_pk\(&signed_id_pk, &rs_pk\) \{\s*if id == peer_id \{\s*"
+                           r"sign_pk = Some\(sign::PublicKey\(pk\)\);\s*option_pk = Some\(pk\.to_vec\(\)\);", secure)
+    signed_id = secure.find("decode_id_pk_dtls(&si.id, &sign_pk)")
+    same_id = secure.find("if id == peer_id {", signed_id)
+    keyed = secure.find("conn.set_negotiated_key(")
+    if not (vouched and target_key and secure.count("option_pk = Some") == 1
+            and 0 <= signed_id < same_id < keyed and code.count("set_negotiated_key(") == 1
+            and not re.search(r"\.set_key(?:_split)?\(", code)):
+        why.append("secure_connection no longer keys the stream only after the Target's signed ID checks out "
+                   "under the servers' word (is_secured() would not mean verified)")
+    c.fact("Controllers sign a Machine-ID login only on a stream that verified the Target (pinned Direct Link or "
+           "the baked server key)", not why, "; ".join(why))
+
+
+# Ticket 08 on 1.7's Direct Link, pinned here (not taken from rebrand.py).
+DIRECT_FIRST = ("if let Some((stream, path, pk)) =\n"
+                "            crate::connect_plan::direct_first(peer, interface.is_force_relay()).await\n"
+                "        {\n")
+CONNECT_PLAN = ("if !crate::client::boring_is_machine_id(peer) { return vec![Attempt::DirectLink]; } "
+                "let mut attempts = Vec::new(); if known && !relay_only { attempts.push(Attempt::DirectLink); } "
+                "attempts.push(Attempt::Hosted); attempts")
+MACHINE_ID_PLAN = ("let port = hbb_common::config::RELAY_PORT as u16 + 1; let tailscale = known.tailscale_of(id); "
+                   "let direct = crate::lan::advert_of(id).first().map(|a| SocketAddr::new(a.ip, port)); "
+                   "let mut plan = match (direct, tailscale) { (Some(direct), ts) => widen(direct, ts, Some(id), known, None), "
+                   "(None, Some(ts)) => Plan::single(ts, None), (None, None) => return None, }; "
+                   "plan.target = Some(id.to_owned()); plan.dialled = None; Some(plan)")
+REMEMBERED = ("crate::connect_plan::save_reported(\n                            &self.handler.get_id(),\n"
+              "                            peer.is_secured(),\n                            &pi.platform_additions,\n"
+              "                        );")
+HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
+               " connection, or connect by Tailscale name or IP.")
+HOSTED_DOWN_MAP = ("let socket = socket.map_err(crate::connect_plan::hosted_down); "
+                   "// boring-remote: say so, naming them (ticket 08)\n        let mut socket = socket?;")
+HOSTED_RELAY = "let err = crate::connect_plan::hosted_error(err);"
+
+
+def direct_first_checks(c):
+    """Ticket 08 (and 16) on 1.7's Direct Link: a Machine ID tries a Direct Link where it was met
+    (pinned, only that Machine ID counts), then the Hosted servers; a typed name or address is a
+    Direct Link only; the Hosted path holds the same pin; a reported tailnet address is kept only
+    from a keyed stream to a pinned Target; a plain error when the Hosted servers are down."""
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    client = c.read("src/client.rs")
+    plan_code = strip_tests_and_comments(c.read("src/connect_plan.rs"))
+    link = strip_tests_and_comments(c.read(DIRECT_LINK))
+    io_loop = strip_tests_and_comments(c.read("src/client/io_loop.rs"))
+    body = fn_body(client, "    async fn _start(\n") or ""
+    call, rendezvous = body.find(DIRECT_FIRST), body.find("let other_server = interface.get_lch()")
+    why = []
+    if "mod connect_plan;" not in c.read("src/lib.rs"):
+        why.append("no connect_plan module")
+    if not 0 <= body.find(rebrand.DIRECT_LINK_CALL) <= call < rendezvous:
+        why.append("_start doesn't try a Machine ID's Direct Link after the name/IP branch and before the Hosted servers")
+    if squash(fn_body(plan_code, "pub fn plan(peer: &str, known: bool, relay_only: bool) -> Vec<Attempt> {")) != CONNECT_PLAN:
+        why.append("plan isn't: names Direct Link only; a Machine ID's Direct Link where met, then the Hosted servers")
+    first = squash(fn_body(plan_code, "pub async fn direct_first("))
+    if "base::direct_link::machine_id_known(peer, &known)" not in first or \
+            "base::direct_link::connect_machine_id(peer, DIRECT_FIRST_MS, known).await" not in first:
+        why.append("direct_first isn't the strict Machine-ID Direct Link")
+    if squash(fn_body(link, "fn plan_for_machine_id(id: &str, known: &Known) -> Option<Plan> {")) != MACHINE_ID_PLAN:
+        why.append("a Machine ID's Direct Link plan isn't strict (target set, nothing exempt, no name lookups)")
+    judge = squash(fn_body(link, "fn judge<S>("))
+    if "Err(Failure::Refused(e)) => Err(Failure::Stale(e))," not in judge or \
+            "Ok((_, Some(who))) if who.id != target && plan.dialled != Some(addr) =>" not in judge:
+        why.append("another computer at a Machine ID's address isn't passed over")
+    if "pub const DIRECT_FIRST_MS: u64 = 3_000;" not in plan_code:
+        why.append("the Tailscale attempt isn't ~3 s")
+    if re.search(r"TAILNET_STREAM|tailnet_first|boring_tailnet_stream|TAILNET_OPTION", strip_tests_and_comments(client) + io_loop):
+        why.append("a plaintext tailnet-first path or its exemption is back")
+    c.fact("a Machine ID tries a pinned Direct Link where it was met (~3 s on Tailscale), then the Hosted servers (ticket 08)",
+           not why, "; ".join(why))
+
+    pin = squash(fn_body(plan_code, "pub fn pin_target(id: &str, pk: Option<&[u8]>) -> bool {"))
+    pin_id = squash(fn_body(link, "pub fn pin_id(&mut self, id: &str, sign_pk: &[u8]) -> bool {"))
+    learn = squash(fn_body(link, "pub fn learn_tailscale(&mut self, id: &str, ip: IpAddr) -> bool {"))
+    save = squash(fn_body(plan_code, "pub fn save_reported(id: &str, secured: bool, additions: &str) {"))
+    peer_info = io_loop[io_loop.find("Some(login_response::Union::PeerInfo(pi)) => {"):]
+    conn = c.read("src/server/connection.rs")
+    reported = conn.find("crate::connect_plan::add_own_tailnet(&mut platform_additions);")
+    why = []
+    if not pin.startswith("let Some(pk) = pk.filter(|pk| pk.len() == 32) else { return false; };") or \
+            "let ok = known.pin_id(id, pk);" not in pin:
+        why.append("pin_target doesn't refuse a missing key or check the pin")
+    if pin_id != ("let pk = hex(sign_pk); match self.0.get(id) { Some(t) => t.pk == pk, None => { "
+                  "self.0.insert(id.to_owned(), KnownTarget { pk, ..Default::default() }); true } }"):
+        why.append("a Machine ID met before doesn't keep its key")
+    if not learn.startswith("if !is_tailscale(ip) { return false; } let Some(t) = self.0.get_mut(id) else { return false };"):
+        why.append("a reported address is kept for an unpinned Target or isn't a Tailscale one")
+    if not save.startswith("if !(secured && crate::client::boring_is_machine_id(id)) { return; }") or \
+            "known.learn_tailscale(id, ip)" not in save:
+        why.append("save_reported keeps an address from an unverified stream")
+    if not 0 <= peer_info.find(REMEMBERED) < peer_info.find("self.set_peer_info(&pi);"):
+        why.append("io_loop doesn't keep the address its verified Target reports")
+    if not 0 <= reported < conn.find("pi.platform_additions = serde_json::to_string(&platform_additions)"):
+        why.append("the Target doesn't report its tailnet address after login")
+    c.fact("the Hosted path holds the same pin as a Direct Link, and a tailnet address is kept only from a pinned Target "
+           "(tickets 08, 16)", not why, "; ".join(why))
+
+    code = strip_tests_and_comments(client)
+    inner = fn_body(code, "    async fn _start_inner(\n") or ""
+    langs = sorted((c.root / rebrand.LANG_DIR).glob("*.rs"))
+    missing = [p.name for p in langs for k in (HOSTED_DOWN,)
+               if p.read_text(encoding="utf-8").count(f'("{k}", ') != (0 if p.name == "en.rs" else 1)]
+    c.fact(f"Hosted servers unreachable: a plain error naming {HOSTED} (ticket 08)",
+           HOSTED_DOWN_MAP in inner and inner.count("socket?;") == 1 and HOSTED in HOSTED_DOWN
+           and HOSTED_RELAY in (fn_body(code, "    pub async fn start(\n") or "")
+           and 'starts_with("Failed to connect via relay server")' in plan_code
+           and f'pub const HOSTED_DOWN: &str = "{HOSTED_DOWN}";' in plan_code and rebrand.HOSTED_DOWN == HOSTED_DOWN
+           and bool(langs) and not missing, ", ".join(missing[:5]))
+
+
+# The one way a key lets a login skip Allow: a Trusted entry found by the key this login proved.
+SKIPS = "matches!(self.by_key, Some(ByKey::Trusted(..)))"
+PROVE = ("self.pk = pk.map(|k| hex(&k)); self.by_key = None; "
+         "if self.trusted.is_some() || self.always_ask.is_some() || self.removed.is_some() { return; } "
+         "let Some(c) = self.pk.as_deref().and_then(|pk| t.by_pk(pk)) else { return };")
+TAKE_WAIT = ("match self.waiting.take() { Some(password_right) => { self.may_remember = password_right && others == 0; "
+             "self.may_reinstate = others == 0; true } None => false, }")
+EFFECTIVE = ("let ok = if self.removed_key().is_some() { self.may_reinstate } else { self.may_remember }; "
+             "if how == SignIn::Allowed && !ok { SignIn::ThisSessionOnly } else { how }")
+
+
+def controller_key_checks(c, locked):
+    """Ticket 06 on 1.7's Trusted list: a new Controller needs the password and Allow; only a token
+    (1.7, Direct Link) or a key it proves over this login (1.8, signed) finds its entry; Allow stores
+    only after the right password with no other session open; Remove ends its sessions; while
+    anyone is connected Settings only tightens the list. The ID it reports is never enough."""
+    c.fact("new Controllers need the password and Allow on the Target (approve mode locked, ask can't hide)",
+           locked.get("approve-mode") == "" and "approve-mode" in locked and locked.get("allow-hide-cm") == "N",
+           f"approve-mode {locked.get('approve-mode')!r}, allow-hide-cm {locked.get('allow-hide-cm')!r}")
+    squash = lambda s: re.sub(r"\s+", " ", s or "").strip()
+    conn = c.read("src/server/connection.rs")
+    trust = strip_tests_and_comments(c.read("libs/base/src/trust.rs"))
+    wait = trust_gate(conn)
+    why = []
+    if not wait or "self.boring_trust.unattended_password_right();" not in wait \
+            or "if !self.boring_trust.skips_click() {" not in wait or "self.boring_trust.wait_for_allow(true);" not in wait \
+            or not re.search(BUMP + r"\s*self\.boring_trust\.wait_for_allow\(true\);\s*" + CLICK_WAIT, wait):
+        why.append("trust gate missing, out of place, or not counted")
+    if squash(fn_body(trust, "pub fn skips_click(&self) -> bool {")) != SKIPS:
+        why.append("something other than a Trusted entry's proven key skips Allow")
+    if not squash(fn_body(trust, "pub fn prove(&mut self, pk: Option<[u8; 32]>, t: &Trusted) {")).startswith(PROVE):
+        why.append("prove doesn't let a token decide first, or matches on something other than the proven key")
+    if "pub fn by_pk(&self, pk: &str) -> Option<&TrustedController> {\n        if pk.len() != 64 {" not in trust:
+        why.append("by_pk matches a short or empty key")
+    c.fact("a right password waits for Allow on the Target unless a Trusted Controller proves its key",
+           not why, "; ".join(why))
+
+    accept = conn.find("ipc::Data::Authorize => {")
+    gate = conn.find("if !conn.boring_trust.take_wait(crate::password_lock::authed_sessions()) {", accept)
+    audit = conn.find("conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);", accept)
+    stray = conn[gate:audit]
+    approve = squash(fn_body(trust, "fn approve_into(&mut self, t: &mut Trusted, how: SignIn, name: &str) -> bool {"))
+    c.fact("Allow only counts for a login waiting on it, and stores a Controller only after its password, "
+           "with no other session open",
+           0 <= accept < gate < audit and "conn.send_close_reason_no_retry(\"\").await;" in stray and "break;" in stray
+           and "clear_failures(&mut LOGIN_FAILURES[0].lock().unwrap(), &conn.failure_keys());" in stray
+           and squash(fn_body(trust, "pub fn take_wait(&mut self, others: usize) -> bool {")) == TAKE_WAIT
+           and squash(fn_body(trust, "fn effective(&self, how: SignIn) -> SignIn {")) == EFFECTIVE
+           and "let how = self.effective(how);" in (fn_body(trust, "pub fn approve(&mut self, how: SignIn, name: &str) {") or "")
+           and "if how != SignIn::Allowed { self.pending = None; return false; }" in approve
+           and "LOGIN_GRACE" in conn,
+           f"Authorize arm at {accept}, take_wait at {gate}")
+    login = conn.find("if let Some(message::Union::LoginRequest(lr)) = msg.union {")
+    waits = re.findall(r"self\.boring_trust\.wait_for_allow\((?:true|false)\);", conn)
+    c.fact("a new login on a connection waiting on Allow ends it (the click can't land on another login)",
+           re.search(r"if self\.boring_trust\.waiting\(\) \{\s*self\.send_login_error\(\"Connection not allowed\"\)\.await;"
+                     r"\s*return false;", conn[login:login + 800]) is not None and len(waits) == 3,
+           f"{len(waits)} waits")
+    c.fact("no Allow prompt for a login without the right password (empty or wrong)",
+           rebrand.EMPTY_PASSWORD_NO_CM in conn and rebrand.EMPTY_PASSWORD_CM not in conn
+           and rebrand.WRONG_PASSWORD_CM not in conn)
+    n, odd = logon_sites(conn, locked)
+    c.fact("exactly seven ways into a session, each gated or explained", n == 7 and not odd,
+           f"{n} logon calls, unexplained at {odd}")
+
+    lost = squash(fn_body(trust, "fn lost_trust_in(&self, t: &Trusted) -> bool {"))
+    plan = fn_body(trust, "fn plan_edit(raw: &str, edit: &Edit, sessions: usize) -> Result<(Trusted, bool), &'static str> {") or ""
+    ipc = c.read("src/ipc.rs")
+    why = []
+    if "(c.removed || !self.password_right && !self.stays && c.always_ask)" not in lost:
+        why.append("Remove doesn't end that Controller's session")
+    if "Edit::Allow { .. } if sessions > 0 => return Err(IN_SESSION)," not in plan or \
+            "if !*on && was && sessions > 0 {\n                return Err(IN_SESSION);" not in plan:
+        why.append("Settings can let more in while someone is connected")
+    if "base::trust::edit_in_session(&value, crate::password_lock::authed_sessions())" not in ipc:
+        why.append("the service's edit doesn't know who is connected")
+    c.fact("Remove ends that Controller's sessions; while anyone is connected Settings only tightens the list",
+           not why, "; ".join(why))
+    proof_checks(c, conn, trust)
+
+
+def stored_controller_key_checks(c):
+    """1.8 keys on 1.7's Trusted list: optional, never written empty, never a token."""
+    trust = strip_tests_and_comments(c.read("libs/base/src/trust.rs"))
+    c.fact("the Controller's key rides 1.7's list: optional, never written empty, its own entries never match a token",
+           '#[serde(default, skip_serializing_if = "String::is_empty")]\n    pub pk: String,' in trust
+           and 'pub const PK_KEY_PREFIX: &str = "pk:";' in trust
+           and "let ok = unhex(&t.key).map_or(false, |k| k.len() == d.len() && memcmp(&k, &d));" in trust)
+
+
+def baked_key():
+    """(the checked-in server public key, None) or (None, why it can't be the baked key)."""
+    try:
+        text = SERVER_KEY.read_text(encoding="ascii").strip()
+        raw = base64.b64decode(text, validate=True)
+    except (OSError, UnicodeError, ValueError) as e:
+        return None, f"{SERVER_KEY.name} missing or not base64 ({e.__class__.__name__})"
+    if len(raw) != 32 or base64.b64encode(raw).decode() != text:
+        return None, f"{SERVER_KEY.name} is not a 32-byte Ed25519 public key"
+    if text == RUSTDESK_KEY:
+        return None, f"{SERVER_KEY.name} is RustDesk's public servers' key"
+    if text != PINNED_KEY:
+        return None, f"{SERVER_KEY.name} isn't the pinned Hosted servers' key (check.py PINNED_KEY)"
+    if SERVERS_REPO_KEY.is_file() and SERVERS_REPO_KEY.read_text(encoding="ascii").strip() != text:
+        return None, f"{SERVER_KEY.name} differs from {SERVERS_REPO_KEY}"
+    return text, None
+
+
+def hosted_checks(c, cfg, locked):
+    """ADR 0005: the Hosted servers are the only servers, every override forces them, their key
+    is the checked-in one, and no Tailscale whitelist is left."""
+    servers = re.search(r"pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[(.*?)\];", cfg, re.S)
+    c.fact(f"the only rendezvous server is {HOSTED} (ADR 0005)",
+           servers is not None and servers.group(1).strip() == f'"{HOSTED}"' and rebrand.HOSTED == HOSTED,
+           servers and servers.group(1))
+    firsts = {sig: first_statement(cfg, sig) for sig in ("pub fn get_rendezvous_servers() -> Vec<String> {",
+                                                         "pub fn get_rendezvous_server() -> String {")}
+    c.fact("rendezvous server and list are always ours (exe name, Settings, config file, serial path skipped)",
+           list(firsts.values()) == [FORCE_SERVERS, FORCE_SERVER], firsts)
+    want = {"custom-rendezvous-server": HOSTED, "relay-server": HOSTED, "rendezvous-servers": HOSTED,
+            "api-server": ""}
+    bad = {k: locked.get(k) for k, v in want.items() if locked.get(k) != v}
+    c.fact(f"server settings locked to {HOSTED} (relay follows; no API server)", not bad, bad)
+
+    key, why = baked_key()
+    rs = re.search(r'pub const RS_PUB_KEY: &str = "([^"]*)";', cfg)
+    if key and (rs is None or rs.group(1) != key):
+        why = f"RS_PUB_KEY is {rs and rs.group(1)}, not {SERVER_KEY.name}"
+    elif key and locked.get("key") != key:
+        why = f"locked key option is {locked.get('key')!r}, not {SERVER_KEY.name}"
+    c.fact(f"baked server key is {SERVER_KEY.name} (built-in key and locked key option)", key and not why, why)
+
+    tailnet = set(rebrand.TAILNET.split(","))
+    maps = {name: rust_map(cfg, name) for name in ("OVERWRITE_SETTINGS", "DEFAULT_SETTINGS", "BUILTIN_SETTINGS",
+                                                   "HARD_SETTINGS", "OVERWRITE_LOCAL_SETTINGS",
+                                                   "DEFAULT_LOCAL_SETTINGS")}
+    left = [f"{name} {k}" for name, m in maps.items() for k, v in m.items()
+            if k == "whitelist" or tailnet & set(v.split(","))]
+    c.fact("no global whitelist left (ADR 0005: Hosted connections arrive from anywhere)", not left, ", ".join(left))
+    exposure_checks(c, cfg)
+
+
+ICE_URL = re.compile(r"\b(?:stun|stuns|turn|turns):(?://)?([\w.-]+)")
+RELAY_OURS = "let relay_server = boring_relay(&relay_server)?;"
+BORING_RELAY = ('let ours = hbb_common::config::Config::get_option("relay-server"); if ours.is_empty() '
+                '{ bail!("no relay server"); } if !advertised.is_empty() && advertised != ours '
+                '&& !advertised.starts_with(&format!("{ours}:")) { log::warn!("relay {advertised} named by the peer '
+                'ignored, using {ours}"); } Ok(ours)')
+DIRECT_LAN_ONLY = ('log::info!("direct access from {}", addr);\n'
+                   "                // boring-remote: the Direct Link answers Tailscale and private-LAN addresses only (ADR 0003, 0005).\n"
+                   "                if !base::lan::is_allowed(addr.ip()) {\n                    continue;\n                }\n")
+
+
+def exposure_checks(c, cfg):
+    """Ticket 07: what the Hosted path newly exposes stays shut. The Controller's relay is ours,
+    nothing reaches a third-party STUN server, 21118 answers Tailscale and private LAN only (1.7's
+    whitelist, now a listener hook), and the Machine ID can't be changed."""
+    squash = lambda t: re.sub(r"\s+", " ", t or "").strip()
+    client = strip_tests_and_comments(c.read("src/client.rs"))
+    relay = fn_body(client, "    async fn create_relay(\n") or ""
+    c.fact("the Controller's relay is always the locked relay-server, never a host the peer names",
+           relay.lstrip().startswith(RELAY_OURS) and squash(fn_body(client, "fn boring_relay(advertised: &str) -> ResultType<String> {")) == BORING_RELAY
+           and client.count("check_port(relay_server, RELAY_PORT)") == 1, relay.lstrip()[:120])
+
+    local = rust_map(cfg, "OVERWRITE_LOCAL_SETTINGS")
+    med = c.read("src/rendezvous_mediator.rs")
+    stun = []
+    for rel, text in shipped_files(c, (".rs", ".dart")):
+        code = strip_tests_and_comments(text) if rel.endswith(".rs") else text
+        stun += [f"{rel}: {h}" for h in ICE_URL.findall(code) if h != HOSTED]
+    why = [f"{k} not locked N" for k in ("enable-webrtc", "enable-ipv6-punch", "enable-udp-punch") if local.get(k) != "N"]
+    if "        let webrtc_viable = false\n" not in med:
+        why.append("the Target answers WebRTC offers")
+    if first_statement(med, "    slot: Option<PunchSlot>,\n) -> bytes::Bytes {") != \
+            "if true { return Default::default(); } // boring-remote: no IPv6 punch (ticket 07)":
+        why.append("the Target starts IPv6 punches (STUN probes)")
+    c.fact("no WebRTC, IPv6 or UDP punch, and no third-party STUN or TURN host ships",
+           not why and not stun, "; ".join(why + stun[:6]))
+
+    accept = med.find("if let Ok(Ok((stream, addr))) = hbb_common::timeout(1000, l.accept()).await {")
+    allowed = re.sub(r"\s+", " ", fn_body(c.read("libs/base/src/lan.rs"), "pub fn is_allowed(ip: IpAddr) -> bool {") or "")
+    c.fact("the Direct Link (21118) answers Tailscale and private-LAN addresses only, with no global whitelist",
+           accept >= 0 and med.count(DIRECT_LAN_ONLY) == 1
+           and 0 <= med.find(DIRECT_LAN_ONLY, accept) < med.find("crate::server::create_tcp_connection(", accept)
+           and "(a == 100 && (b & 0xc0) == 64) || v4.is_private()" in allowed, allowed[:120])
+
+    ui = c.read("src/ui_interface.rs")
+    first = first_statement(ui, "pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {")
+    settings, mobile = c.read(rebrand.SETTINGS), c.read(rebrand.MOBILE_SERVER)
+    c.fact("Change ID is off: hidden on desktop and mobile, refused if called (the Machine ID never changes)",
+           rust_map(cfg, "BUILTIN_SETTINGS").get("disable-change-id") == "Y"
+           and first is not None and first.startswith("if true { return INVALID_FORMAT; }")
+           and "if (!isChangeIdDisabled())\n                  _Card(title: 'ID', children: [changeId()])," in settings
+           and "            if (!isChangeIdDisabled())\n" in mobile
+           and "bind.mainGetBuildinOption(key: kOptionDisableChangeId) == 'Y'" in c.read("flutter/lib/common.dart"),
+           f"change_id_shared_ starts {first!r}")
+
+
+def first_launch_checks(c):
+    """Ticket 09: a Target without an app-generated Permanent password stays off the Hosted servers
+    (its Machine ID is never registered) while Direct IP over the tailnet keeps working."""
+    med = c.read("src/rendezvous_mediator.rs")
+    ipc = c.read("src/ipc.rs")
+    lock = strip_tests_and_comments(c.read("src/password_lock.rs"))
+    body = fn_body(med, "pub async fn start_all() {") or ""
+    flat = lambda sig: re.sub(r"\s+", "", fn_body(lock, sig) or "")
+    gate = re.search(r"let servers = crate::password_lock::hosted_servers\(\s*Config::get_rendezvous_servers\(\),"
+                     r"\s*crate::password_lock::hosted_on\(\),\s*\);", body)
+    helper = flat("pub fn hosted_servers(servers: Vec<String>, password_set: bool) -> Vec<String> {")
+    ready = flat("pub fn hosted_ready(marker: &str, has_password: bool) -> bool {")
+    on = flat("pub fn hosted_on() -> bool {")
+    spawn = re.search(r"let server_cloned = server\.clone\(\);\s*tokio::spawn\(async move \{\s*"
+                      r"direct_server\(server_cloned\)\.await;\s*\}\);", body)
+    loop = body.find("for host in servers.clone() {")
+    c.fact("no app-generated Permanent password, no Hosted servers: the Target registers its Machine ID only once "
+           "the generator's marker is set; Direct IP keeps listening (ticket 09)",
+           gate is not None and 0 <= gate.end() < loop and body.count("Config::get_rendezvous_servers()") == 1
+           and med.count("Self::start(server, host)") == 1 and helper == "ifpassword_set{servers}else{Vec::new()}"
+           and ready == 'marker=="Y"&&has_password'
+           and on == "hosted_ready(&Config::get_option(GENERATED_OPTION),Config::has_permanent_password())"
+           and spawn is not None and spawn.start() < body.find("\n        loop {\n"),
+           f"gate {gate is not None}, helper {helper!r}, ready {ready!r}, on {on!r}, Direct IP ungated {spawn is not None}")
+
+    ticks = re.findall(r"_ = timer\.tick\(\) => \{\s*if SHOULD_EXIT\.load\(Ordering::SeqCst\) \{\s*break;\s*\}"
+                       r"\s*if !crate::password_lock::hosted_on\(\) \{\s*break;", med)
+    c.fact("a live Hosted registration ends within a tick once the generated password is gone, whatever removed it "
+           "(ticket 09)", len(ticks) == 2 == med.count("_ = timer.tick() => {"), f"{len(ticks)} of 2 ticks")
+
+    key = re.search(r'pub const GENERATED_CONFIG: &str = "([^"]+)";', lock)
+    opt = re.search(r'pub const GENERATED_OPTION: &str = "([^"]+)";', lock)
+    protected = str_array(c, lock, "PROTECTED_CONFIG", {"GENERATED_CONFIG": key and key.group(1)})
+    arm = re.search(r"\} else if name == crate::password_lock::GENERATED_CONFIG \{\s*(?://[^\n]*\s*)?"
+                    r"updated = crate::password_lock::set_generated\(&value\);\s*let ack = if updated", ipc)
+    clear = re.search(r"updated = Config::set_permanent_password\(&value\);\s*if updated \{\s*"
+                      r"crate::password_lock::clear_generated\(\);", ipc)
+    setgen = fn_body(lock, "pub fn set_generated(password: &str) -> bool {") or ""
+    order = [setgen.find(n) for n in ("if !generated_write_allowed(", "authed_sessions()",
+                                      "Config::is_disable_change_permanent_password()",
+                                      "if !Config::set_permanent_password(password) {",
+                                      "Config::set_option(GENERATED_OPTION.to_owned(), \"Y\".to_owned());")]
+    allowed = flat("pub fn generated_write_allowed(password: &str, remote_sessions: usize, change_disabled: bool) -> bool {")
+    guard = fn_body(lock, "pub fn guard_options(") or ""
+    pinned = guard.find("pin_option(&mut incoming, current, GENERATED_OPTION);")
+    gen = flat("pub fn generate_and_set() -> String {")
+    c.fact("only an app-generated password sets the Hosted marker: the daemon writes it with the password, any other "
+           "password write clears it, and no Options write or remote session sets it (ticket 09)",
+           key and opt and key.group(1) in protected and arm and clear
+           and -1 not in order and order == sorted(order)
+           and allowed == ("!change_disabled&&config_write_allowed(GENERATED_CONFIG,remote_sessions)"
+                           "&&password.len()==LEN&&password.bytes().all(|b|ALPHABET.contains(&b))")
+           and 0 <= pinned < guard.find("if remote_sessions == 0")
+           and "ifsend_generated(pw.clone()){" in gen and "set_permanent_password" not in gen,
+           f"protected {protected}, generated arm {arm is not None}, typed clears {clear is not None}, "
+           f"set_generated order {order}, options pin {pinned}")
+
+    home, setup = c.read(rebrand.HOME), c.read(SETUP_DART)
+    panel = c.read("flutter/lib/desktop/kit/password.dart")
+    dart_opt = re.search(r"const kBoringPasswordGenerated = '([^']+)';", panel)
+    make = fn_body(panel, "  Future<void> _make() async {") or ""
+    at = setup.find("List<_Screen> _screensFor(SetupPlatform p, {bool passwordOnly = false}) => [")
+    screens = re.sub(r"\s+", " ", setup[at:setup.find("];", at) + 2]) if at >= 0 else ""
+    why = []
+    if not (rebrand.PASSWORD_SETUP_INIT in home and rebrand.PASSWORD_SETUP_BRANCH in home
+            and home.find(rebrand.PASSWORD_SETUP_BRANCH) < home.find("    if ((isMacOS || isWindows) && _boringSetup) {\n")):
+        why.append("the home page doesn't open Setup's password step for a computer with no password made here")
+    if not (dart_opt and opt and dart_opt.group(1) == opt.group(1)):
+        why.append("the Dart marker isn't the service's")
+    if "generatePassword: () => bind.mainGeneratePermanentPassword()," not in home or "passwordOnly: passwordOnly," not in home:
+        why.append("Setup doesn't run the generator")
+    if "if (!passwordOnly) ...[" not in screens or not screens.endswith("], _Screen.password, ];"):
+        why.append("the password-only run isn't Setup's own password step")
+    if not 0 <= make.find("final pass = await widget.generate();") < make.find("_step = _Step.shown;") \
+            or "if (pass.isEmpty) {" not in make:
+        why.append("the panel doesn't show the generated password once, or shows a refusal as a password")
+    if "_Step.confirm" not in (fn_body(panel, "  Widget build(BuildContext context) {") or ""):
+        why.append("replacing a password doesn't ask first")
+    c.fact("1.8.0 first launch: a computer with no password made here gets Setup's password step alone, which "
+           "runs the generator (asking first if a password is set) and shows it once (ticket 09)",
+           not why, "; ".join(why))
+
+
+def our_code(c):
+    """The Rust and Dart we add: our own modules and widgets, and the text rebrand.py inserts."""
+    files, inserted = set(), []
+    for rel, old, new, _ in rebrand.PATCHES:
+        if not isinstance(old, str):
+            continue
+        added = new.replace(old, "", 1) if old in new else new
+        if rel.endswith((".rs", ".dart")):
+            inserted.append(added)
+        if rel == "src/lib.rs":
+            files |= {f"src/{m}.rs" for m in re.findall(r"\bmod (\w+);", added)}
+        files |= {f"flutter/lib/desktop/widgets/{w}.dart"
+                  for w in re.findall(r"package:flutter_hbb/desktop/widgets/(\w+)\.dart", added)}
+    texts = {rel: strip_tests_and_comments(c.read(rel)) for rel in sorted(files)}
+    texts["rebrand.py inserted text"] = "\n".join(inserted)
+    return texts
+
+
+def config_kept_checks(c, cfg):
+    """Ticket 09: the 1.8.0 Update starts from the 1.7.x config, untouched."""
+    org = re.search(r'static ref ORG: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    app = re.search(r'static ref APP_NAME: RwLock<String> = RwLock::new\("([^"]*)"', cfg)
+    key = re.search(r'pub const KEY_OPTION: &str = "([^"]*)";', c.read("src/license_key.rs"))
+    same = ((org and org.group(1), app and app.group(1), key and key.group(1))
+            == (SHIPPED_ORG, SHIPPED_APP, SHIPPED_KEY_OPTION))
+    script = c.read("src/platform/privileges_scripts/install-update.sh")
+    removed = set(re.findall(r'\brm -r?f "([^"]+)"', script))
+    script_ok = (script and not CONFIG_PATH.search(script)
+                 and removed <= {"$STAGE", "$PREV", "$APP", "$OLD", "$f", "$SUPPORT/update-pending"})
+    wipes = [f"{rel}: {m.group(0)}" for rel, text in our_code(c).items() for m in CONFIG_WIPE.finditer(text)]
+    c.fact("the 1.8.0 Update keeps 1.7.x's config: same config dir and License key option, the update script "
+           "never touches it, and nothing we add clears saved machines or settings (ticket 09)",
+           same and script_ok and not wipes,
+           f"identity {org and org.group(1)}.{app and app.group(1)} / {key and key.group(1)}, "
+           f"script removes {sorted(removed)}, wipes {wipes[:5]}")
+
+
 def run_checks(root):
     c = Check(root)
+    workflow_guard(c)
     cfg = c.read(HBB)
 
     # identity
@@ -1964,17 +2770,13 @@ def run_checks(root):
            conf_dir == f"{rebrand.ORG}.{APP}" and dirs == {conf_dir}
            and tomls == {f"{APP}.toml", f"{APP}2.toml"}, f"config dir {conf_dir}, script {dirs} {tomls}")
 
-    # servers and locked settings
-    c.fact("rendezvous servers empty", re.search(r"RENDEZVOUS_SERVERS: &\[&str\] = &\[\s*\];", cfg))
+    # servers and locked settings (ADR 0005: the Hosted servers, forced; no whitelist)
     locked = rust_map(cfg, "OVERWRITE_SETTINGS")
-    for key in ("custom-rendezvous-server", "relay-server", "api-server"):
-        c.fact(f"{key} locked empty", key in locked and locked[key] == "", locked.get(key))
-    c.fact("whitelist locked to Tailscale + private LAN, nothing public (ADR 0003)",
-           whitelist_is_private(locked.get("whitelist", "")), locked.get("whitelist"))
+    hosted_checks(c, cfg, locked)
     c.fact("Direct IP locked on", locked.get("direct-server") == "Y")
     conn = c.read("src/server/connection.rs")
     ok, why = whitelist_enforced(conn, c.read("libs/hbb_common/src/lib.rs"))
-    c.fact("whitelist is enforced on incoming connections", ok, why)
+    c.fact("a whitelist the buyer sets is still checked first on incoming connections", ok, why)
     med, tcp = c.read("src/rendezvous_mediator.rs"), c.read("libs/hbb_common/src/tcp.rs")
     c.fact("Direct IP listener on all interfaces",
            "hbb_common::tcp::listen_any(" in med and "Ipv6Addr::UNSPECIFIED), port)" in tcp
@@ -1985,6 +2787,11 @@ def run_checks(root):
            and 'Config::get_option("allow-only-conn-window-open") == "Y"' in conn)
     c.fact("allow-only-conn-window-open available in settings",
            "'allow-only-conn-window-open'" in c.read("flutter/lib/desktop/pages/desktop_setting_page.dart"))
+    password_lock_checks(c, locked)
+    controller_key_checks(c, locked)
+    stored_controller_key_checks(c)
+    first_launch_checks(c)
+    config_kept_checks(c, cfg)
 
     # sync, NAT test, updater
     for rel, sig, what in (
@@ -2000,14 +2807,12 @@ def run_checks(root):
          "Windows exe-name license (sets rendezvous and API server)"),
         ("src/common.rs", "pub fn read_custom_client(config: &str) {",
          "custom.txt reader (writes OVERWRITE_SETTINGS)"),
-        (HBB, "pub fn get_rendezvous_servers() -> Vec<String> {",
-         "rendezvous server list (rendezvous-servers option, serial path)"),
+        ("src/common.rs", "fn get_api_server_(api: String, custom: String) -> String {",
+         "API server lookup (none derived from the rendezvous server: no audit posts)"),
     ):
         first = first_statement(c.read(rel), sig)
         c.fact(f"{what} returns before doing anything",
                first is not None and re.match(r"(if true \{ )?(return\b|bail!)", first), f"{rel}: {first!r}")
-    c.fact("rendezvous-servers locked empty", locked.get("rendezvous-servers") == "",
-           locked.get("rendezvous-servers"))
     body = fn_body(cfg, "pub fn get_rendezvous_server() -> String {") or ""
     c.fact("no rendezvous server read from the config file",
            body and "rendezvous_server = CONFIG2" not in body and "get_rendezvous_servers()" in body)
@@ -2087,32 +2892,24 @@ def run_checks(root):
            "logUiErrors((text) => bind.mainLogUiError(text: text));" in c.read("flutter/lib/main.dart")
            and "pub fn main_log_ui_error(text: String)" in c.read("src/flutter_ffi.rs"))
 
-    hits, index = [], []
+    hits = []
     for base in ("src", "libs", "flutter/lib"):
         for p in sorted((c.root / base).rglob("*")):
             if p.suffix not in (".rs", ".dart") or not p.is_file() or "/lang/" in p.as_posix():
                 continue
             code = strip_tests_and_comments(p.read_text(encoding="utf-8", errors="replace"))
             hits += [f"{p.relative_to(c.root)}: {h}" for h in PUBLIC_SERVER.findall(code)]
-            index += [f"{p.relative_to(c.root)}: {h}" for h in re.findall(r"RENDEZVOUS_SERVERS\[[^\]]*\]", code)]
-    c.fact("no shipped code names a RustDesk public server", not hits, "; ".join(hits[:10]))
-    c.fact("no code indexes the empty RENDEZVOUS_SERVERS (id@public panics)", not index, "; ".join(index))
-    public = re.search(r"if other_server == PUBLIC_SERVER \{(.*?)\} else", c.read("src/client.rs"), re.S)
-    c.fact("id@public peer fails with an error", public is not None and "split_first()" in public.group(1)
-           and "bail!(" in public.group(1), public and public.group(1)[:200])
+            hits += [f"{p.relative_to(c.root)}: RustDesk's server key" for _ in range(code.count(RUSTDESK_KEY))]
+    c.fact("no shipped code names a RustDesk public server or its key", not hits, "; ".join(hits[:10]))
 
-    # banned codecs and the Mac build flags
-    wf_dir = c.root / ".github/workflows"
-    workflows = sorted(wf_dir.glob("*.y*ml")) if wf_dir.is_dir() else []
-    upstream = [w.name for w in workflows if not w.name.startswith(rebrand.OUR_WORKFLOW_PREFIX)]
-    c.fact("only our workflows remain", not upstream, ", ".join(upstream))
+    # banned codecs and the Mac build flags (releases build locally: boring/release/build-mac)
     bad = []
     for p in sorted(c.root.rglob("*")):
         rel = p.relative_to(c.root).as_posix()
-        if not p.is_file() or rel.startswith(("boring/", ".git/", "target/")):
+        if not p.is_file() or (rel.startswith(("boring/", ".git/", "target/")) and rel != RELEASE_SCRIPT):
             continue
         is_wf = rel.startswith(".github/workflows/")
-        if not (is_wf or p.suffix in (".sh", ".ps1", ".bat", ".cmd", ".py") or p.name == "Dockerfile"):
+        if not (is_wf or p.suffix in (".sh", ".ps1", ".bat", ".cmd", ".py") or p.name in ("Dockerfile", "build-mac")):
             continue
         for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if BANNED.search(line) and (is_wf or BUILD_CALL.search(line)):
@@ -2123,25 +2920,22 @@ def run_checks(root):
     c.fact("hwcodec and vram not default features", m is not None and not BANNED.search(m.group(1)))
     c.fact("build.py refuses hwcodec and vram", "hwcodec and vram are banned" in c.read("build.py")
            and "features.append('hwcodec')" not in c.read("build.py"))
-    mac_builds = [l for w in workflows for l in w.read_text().splitlines()
+    mac_builds = [l for l in c.read(RELEASE_SCRIPT).splitlines()
                   if "build.py" in l and "--flutter" in l and "--portable" not in l]
     c.fact("Mac build has --unix-file-copy-paste",
            mac_builds and all("--unix-file-copy-paste" in l for l in mac_builds), str(mac_builds))
-    # the other pins can only be checked against upstream's workflows: boring/pins.py
-    app = re.search(r'(?m)^version = "([^"]*)"', c.read("Cargo.toml"))
-    wfv = re.search(r'(?m)^  VERSION: "([^"]*)"', c.read(".github/workflows/boring-build.yml"))
-    c.fact("workflow VERSION matches Cargo.toml version",
-           app and wfv and app.group(1) == wfv.group(1),
-           f"workflow {wfv and wfv.group(1)}, Cargo.toml {app and app.group(1)}; run boring/pins.py --fix")
+    # toolchain pins are checked against upstream's workflows by boring/pins.py; the app version is Cargo.toml's
 
-    msi_checks(c, workflows)
+    msi_checks(c)
     branding_checks(c)
     connect_checks(c)
     transfer_checks(c)  # v1.7 t29
     look_checks(c)  # v1.7 review: nothing left in the RustDesk look
+    direct_first_checks(c)
 
-    # protocol untouched: every .proto in the tree is upstream's, byte for byte
-    c.fact("protocol files are upstream's (boring/protocol.sha256)", *protocol_matches(c.root))
+    # protocol: every .proto in the tree is upstream's, byte for byte, except our two LoginRequest fields
+    c.fact("protocol files are upstream's plus our two LoginRequest fields (boring/protocol.sha256)",
+           *protocol_matches(c.root))
 
     print(f"rebrand check: {c.passed} passed, {c.failed} failed")
     return 1 if c.failed else 0

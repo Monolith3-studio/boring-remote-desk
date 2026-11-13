@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Compare our workflow's toolchain pins with upstream's at a git ref.
+"""Compare our release build's toolchain pins with upstream's at a git ref.
 
 Usage:  python3 boring/pins.py [--fix] [--root REPO] UPSTREAM_REF
 
 Our tree deletes upstream's workflows, so their pins are read from the ref
 with `git show`. The pins come from upstream's own build so ours build the
 same way. Exit 0 = all match, 1 = some stale (--fix copies upstream's values
-into boring-build.yml and exits 0), 2 = a pin's source moved upstream (fix the
+into boring/release/pins.env and exits 0), 2 = a pin's source moved upstream (fix the
 entry in PINS below), 3 = bad ref (not a commit in this repo: fetch it first).
 Run it on every rebase (boring/REBASE.md).
 
@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-OURS = ".github/workflows/boring-build.yml"
+OURS = "boring/release/pins.env"
 BUILD = ".github/workflows/flutter-build.yml"
 BRIDGE = ".github/workflows/bridge.yml"
 
@@ -27,24 +27,26 @@ def env(key):
     return rf'^  {key}: "([^"]*)"'
 
 
+def pin(key):  # ours: boring/release/pins.env, sourced by bash
+    return rf'^{key}="([^"]*)"'
+
+
 MIN_MACOS = r'MIN_MACOS_VERSION="([^"]*)"'
 
 # (our name, upstream file, upstream regex, our regex). Group 1 is the value.
 PINS = [
-    ("FLUTTER_VERSION", BUILD, env("FLUTTER_VERSION"), env("FLUTTER_VERSION")),
-    ("MAC_RUST_VERSION", BUILD, env("MAC_RUST_VERSION"), env("MAC_RUST_VERSION")),
-    ("WIN_RUST_VERSION", BUILD, env("RUST_VERSION"), env("WIN_RUST_VERSION")),
-    ("LLVM_VERSION", BUILD, env("LLVM_VERSION"), env("LLVM_VERSION")),
-    ("VCPKG_COMMIT_ID", BUILD, env("VCPKG_COMMIT_ID"), env("VCPKG_COMMIT_ID")),
+    ("FLUTTER_VERSION", BUILD, env("FLUTTER_VERSION"), pin("FLUTTER_VERSION")),
+    ("MAC_RUST_VERSION", BUILD, env("MAC_RUST_VERSION"), pin("MAC_RUST_VERSION")),
+    ("WIN_RUST_VERSION", BUILD, env("RUST_VERSION"), pin("WIN_RUST_VERSION")),
+    ("LLVM_VERSION", BUILD, env("LLVM_VERSION"), pin("LLVM_VERSION")),
+    ("VCPKG_COMMIT_ID", BUILD, env("VCPKG_COMMIT_ID"), pin("VCPKG_COMMIT_ID")),
     ("MIN_MACOS_VERSION", BUILD, MIN_MACOS, MIN_MACOS),
-    ("BRIDGE_RUST_VERSION", BRIDGE, env("RUST_VERSION"), env("BRIDGE_RUST_VERSION")),
+    ("BRIDGE_RUST_VERSION", BRIDGE, env("RUST_VERSION"), pin("BRIDGE_RUST_VERSION")),
     ("FLUTTER_RUST_BRIDGE_VERSION", BRIDGE, env("FLUTTER_RUST_BRIDGE_VERSION"),
-     env("FLUTTER_RUST_BRIDGE_VERSION")),
-    ("CARGO_EXPAND_VERSION", BRIDGE, env("CARGO_EXPAND_VERSION"), env("CARGO_EXPAND_VERSION")),
+     pin("FLUTTER_RUST_BRIDGE_VERSION")),
+    ("CARGO_EXPAND_VERSION", BRIDGE, env("CARGO_EXPAND_VERSION"), pin("CARGO_EXPAND_VERSION")),
     # the default bridge is the first matrix entry (the one for Flutter 3.24.x builds)
-    ("BRIDGE_FLUTTER_VERSION", BRIDGE, r'flutter-version: "([^"]*)"', env("BRIDGE_FLUTTER_VERSION")),
-    # the app version; the Mac smoke test compares `--version` with it
-    ("VERSION", "Cargo.toml", r'^version = "([^"]*)"', env("VERSION")),
+    ("BRIDGE_FLUTTER_VERSION", BRIDGE, r'flutter-version: "([^"]*)"', pin("BRIDGE_FLUTTER_VERSION")),
 ]
 
 

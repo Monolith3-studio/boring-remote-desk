@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'access.dart';
 import 'kit.dart';
-import 'simple_settings.dart';
+import 'password.dart';
 
 /// Local option set to 'Y' once Setup finishes (or is skipped through to the end).
 const kSetupDoneOption = 'boring-setup-done';
@@ -116,16 +116,18 @@ const setupCopy = <String, String>{
   'reach.failed': "That didn't work. Click Allow again, then click “Yes” when Windows asks.",
   'reach.skip.why': "If you skip, your other computers may not be able to reach this one. "
       'You can finish this later in Settings.',
-  // Screen 3
-  'password.title': 'Set a password for when no one is here',
-  'password.body': 'Your other computers can get in with this password when no one is at this one.',
-  'password.hint': 'Type a password',
-  'password.rule': 'At least 8 characters, with a capital, a small letter and a number.',
-  'password.failed': "Couldn't save that password. Try again.",
-  'password.save': 'Save password',
-  'password.seen': "You'll see “Password saved.” when it worked.",
-  'password.saved': 'Password saved.',
-  'password.already': 'A password is already set. Type a new one to change it, or click Finish.',
+  // Screen 3 (1.8: Boring Remote makes the password, kit/password.dart)
+  'password.title': 'Make a password for when no one is here',
+  'password.body': 'Your other computers use it to get in when no one is at this one. '
+      'Boring Remote makes it for you, long enough that nobody can guess it.',
+  // 1.8 first launch on a computer set up before (ticket 09): the password step alone
+  'later.title': 'Make a new password',
+  'later.body': 'Boring Remote can now reach this computer from anywhere by its Machine ID, not just on this '
+      'network or over Tailscale. That needs a password made here. This network and Tailscale keep working '
+      'until you make one.',
+  'later': 'Later',
+  'later.why': 'Until you make one, your other computers reach this one only on this network or over Tailscale. '
+      'Boring Remote asks again next time it opens.',
   'password.skip.why': 'If you skip, someone has to be at this Mac to click Allow every time. '
       'You can set it later in Settings.',
   'password.skip.why@windows': 'If you skip, someone has to be at this computer to click Allow every time. '
@@ -155,10 +157,12 @@ enum SetupPlatform { mac, windows }
 
 enum _Screen { name, allow, reach, password }
 
-List<_Screen> _screensFor(SetupPlatform p) => [
-      _Screen.name,
-      if (p == SetupPlatform.mac) _Screen.allow,
-      if (p == SetupPlatform.windows) _Screen.reach,
+List<_Screen> _screensFor(SetupPlatform p, {bool passwordOnly = false}) => [
+      if (!passwordOnly) ...[
+        _Screen.name,
+        if (p == SetupPlatform.mac) _Screen.allow,
+        if (p == SetupPlatform.windows) _Screen.reach,
+      ],
       _Screen.password,
     ];
 
@@ -177,7 +181,6 @@ class _MacSwitch {
 /// Bridge-free; the home page passes data and callbacks.
 class SetupFlow extends StatefulWidget {
   static const nameKey = Key('setup-name');
-  static const passwordKey = Key('setup-password');
 
   /// Screens Setup shows on [platform]; [startStep] and [onStep] count in these.
   static int screenCount(SetupPlatform platform) => _screensFor(platform).length;
@@ -211,8 +214,15 @@ class SetupFlow extends StatefulWidget {
   final Future<bool> Function() canBeReached;
   final Future<void> Function() allowReach;
 
+  /// A password is set now (made here, or typed in 1.7), and whether it was made here (1.8).
   final bool passwordSet;
-  final Future<bool> Function(String password) setPassword;
+  final bool passwordGenerated;
+
+  /// Asks the service to make and set a new Unattended Password; returns it once, '' if refused.
+  final Future<String> Function() generatePassword;
+
+  /// 1.8 first launch on a computer set up before (ticket 09): the password step alone, with Later.
+  final bool passwordOnly;
 
   final int startStep;
   final void Function(int step) onStep;
@@ -239,7 +249,9 @@ class SetupFlow extends StatefulWidget {
     required this.canBeReached,
     required this.allowReach,
     required this.passwordSet,
-    required this.setPassword,
+    this.passwordGenerated = false,
+    required this.generatePassword,
+    this.passwordOnly = false,
     this.startStep = 0,
     required this.onStep,
     required this.onDone,
@@ -260,10 +272,9 @@ class SetupFlow extends StatefulWidget {
 }
 
 class _SetupFlowState extends State<SetupFlow> {
-  late final _screens = _screensFor(widget.platform);
+  late final _screens = _screensFor(widget.platform, passwordOnly: widget.passwordOnly);
   late int _step = widget.startStep.clamp(0, _screens.length - 1);
   final _name = TextEditingController();
-  final _password = TextEditingController();
   String? _error;
   bool _confirmSkip = false;
   bool _saved = false;
@@ -271,7 +282,7 @@ class _SetupFlowState extends State<SetupFlow> {
   String? _opened; // the pane the person clicked through to, for "Waiting for that switch"
   bool _sawMissing = false, _reading = false;
   Timer? _moveOn;
-  late bool _welcome = widget.welcome && _step == 0;
+  late bool _welcome = widget.welcome && !widget.passwordOnly && _step == 0;
   bool _ready = false, _copied = false;
   bool _reached = false, _reachFailed = false;
   Timer? _poll;
@@ -295,7 +306,6 @@ class _SetupFlowState extends State<SetupFlow> {
     _poll?.cancel();
     _moveOn?.cancel();
     _name.dispose();
-    _password.dispose();
     super.dispose();
   }
 
@@ -402,7 +412,7 @@ class _SetupFlowState extends State<SetupFlow> {
     _moveOn = null;
     if (_step == _screens.length - 1) {
       _poll?.cancel();
-      if (widget.ready && !_ready) {
+      if (widget.ready && !widget.passwordOnly && !_ready) {
         setState(() => _ready = true);
         return;
       }
@@ -428,23 +438,6 @@ class _SetupFlowState extends State<SetupFlow> {
     if (mounted) _advance();
   }
 
-  Future<void> _savePassword() async {
-    final p = _password.text;
-    if (!SimpleSettings.strongEnough(p)) {
-      setState(() => _error = _copy('password.rule'));
-      return;
-    }
-    final ok = await widget.setPassword(p);
-    if (!mounted) return;
-    setState(() {
-      _error = ok ? null : _copy('password.failed');
-      if (ok) {
-        _saved = true;
-        _password.clear();
-      }
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     final t = Theme.of(context).textTheme;
@@ -454,10 +447,12 @@ class _SetupFlowState extends State<SetupFlow> {
       _Screen.name => (_copy('name.title'), _nameScreen(t)),
       _Screen.allow => (_copy('allow.title'), _allowScreen(t)),
       _Screen.reach => (_copy('reach.title'), _reachScreen(t)),
-      _Screen.password => (_copy('password.title'), _passwordScreen(t)),
+      _Screen.password => (_copy(widget.passwordOnly ? 'later.title' : 'password.title'), _passwordScreen(t)),
     };
     return _page(t, title, body,
-        step: _copy('step').replaceFirst('{n}', '${_step + 1}').replaceFirst('{total}', '${_screens.length}'));
+        step: widget.passwordOnly
+            ? null
+            : _copy('step').replaceFirst('{n}', '${_step + 1}').replaceFirst('{total}', '${_screens.length}'));
   }
 
   Widget _page(TextTheme t, String title, Widget body, {String? step}) {
@@ -482,13 +477,13 @@ class _SetupFlowState extends State<SetupFlow> {
       );
 
   /// Skip is a link; it only skips after the buyer has read what skipping costs.
-  Widget _skip(TextTheme t, String why) {
+  Widget _skip(TextTheme t, String why, {String? label}) {
     if (!_confirmSkip) {
       return Align(
         alignment: Alignment.centerLeft,
         child: TextButton(
           onPressed: () => setState(() => _confirmSkip = true),
-          child: Text(_copy('skip')),
+          child: Text(label ?? _copy('skip')),
         ),
       );
     }
@@ -727,44 +722,26 @@ class _SetupFlowState extends State<SetupFlow> {
   }
 
   Widget _passwordScreen(TextTheme t) {
-    final isSet = _saved || widget.passwordSet;
+    final isSet = _saved || widget.passwordSet && widget.passwordGenerated;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(_copy('password.body')),
-        if (widget.passwordSet && !_saved) ...[
-          const SizedBox(height: Kit.s2),
-          Text(_copy('password.already')),
-        ],
+        Text(_copy(widget.passwordOnly ? 'later.body' : 'password.body')),
         const SizedBox(height: Kit.s4),
-        if (_saved)
-          Row(children: [
-            const Icon(Icons.check_circle, color: Kit.ok),
-            const SizedBox(width: Kit.s2),
-            Text(_copy('password.saved')),
-          ])
-        else ...[
-          TextField(
-            key: SetupFlow.passwordKey,
-            controller: _password,
-            obscureText: true,
-            autofocus: true,
-            decoration: InputDecoration(hintText: _copy('password.hint')),
-            onSubmitted: (_) => _savePassword(),
-          ),
-          const SizedBox(height: Kit.s2),
-          Text(_copy('password.rule'), style: t.bodySmall),
-          const SizedBox(height: Kit.s2),
-          Text(_copy('password.seen'), style: t.bodySmall),
-          const SizedBox(height: Kit.s4),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: (isSet ? OutlinedButton.new : FilledButton.new)(
-                onPressed: _savePassword, child: Text(_copy('password.save'))),
-          ),
-        ],
+        UnattendedPasswordPanel(
+          passwordSet: widget.passwordSet,
+          generated: widget.passwordGenerated,
+          generate: widget.generatePassword,
+          copyText: widget.copyText,
+          onSaved: () => setState(() => _saved = true),
+        ),
         const SizedBox(height: Kit.s4),
-        if (isSet) _primary(_copy('done'), _advance) else _skip(t, _copy('password.skip.why')),
+        if (isSet)
+          _primary(_copy('done'), _advance)
+        else if (widget.passwordOnly)
+          _skip(t, _copy('later.why'), label: _copy('later'))
+        else
+          _skip(t, _copy('password.skip.why')),
       ],
     );
   }

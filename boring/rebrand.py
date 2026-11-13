@@ -35,8 +35,8 @@ LEGAL_DART = "flutter/lib/desktop/kit/legal.dart"
 LEGAL_CREDIT = "Boring Remote is based on RustDesk, \u00a9 Purslane Tech Pte. Ltd."
 LICENCE_ASSET = "flutter/assets/LICENCE.txt"  # the license text, bundled so Legal can show it with no network
 # Tailscale's address ranges, both tailnet-only: IPv4 CGNAT and the IPv6 ULA a
-# MagicDNS AAAA answer points at. The listener is dual-stack, so v4 peers arrive
-# as ::ffff:100.x and connection.rs normalises them with try_into_v4 first.
+# MagicDNS AAAA answer points at. The connect box sends a name Direct IP only when it
+# resolves into them (a tailnet name). No longer a whitelist (ADR 0005).
 TAILNET = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 # ADR 0003: the private LAN is allowed too (RFC 1918, IPv6 ULA and link-local),
 # so Macs on the same network connect Direct. Public addresses stay blocked.
@@ -59,39 +59,139 @@ CONNECT_ERRORS = {"NOT_FOUND": NOT_FOUND, "NOT_ON_THIS_NETWORK": NOT_ON_NETWORK,
                   "PLAINTEXT_REFUSED": PLAINTEXT_REFUSED, "IDENTITY_CHANGED": IDENTITY_CHANGED}
 CONNECT_ERROR_KEYS = list(CONNECT_ERRORS.values())
 
-# Replaces _start's IP and domain:port branches in src/client.rs. check.py looks for
-# exactly this block and that nothing before it reaches the ID/rendezvous path.
+# Replaces _start's IP and domain:port branches in src/client.rs (v1.7 t03; ADR 0005 Hosted, ticket
+# 08). check.py looks for exactly this block: a name or IP returns a Direct Link before anything can
+# reach the rendezvous path; only a Machine ID goes on, after its own Direct Link attempt.
 DIRECT_LINK_CALL = (
-    "        // boring-remote (v1.7 t03): every peer is a name or IP for a Direct Link, never an\n"
-    "        // ID. base::direct_link dials the Target's own address, then its Tailscale address,\n"
-    "        // else \"Not on this network\"; always encrypted or refused, Tailscale too (ADR 0004,\n"
-    "        // 0005). There is no rendezvous server, so the ID path below can't be reached.\n"
-    "        if true {\n"
+    "        // boring-remote (v1.7 t03): a name or IP is a Direct Link and nothing else: the Target's\n"
+    "        // own address, then its Tailscale address, else \"Not on this network\"; always encrypted\n"
+    "        // or refused, Tailscale too (ADR 0004, 0005). Never the ID path below.\n"
+    "        if !boring_is_machine_id(peer) {\n"
     "            let (stream, path, pk) = base::direct_link::connect(peer, CONNECT_TIMEOUT).await?;\n"
     "            return Ok((\n"
     "                (stream, true, pk, None, path.stream_type()),\n"
     "                (0, \"\".to_owned()),\n"
     "                false,\n"
     "            ));\n"
+    "        }\n"
+    "        // boring-remote (1.8, ticket 08): a Machine ID tries a Direct Link where it was met first\n"
+    "        // (pinned to that Machine ID), then the Hosted servers below (src/connect_plan.rs).\n"
+    "        if let Some((stream, path, pk)) =\n"
+    "            crate::connect_plan::direct_first(peer, interface.is_force_relay()).await\n"
+    "        {\n"
+    "            return Ok((\n"
+    "                (stream, true, pk, None, path.stream_type()),\n"
+    "                (0, \"\".to_owned()),\n"
+    "                false,\n"
+    "            ));\n"
     "        }\n")
+# The Hosted servers (ADR 0005): our unmodified hbbs + hbbr. The only rendezvous host the app
+# knows; the relay follows it. Their server key's public half is checked in next to this file,
+# the same bytes as boring-remote-servers' keys/id_ed25519.pub, and baked in as RS_PUB_KEY.
+HOSTED = "rs.theboringremote.com"
+SERVER_KEY_FILE = pathlib.Path(__file__).resolve().parent / "server-key.pub"
+RUSTDESK_PUB_KEY = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw="  # RustDesk's public servers' key
+
+# New UI strings for upstream's Set Password dialog (ticket 05; All settings still reaches it). The
+# kit's own words (Setup, Settings) are plain Dart strings, as all of 1.7's. Each is its own translation key: English text, "" in every
+# language file until translated (AGENTS.md, Localization).
+SESSION_SET_FAILED = "Couldn't set the password. If a remote session is open, end it and try again."
+UI_KEYS = [
+    "Generate", "Reset", "Copy", "New password", "Write it down or copy it now. It won't be shown again.",
+    "I've saved it", "Replace", "Replace the password?", "Every Controller will need the new password.",
+    "Also clear trusted Controllers", SESSION_SET_FAILED,
+]
+MACHINE_ID_LABEL = "Machine ID"  # the Target's ID on its home page (ticket 07, glossary)
+# A Machine-ID connection that didn't verify the Target against the baked server key (ticket 07).
+UNVERIFIED = "Couldn't verify this machine through the Boring Remote servers, so it wasn't connected."
+# Ticket 08: the Hosted-down error (src/connect_plan.rs HOSTED_DOWN).
+HOSTED_DOWN = ("Can't reach the Boring Remote servers (rs.theboringremote.com). Check this computer's internet"
+               " connection, or connect by Tailscale name or IP.")
+PATH_KEYS = [HOSTED_DOWN]
+LANG_KEYS = CONNECT_ERROR_KEYS + [MACHINE_ID_LABEL, UNVERIFIED] + UI_KEYS + PATH_KEYS
+# English shows these keys as they are, so en.rs doesn't list them (AGENTS.md, Localization).
+NOT_IN_EN = [MACHINE_ID_LABEL, UNVERIFIED] + PATH_KEYS
+# Goes in src/client.rs before `impl Client` (ADR 0005, tickets 07 and 08).
+MACHINE_ID_HELPERS = f"""
+// boring-remote (1.8): a Machine ID (digits only) is the one thing the Hosted servers carry; any
+// other name or address is 1.7's Direct Link (`_start`).
+pub(crate) const BORING_UNVERIFIED: &str = "{UNVERIFIED}";
+
+/// A Machine ID the Hosted servers issue: digits only. Never an address, a name or id@server.
+pub(crate) fn boring_is_machine_id(peer: &str) -> bool {{
+    !peer.is_empty() && peer.len() <= 20 && peer.bytes().all(|b| b.is_ascii_digit())
+}}
+
+/// The relay a Controller connects to: always the locked relay-server (the Hosted servers),
+/// never a host the Target or the rendezvous path names (ticket 07).
+fn boring_relay(advertised: &str) -> ResultType<String> {{
+    let ours = hbb_common::config::Config::get_option("relay-server");
+    if ours.is_empty() {{
+        bail!("no relay server");
+    }}
+    if !advertised.is_empty() && advertised != ours && !advertised.starts_with(&format!("{{ours}}:")) {{
+        log::warn!("relay {{advertised}} named by the peer ignored, using {{ours}}");
+    }}
+    Ok(ours)
+}}
+"""
 
 GUARD = "if true { return; } // boring-remote: stripped"
 GUARD_OK = "if true { return Ok(()); } // boring-remote: stripped"
+GUARD_EMPTY = 'if true { return "".to_owned(); } // boring-remote: no API server (spec slice 2)'
+# First statements of hbb_common's two server getters (ADR 0005): every override (exe name,
+# Settings, PROD_RENDEZVOUS_SERVER, the config file, rendezvous-servers, the serial path)
+# is skipped, so the answer is always the Hosted servers.
+FORCE_SERVERS = ("        if true { return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect(); }"
+                 " // boring-remote: the Hosted servers only\n")
+FORCE_SERVER = ('        if true { return format!("{}:{RENDEZVOUS_PORT}", RENDEZVOUS_SERVERS[0]); }'
+                " // boring-remote: the Hosted servers only\n")
+RELAY_OURS = ("        // boring-remote: always the Hosted relay (ticket 07).\n"
+              "        let relay_server = boring_relay(&relay_server)?;\n")
+# The Direct Link listener (21118) with no global whitelist (ADR 0005 removed it so relayed and
+# punched Hosted connections get through): Tailscale and private-LAN peers only, as 1.7's
+# whitelist allowed (ADR 0003, base::lan::is_allowed); anyone else is dropped before a byte.
+DIRECT_LAN_ONLY = (
+    "                // boring-remote: the Direct Link answers Tailscale and private-LAN addresses only (ADR 0003, 0005).\n"
+    "                if !base::lan::is_allowed(addr.ip()) {\n"
+    "                    continue;\n"
+    "                }\n")
 
 LOCKED = {  # OVERWRITE_SETTINGS: wins over the user's config file, UI shows them fixed
-    "whitelist": WHITELIST,
+    # Servers (ADR 0005): ours, forced, never blank. "key" (the baked server key) is added by
+    # server_patches(). No global whitelist: Machine-ID connections arrive relayed or punched from
+    # anywhere. The Direct Link listener (21118) still answers only Tailscale and private-LAN
+    # addresses (ADR 0003), by its own hook (DIRECT_LAN_ONLY).
     "direct-server": "Y",
-    "custom-rendezvous-server": "",
-    "relay-server": "",
-    "api-server": "",
+    "custom-rendezvous-server": HOSTED,
+    "relay-server": HOSTED,
+    "api-server": "",  # no API server (spec slice 2); get_api_server_ derives none either
     "allow-auto-update": "N",
-    "rendezvous-servers": "",     # a server list the config file could otherwise carry
+    "rendezvous-servers": HOSTED,  # a server list the config file could otherwise carry
+    # ticket 05: Unattended (permanent) password only; no one-time code, no Controller-side config edits
+    "verification-method": "use-permanent-password",
+    "allow-remote-config-modification": "N",
+    # ticket 06: password AND Allow. "" is RustDesk's "both": a right password from a Trusted
+    # Controller logs in, a new one also needs Allow here (base::trust). Not "password": that
+    # hides Allow. The ask can't be hidden either.
+    "approve-mode": "",
+    "allow-hide-cm": "N",
 }
 DEFAULTS = {  # DEFAULT_SETTINGS: user can change
     "allow-only-conn-window-open": "N",
 }
 LOCKED_LOCAL = {  # OVERWRITE_LOCAL_SETTINGS
     "enable-check-update": "N",
+    # Ticket 07: no WebRTC, IPv6 or UDP punch. They reach third-party STUN servers (Google,
+    # Cloudflare...) and hand ICE candidates to whoever asks; TCP punch and the relay remain.
+    "enable-webrtc": "N",
+    "enable-ipv6-punch": "N",
+    "enable-udp-punch": "N",
+}
+# BUILTIN_SETTINGS (ticket 07): the Machine ID never changes, so saved machines and the Hosted
+# path keep working (custom IDs aren't Machine IDs). Hides Change ID on desktop and mobile.
+BUILTIN = {
+    "disable-change-id": "Y",
 }
 
 
@@ -220,36 +320,70 @@ PATCHES = [
          "LaunchAgent label (bundle move, t17)"),
     )
 ] + [
-    # --- servers: none ------------------------------------------------------
+    # --- servers: the Hosted servers only (ADR 0005) ------------------------
     (HBB, 'pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];',
-     "pub const RENDEZVOUS_SERVERS: &[&str] = &[];", "no public rendezvous server"),
+     f'pub const RENDEZVOUS_SERVERS: &[&str] = &["{HOSTED}"];', "the Hosted servers, no public one"),
     ("libs/hbb_common/src/lib.rs", 'const URL: &str = "https://api.rustdesk.com/version/latest";',
      'const URL: &str = "";', "no version check endpoint"),
     ("src/common.rs", '    "https://admin.rustdesk.com".to_owned()\n',
      '    "".to_owned()\n', "no default API server"),
+    ("src/common.rs", "fn get_api_server_(api: String, custom: String) -> String {\n",
+     f"fn get_api_server_(api: String, custom: String) -> String {{\n    {GUARD_EMPTY}\n",
+     "no API server, none derived from the rendezvous server (no audit posts, no account calls)"),
     (HBB, "    pub fn get_rendezvous_servers() -> Vec<String> {\n",
-     "    pub fn get_rendezvous_servers() -> Vec<String> {\n"
-     "        if true { return Vec::new(); } // boring-remote: stripped\n",
-     "no server list from the exe name, rendezvous-servers or the serial path"),
+     "    pub fn get_rendezvous_servers() -> Vec<String> {\n" + FORCE_SERVERS,
+     "server list is ours: not from the exe name, rendezvous-servers or the serial path"),
+    (HBB, "    pub fn get_rendezvous_server() -> String {\n",
+     "    pub fn get_rendezvous_server() -> String {\n" + FORCE_SERVER,
+     "rendezvous server is ours: not from the exe name, Settings, PROD or the config file"),
     (HBB, "            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();\n",
      "            // boring-remote: no rendezvous server from the config file\n",
      "no rendezvous server from the config file"),
+    # upstream's test sets a custom server and expects it back; ours must ignore it
+    ("src/common.rs", '        assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));\n',
+     "        // boring-remote: a server set in Settings never replaces the Hosted servers\n"
+     f'        assert_eq!(get_tcp_proxy_addr(), format!("{HOSTED}:{{RENDEZVOUS_PORT}}"));\n',
+     "upstream's TCP proxy test expects the Hosted server over a custom one"),
+    # upstream's test maps ports from servers set in Settings; ours can't be set
+    ("libs/hbb_common/src/websocket.rs", "    #[test]\n    fn test_check_ws() {\n",
+     '    #[test]\n    #[ignore = "boring-remote: servers are locked to the Hosted servers"]\n'
+     "    fn test_check_ws() {\n",
+     "upstream's websocket port test needs settable servers"),
+    (HBB, "pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+     "pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(BUILTIN) + ";",
+     "Change ID off: the Machine ID never changes"),
+    ("src/ui_interface.rs", "pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {\n",
+     "pub async fn change_id_shared_(id: String, old_id: String) -> &'static str {\n"
+     "    if true { return INVALID_FORMAT; } // boring-remote: the Machine ID never changes (ticket 07)\n",
+     "no ID change, whatever calls it"),
+    # --- ticket 07: the relay is ours, no third-party STUN, 21118 tailnet-only ---------
     ("src/client.rs",
-     "            if other_server == PUBLIC_SERVER {\n"
-     "                (\n"
-     "                    check_port(RENDEZVOUS_SERVERS[0], RENDEZVOUS_PORT),\n"
-     "                    RENDEZVOUS_SERVERS[1..]\n"
-     "                        .iter()\n",
-     "            if other_server == PUBLIC_SERVER {\n"
-     "                // boring-remote: the list is empty, so id@public is an error, not a panic\n"
-     "                let Some((first, rest)) = RENDEZVOUS_SERVERS.split_first() else {\n"
-     '                    bail!("Boring Remote has no public server: connect by tailnet address");\n'
-     "                };\n"
-     "                (\n"
-     "                    check_port(*first, RENDEZVOUS_PORT),\n"
-     "                    rest.iter()\n",
-     "id@public peer fails cleanly"),
-    # --- Direct Link (v1.7 t03): the connect box takes a name or IP, never an ID ------
+     "    ) -> ResultType<Stream> {\n        let mut conn = connect_tcp(\n"
+     "            ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),\n",
+     "    ) -> ResultType<Stream> {\n" + RELAY_OURS + "        let mut conn = connect_tcp(\n"
+     "            ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),\n",
+     "the Controller's relay is the locked relay-server, never one the peer names"),
+    ("libs/hbb_common/src/webrtc.rs", re.compile(
+        r'static DEFAULT_ICE_SERVERS: \[&str; 4\] = \[\n(?:    "stun:[^"]*",\n){4}\];'),
+     f'static DEFAULT_ICE_SERVERS: [&str; 1] = ["stun:{HOSTED}:3478"]; // boring-remote: no third-party STUN',
+     "no third-party STUN servers"),
+    ("src/rendezvous_mediator.rs", "        let webrtc_viable = !ph.webrtc_sdp_offer.is_empty()\n",
+     "        // boring-remote: never answer a WebRTC offer (third-party STUN, ICE candidates; ticket 07)\n"
+     "        let webrtc_viable = false\n            && !ph.webrtc_sdp_offer.is_empty()\n",
+     "the Target answers no WebRTC offer"),
+    ("src/rendezvous_mediator.rs",
+     "    slot: Option<PunchSlot>,\n) -> bytes::Bytes {\n",
+     "    slot: Option<PunchSlot>,\n) -> bytes::Bytes {\n"
+     "    if true { return Default::default(); } // boring-remote: no IPv6 punch (ticket 07)\n",
+     "the Target starts no IPv6 punch (it would probe STUN servers)"),
+    ("src/rendezvous_mediator.rs", '                log::info!("direct access from {}", addr);\n',
+     '                log::info!("direct access from {}", addr);\n' + DIRECT_LAN_ONLY,
+     "Direct Link (21118) answers Tailscale and private-LAN addresses only"),
+    # --- connect box: a Machine ID can reach the Hosted servers; names and IPs are a Direct Link ----
+    ("src/client.rs", "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
+     MACHINE_ID_HELPERS + "\nimpl Client {\n    const CLIENT_CLIPBOARD_NAME",
+     "Machine ID test and the locked relay"),
+    # --- Direct Link (v1.7 t03): a name or IP is a Direct Link; a Machine ID tries one first ------
     ("src/client.rs",
      "        // to-do: remember the port for each peer, so that we can retry easier\n"
      "        if hbb_common::is_ip_str(peer) {\n"
@@ -281,7 +415,7 @@ PATCHES = [
      "            ));\n"
      "        }\n",
      DIRECT_LINK_CALL,
-     "every peer is a Direct Link: own address, then Tailscale, else Not on this network; no ID path"),
+     "a name or IP is a Direct Link only; a Machine ID tries one, then the Hosted servers"),
     # --- lock bypasses: these write past OVERWRITE_SETTINGS ------------------
     ("src/platform/windows.rs", "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n",
      "pub fn get_license_from_exe_name() -> ResultType<CustomServer> {\n"
@@ -289,11 +423,9 @@ PATCHES = [
      "exe name cannot set the rendezvous, API or relay server"),
     ("src/common.rs", "pub fn read_custom_client(config: &str) {\n",
      f"pub fn read_custom_client(config: &str) {{\n    {GUARD}\n",
-     "custom.txt cannot rewrite OVERWRITE_SETTINGS (whitelist, servers)"),
+     "custom.txt cannot rewrite OVERWRITE_SETTINGS (servers, key)"),
     # --- locked settings ----------------------------------------------------
-    (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
-     "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(LOCKED) + ";",
-     "whitelist, Direct IP, empty servers, no auto update"),
+    # OVERWRITE_SETTINGS (LOCKED plus the server key) is in server_patches().
     (HBB, "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
      "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = " + _rust_map(DEFAULTS) + ";",
      "allow-only-conn-window-open off by default"),
@@ -879,7 +1011,8 @@ T04_EDIT_IPC = (
     "                } else if name == base::trust::EDIT_CONFIG {\n"
     "                    // boring-remote: Settings' Remove, Allow and \"Always ask for password\", one locked\n"
     "                    // edit of the Trusted list here in the service; its answer goes back (base::trust).\n"
-    "                    let answer = base::trust::edit(&value);\n"
+    "                    // 1.8: while a session is open, only edits that let fewer in apply.\n"
+    "                    let answer = base::trust::edit_in_session(&value, crate::password_lock::authed_sessions());\n"
     "                    allow_err!(stream.send(&Data::Config((name.clone(), Some(answer)))).await);\n")
 T04_KEEP_LIST_OLD = "                Config::set_options(value);\n                allow_err!(stream.send(&Data::Options(None)).await);\n"
 T04_KEEP_LIST = (
@@ -930,7 +1063,26 @@ T04_EDIT_FFI = (
     "    #[cfg(any(target_os = \"android\", target_os = \"ios\"))]\n"
     "    return base::trust::edit(&edit);\n"
     "}\n\n")
-T04_TRUSTED_SKIP = T04_ALWAYS_ASK + (
+# 1.8 (ticket 06, option B): the Controller key a login proves finds its entry on the same list,
+# before the always-ask and Trusted checks read it (base::trust::Admission::prove). A token, where
+# the Direct Link exchange gave one, still decides first. The fields are read one by one: upstream's
+# match above has moved lr.union.
+T04_PROVE = (
+    "            // boring-remote (1.8, ticket 06): the Controller's own key, proven over this login (its\n"
+    "            // signature over this connection's challenge and this computer's Machine ID, on a keyed\n"
+    "            // stream), finds its Trusted Controllers entry too. A token still decides first.\n"
+    "            self.boring_trust.prove(\n"
+    "                crate::trust_policy::login_key(\n"
+    "                    &lr.my_id,\n"
+    "                    &lr.boring_controller_pk,\n"
+    "                    &lr.boring_login_sig,\n"
+    "                    &self.hash.challenge,\n"
+    "                    &Config::get_id(),\n"
+    "                    self.stream.is_secured(),\n"
+    "                ),\n"
+    "                &base::trust::Trusted::load(),\n"
+    "            );\n")
+T04_TRUSTED_SKIP = T04_PROVE + T04_ALWAYS_ASK + (
     "            // boring-remote (v1.7 t04): only a token this Mac issued skips the ask (ADR 0005).\n"
     "            if self.boring_trust.is_trusted() {\n"
     "                if !self.send_logon_response_and_keep_alive().await {\n"
@@ -942,13 +1094,16 @@ T04_TRUSTED_SKIP = T04_ALWAYS_ASK + (
     "            // A Controller removed from Trusted Controllers waits for Allow here, whatever\n"
     "            // password it brings: Remove is not undone quietly (device check A2 step 5).\n"
     "            if self.boring_trust.must_ask() {\n"
+    "                self.boring_trust.wait_for_allow(false); // 1.8: Allow takes only a login waiting on it\n"
     "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
     "                self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)\n"
     "                    .await;\n"
     "                return true;\n"
     "            }\n")
-# ADR 0005: Allow here or the Unattended Password makes a Controller Trusted; a one-time code
-# (or the recent-session password) lets it in for this session only.
+# ADR 0005 (1.7): Allow here makes a Controller Trusted; a one-time code (or the recent-session
+# password) lets it in for this session only. 1.8 (base::trust): the Unattended Password alone no
+# longer stores a new Controller, and Allow stores one only after that password, with no other
+# session open; the one-time code is locked off (verification-method).
 T04_GRANT = (
     "        // boring-remote (v1.7 t04): Allow or the Unattended Password = Trusted; a one-time code\n"
     "        // is this session only (ADR 0005).\n"
@@ -1256,6 +1411,9 @@ MAC_HOME_METHOD = (
     "          builder: (context, _) => MacHome(\n"
     "            macs: usedBefore(),\n"
     "            tailscaleAddress: thisTailscaleAddress,\n"
+    "            // 1.8 (ADR 0005): this computer's Machine ID, and whether the Hosted servers know it yet.\n"
+    "            machineId: bind.mainGetMyId(),\n"
+    "            hostedOn: bind.mainGetOptionSync(key: kBoringPasswordGenerated) == 'Y',\n"
     "            lan: lanMacs.macs,\n"
     "            discover: () => bind.mainDiscover(),\n"
     "            onConnect: (t) => connect(context, t),\n"
@@ -1656,7 +1814,13 @@ SIMPLE_SETTINGS_METHOD = (
     "          macName: name.isNotEmpty ? name : Platform.localHostname.replaceAll('.local', ''),\n"
     "          onRename: (n) => bind.mainSetOption(key: nameKey, value: n),\n"
     "          passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
-    "          setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
+    "          // 1.8 ticket 05: the service makes the password; Replace can remove every Trusted Controller.\n"
+    "          passwordGenerated: bind.mainGetOptionSync(key: kBoringPasswordGenerated) == 'Y',\n"
+    "          generatePassword: () => bind.mainGeneratePermanentPassword(),\n"
+    "          removeTrusted: () async {\n"
+    "            final error = trustEditError(await bind.boringTrustEdit(edit: jsonEncode({'op': 'remove_all'})));\n"
+    "            if (error != null) debugPrint('Settings: remove every Trusted Controller: $error');\n"
+    "          },\n"
     "          // Remote access = the service is installed and not stopped. Off stops it (it stays off\n"
     "          // across restarts until turned back on). v1.7 t17: its own switch, never tied to login.\n"
     "          remoteAccess: bind.mainIsInstalledDaemon(prompt: false) &&\n"
@@ -1710,6 +1874,7 @@ PATCHES += [
     (SETTINGS, "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
      "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/kit.dart';\n"
+     "import 'package:flutter_hbb/desktop/kit/password.dart';\n"
      "import 'package:flutter_hbb/desktop/kit/simple_settings.dart';\n",
      "simple Settings imports"),
     (SETTINGS, "    super.build(context);\n    return Scaffold(\n"
@@ -2099,7 +2264,7 @@ PATCHES += [
 # opens it again. Screen 1 writes the same name option Settings and LAN Discovery use.
 T06_SETUP_PAGE = (
     "// boring-remote: v1.7 t06 Setup (name, see + control, Unattended Password).\n"
-    "Widget boringSetupPage({required VoidCallback onDone}) {\n"
+    "Widget boringSetupPage({required VoidCallback onDone, bool passwordOnly = false}) {\n"
     f"  const nameKey = '{BORING_MAC_NAME_OPTION}';\n"
     "  final name = bind.mainGetOptionSync(key: nameKey);\n"
     "  final screens = SetupFlow.screenCount(SetupPlatform.mac);\n"
@@ -2131,15 +2296,20 @@ T06_SETUP_PAGE = (
     "          launchUrl(Uri.parse(url));\n"
     "        },\n"
     "        passwordSet: bind.mainGetCommonSync(key: 'permanent-password-set') == 'true',\n"
-    "        setPassword: (p) => bind.mainSetPermanentPasswordWithResult(password: p),\n"
+    "        // 1.8 tickets 05, 09: the service makes the password; a computer set up before gets this step alone.\n"
+    "        passwordGenerated: bind.mainGetOptionSync(key: kBoringPasswordGenerated) == 'Y',\n"
+    "        generatePassword: () => bind.mainGeneratePermanentPassword(),\n"
+    "        passwordOnly: passwordOnly,\n"
     "        startStep: setupStartStep(bind.mainGetLocalOption(key: kSetupStepOption), screens),\n"
     "        // v1.7 t21: a welcome on first launch only; Ready is Settings' Access line, green when it is.\n"
     "        welcome: setupNeeded(bind.mainGetLocalOption(key: kSetupDoneOption)),\n"
     "        readyChecks: boringAccessChecks(),\n"
     "        onStep: (i) => bind.mainSetLocalOption(key: kSetupStepOption, value: '$i'),\n"
     "        onDone: () async {\n"
-    "          await bind.mainSetLocalOption(key: kSetupStepOption, value: '');\n"
-    "          await bind.mainSetLocalOption(key: kSetupDoneOption, value: 'Y');\n"
+    "          if (!passwordOnly) {\n"
+    "            await bind.mainSetLocalOption(key: kSetupStepOption, value: '');\n"
+    "            await bind.mainSetLocalOption(key: kSetupDoneOption, value: 'Y');\n"
+    "          }\n"
     "          onDone();\n"
     "        },\n"
     "      ),\n"
@@ -2163,6 +2333,7 @@ T06_RUN_AGAIN = (
 T06_FOLDS = {
     (HOME, "Mac Home imports"): ("import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n",
                                 "import 'package:flutter_hbb/desktop/kit/mac_home.dart';\n"
+                                "import 'package:flutter_hbb/desktop/kit/password.dart';\n"
                                 "import 'package:flutter_hbb/desktop/kit/setup.dart';\n"),
     (HOME, "Mac Home replaces the RustDesk home on Mac"): (
         "    if (isMacOS) return _buildBlock(child: buildBoringHome(context));\n",
@@ -3821,6 +3992,447 @@ PATCHES += [
      "empty folders include hidden ones (t30)"),
 ]
 
+# --- Permanent password only (ticket 05) ------------------------------------------
+# src/password_lock.rs and generated_password.dart are ours; these wire them in.
+# The locks themselves are in LOCKED (verification-method, allow-remote-config-modification).
+# Shared by both gates below: upstream's click branch (Windows terminal OS-login prep, the
+# version check before the wait message), so a gated login behaves like an upstream click login.
+def _click_wait(indent):
+    i = " " * indent
+    return (
+        f"{i}#[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+        f"{i}if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {{\n"
+        f"{i}    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {{\n"
+        f"{i}        return keep_alive;\n"
+        f"{i}    }}\n"
+        f"{i}}}\n"
+        f"{i}self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+        f"{i}if hbb_common::get_version_number(&lr.version)\n"
+        f"{i}    >= hbb_common::get_version_number(\"1.2.0\")\n"
+        f"{i}{{\n"
+        f"{i}    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS).await;\n"
+        f"{i}}}\n"
+        f"{i}return true;\n")
+
+
+NO_PASSWORD_GATE = (
+    "            // boring-remote: Unattended (permanent) password only (ticket 05). None set yet: no\n"
+    "            // unattended access, but someone at this computer can still click Allow, for this\n"
+    "            // session only (ticket 06, base::trust).\n"
+    "            if crate::password_lock::refuse_login(&Config::get_option(keys::OPTION_VERIFICATION_METHOD)) {\n"
+    "                self.send_login_error(crate::password_lock::LOCK_GONE_ERROR).await;\n"
+    "                return false;\n"
+    "            }\n"
+    "            if !Config::has_permanent_password() {\n"
+    "                // Every prompt counts against this IP's failure budget: no prompt spam.\n"
+    "                let (failure, res) = self.check_failure(0).await;\n"
+    "                if !res {\n"
+    "                    return true;\n"
+    "                }\n"
+    "                self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+    "                self.boring_trust.wait_for_allow(false);\n"
+    + _click_wait(16) +
+    "            }\n")
+GENERATE_BUTTON = (
+    "        // boring-remote: Generate (ticket 05) sets a strong password and shows it once. Reset asks\n"
+    "        // first and can remove every Trusted Controller too (ticket 06, one locked edit in the service).\n"
+    "        final generateButton = dialogButton(\n"
+    "          permanentPasswordSet ? \"Reset\" : \"Generate\",\n"
+    "          icon: Icon(Icons.casino_outlined),\n"
+    "          onPressed: () async {\n"
+    "            var clearTrusted = false;\n"
+    "            if (permanentPasswordSet) {\n"
+    "              final go = await confirmReplacePassword();\n"
+    "              if (go == null) return;\n"
+    "              clearTrusted = go;\n"
+    "            }\n"
+    "            final pass = await bind.mainGeneratePermanentPassword();\n"
+    "            if (pass.isEmpty) {\n"
+    "              setState(() {\n"
+    f"                errMsg0 = '${{translate('Prompt')}}: ${{translate(\"{SESSION_SET_FAILED}\")}}';\n"
+    "              });\n"
+    "              return;\n"
+    "            }\n"
+    "            if (clearTrusted) clearTrustedControllers();\n"
+    "            close();\n"
+    "            notEmptyCallback?.call();\n"
+    "            showGeneratedPasswordOnce(pass);\n"
+    "          },\n"
+    "        );\n")
+IPC_GUARD = ("!crate::password_lock::config_write_allowed(&name, "
+             "crate::password_lock::authed_sessions())")
+SYNC_GUARD = (
+    "            // boring-remote: no whole-config replace during a remote session (tickets 05, 06).\n"
+    "            if crate::password_lock::authed_sessions() > 0 {\n"
+    "                log::warn!(\"config sync refused during a remote session\");\n"
+    "                return;\n"
+    "            }\n")
+# Before 1.7's T04_KEEP_LIST (the Trusted list stays the service's own): security options and
+# the Hosted marker stay put during a remote session (ticket 05).
+OPTIONS_HOOK = (
+    "                // boring-remote: security options stay put during a remote session (ticket 05).\n"
+    "                let value = crate::password_lock::guard_options(\n"
+    "                    value,\n"
+    "                    &Config::get_options(),\n"
+    "                    crate::password_lock::authed_sessions(),\n"
+    "                );\n")
+MOBILE_SERVER = "flutter/lib/mobile/pages/server_page.dart"
+NON_IOS = '#[cfg(not(target_os = "ios"))] // boring-remote: Target side only\n'
+PATCHES += [
+    ("src/lib.rs", "mod lang;\n",
+     "mod lang;\n" + NON_IOS + "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
+     "password lock module (no Target side on iOS)"),
+    ("src/flutter_ffi.rs", "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "/// boring-remote: set a generated permanent password (ticket 05) and return it once for the\n"
+     "/// UI to show. Empty if the daemon refused it. Never logged, never readable again.\n"
+     "pub fn main_generate_permanent_password() -> String {\n"
+     "    #[cfg(not(target_os = \"ios\"))]\n"
+     "    return crate::password_lock::generate_and_set();\n"
+     "    #[cfg(target_os = \"ios\")]\n"
+     "    String::new()\n"
+     "}\n\n"
+     "pub fn main_get_local_option(key: String) -> SyncReturn<String> {\n",
+     "generate password bridge call"),
+    ("src/server/connection.rs", "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
+     NO_PASSWORD_GATE
+     + "            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)\n",
+     "no permanent password refuses the login"),
+    ("src/ipc.rs",
+     '                } else if name == "permanent-password" {\n'
+     "                    if Config::is_disable_change_permanent_password() {\n",
+     '                } else if name == "permanent-password" {\n'
+     f"                    if {IPC_GUARD} {{\n"
+     '                        log::warn!("permanent password write refused during a remote session");\n'
+     "                        updated = false;\n"
+     "                    } else if Config::is_disable_change_permanent_password() {\n",
+     "no password change during a remote session"),
+    ("src/ipc.rs",
+     '                } else if name == "salt" {\n                    Config::set_salt(&value);\n',
+     '                } else if name == "salt" {\n'
+     f"                    if {IPC_GUARD} {{\n"
+     '                        log::warn!("salt write refused during a remote session");\n'
+     "                        return;\n"
+     "                    }\n"
+     "                    Config::set_salt(&value);\n",
+     "no salt change during a remote session"),
+    ("src/ipc.rs",
+     '                } else if name == "unlock-pin" {\n                    Config::set_unlock_pin(&value);\n',
+     '                } else if name == "unlock-pin" {\n'
+     f"                    if {IPC_GUARD} {{\n"
+     '                        log::warn!("unlock PIN write refused during a remote session");\n'
+     "                        return;\n"
+     "                    }\n"
+     "                    Config::set_unlock_pin(&value);\n",
+     "no unlock PIN change during a remote session"),
+    ("src/ipc.rs", T04_KEEP_LIST, OPTIONS_HOOK + T04_KEEP_LIST, "security options kept during a remote session"),
+    ("src/ipc.rs",
+     "        Data::SyncConfig(Some(configs)) => {\n            let (config, config2) = *configs;\n",
+     "        Data::SyncConfig(Some(configs)) => {\n" + SYNC_GUARD + "            let (config, config2) = *configs;\n",
+     "no whole-config sync during a remote session"),
+    (HOME, 'translate("One-time Password"),',
+     'translate(showOneTime ? "One-time Password" : "Password"),',
+     "no one-time password label when it is off"),
+    (HOME, "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n",
+     "import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';\n"
+     "import 'package:flutter_hbb/desktop/widgets/generated_password.dart';\n",
+     "generated password import (home)"),
+    (HOME, "    MinCharactersValidationRule(8),\n",
+     "    MinCharactersValidationRule(16), // boring-remote: typed passwords 16+ (ticket 05)\n",
+     "typed password needs 16+ characters"),
+    (HOME, "          onPressed: canSubmit ? submit : null,\n        );\n",
+     "          onPressed: canSubmit ? submit : null,\n          isOutline: true,\n        );\n",
+     "OK is the secondary action; Generate/Reset is the main one"),
+    (HOME, "        return [\n          cancelButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n        ];\n",
+     GENERATE_BUTTON
+     + "        return [\n          cancelButton,\n          if (localPasswordSet) removeButton,\n          okButton,\n"
+       "          generateButton,\n        ];\n",
+     "Generate/Reset button in Set Password"),
+    (MOBILE_SERVER, "                translate('One-time Password'),\n",
+     "                translate(showOneTime ? 'One-time Password' : 'Password'),\n",
+     "mobile: no one-time password label when it is off"),
+    (MOBILE_SERVER, "            if (showPasswordOption)\n              PopupMenuItem(\n                value: kUse",
+     "            if (showPasswordOption && !isOptionFixed(kOptionVerificationMethod))\n"
+     "              PopupMenuItem(\n                value: kUse",
+     "mobile: no verification method menu when it is locked"),
+]
+
+# --- Trusted Controllers, 1.8 (ticket 06 on 1.7's one Trusted list) ------------------------------
+# base::trust keeps the one list and decides (1.7's tokens, "Always ask for password", the service
+# as the one writer); src/trust_policy.rs signs and checks the 1.8 login. Trust binding option B:
+# the Controller signs each login with its own key over this connection's challenge, the Target's
+# Machine ID and its own ID (SIGN_LOGIN, two LoginRequest fields in PROTO_PATCH), only over a stream
+# it verified as that Machine ID; the Target finds the entry by that key (T04_PROVE, in
+# T04_TRUSTED_SKIP) on the Hosted path, where there is no token. A new Controller needs Allow even
+# with the right password (TRUST_GATE); Allow stores it only after that password, with no other
+# session open (ACCEPT_GATE). A known ID alone never skips the ask.
+TRUST_GATE = (
+    "                    // boring-remote (1.8, ticket 06): a new Controller also needs Allow on this\n"
+    "                    // computer, even with the right password; only a Trusted Controller's proven key\n"
+    "                    // skips it (base::trust). Every ask counts against this IP's failure budget.\n"
+    "                    // Nobody answers: the login times out.\n"
+    "                    self.boring_trust.unattended_password_right();\n"
+    "                    if !self.boring_trust.skips_click() {\n"
+    "                        self.update_failure_with_scope(failure, false, 0, FailureScope::Default);\n"
+    "                        self.boring_trust.wait_for_allow(true);\n"
+    + _click_wait(24) +
+    "                    }\n")
+ACCEPT_GATE = (
+    "                            // boring-remote (1.8, ticket 06): Allow counts only for a login waiting on\n"
+    "                            // it. Before login, anything else ends the connection, so the connection\n"
+    "                            // window never shows a session that isn't there. With another session open\n"
+    "                            // it lets this one in but stores nothing (the click could be theirs). An\n"
+    "                            // Allow clears the IP's ask count.\n"
+    "                            if !conn.boring_trust.take_wait(crate::password_lock::authed_sessions()) {\n"
+    "                                if conn.authorized {\n"
+    "                                    continue;\n"
+    "                                }\n"
+    "                                conn.send_close_reason_no_retry(\"\").await;\n"
+    "                                conn.on_close(\"connection manager\", true).await;\n"
+    "                                break;\n"
+    "                            }\n"
+    "                            clear_failures(&mut LOGIN_FAILURES[0].lock().unwrap(), &conn.failure_keys());\n")
+FORGET_ON_LOGIN = (
+    "            // boring-remote (1.8, ticket 06): a new login while this one waits on Allow could swap\n"
+    "            // the login the ask shows, so it ends the connection.\n"
+    "            if self.boring_trust.waiting() {\n"
+    "                self.send_login_error(\"Connection not allowed\").await;\n"
+    "                return false;\n"
+    "            }\n")
+# Upstream starts the connection window (an Allow button) on these two paths too; Allow can't let
+# them in, so they show nothing and the Controller asks its person for the password.
+EMPTY_PASSWORD_CM = (
+    "            } else if lr.password.is_empty() {\n"
+    "                #[cfg(not(any(target_os = \"android\", target_os = \"ios\")))]\n"
+    "                if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {\n"
+    "                    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await\n"
+    "                    {\n"
+    "                        return keep_alive;\n"
+    "                    }\n"
+    "                }\n"
+    "                self.try_start_cm(lr.my_id, lr.my_name, false);\n"
+    "            } else {\n")
+EMPTY_PASSWORD_NO_CM = (
+    "            } else if lr.password.is_empty() {\n"
+    "                // boring-remote: no Accept for a login without the password (ticket 06).\n"
+    "            } else {\n")
+WRONG_PASSWORD_CM = (
+    "                    self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)\n"
+    "                        .await;\n"
+    "                    self.try_start_cm(lr.my_id, lr.my_name, false);\n")
+_PW_OK = ("                    self.update_failure_with_scope(failure, true, 0, FailureScope::Default);\n"
+          "                    if !self.send_logon_response_and_keep_alive().await {\n")
+_AUTHORIZE = ("                        ipc::Data::Authorize => {\n"
+              "                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);\n")
+_LOGIN = ("        if let Some(message::Union::LoginRequest(lr)) = msg.union {\n"
+          "            if !self.check_login_scope(&lr).await {\n")
+# The login is signed where it is sent, from the stream that carries it: a Machine ID only when
+# that stream is keyed, which for a Machine ID means a Direct Link pinned to it or the Hosted servers
+# under the baked key (KEY_GUARD) verified the Target. Nothing is shared between a session's
+# connections.
+SIGN_LOGIN = ("    // boring-remote: sign this login for the Target's Trusted list, a Machine ID only over a\n"
+              "    // stream keyed to the Target this connection verified (tickets 06, 07; src/trust_policy.rs).\n"
+              "    let challenge = lc.read().unwrap().hash.challenge.clone();\n"
+              "    if let Some(message::Union::LoginRequest(lr)) = msg_out.union.as_mut() {\n"
+              "        crate::trust_policy::sign_login(lr, &challenge, peer.is_secured());\n"
+              "    }\n")
+_SEND_LOGIN = ("    let msg_out = lc\n        .read()\n        .unwrap()\n"
+               "        .create_login_msg(os_username, os_password, password);\n"
+               "    allow_err!(peer.send(&msg_out).await);\n")
+SEND_LOGIN_SIGNED = _SEND_LOGIN.replace("    let msg_out", "    let mut msg_out", 1).replace(
+    "    allow_err!", SIGN_LOGIN + "    allow_err!", 1)
+# A Machine ID is checked only against the baked server key: whatever key a session was handed
+# (config, IPC), a keyed Hosted stream to a Machine ID then means the Hosted servers vouched for it.
+KEY_GUARD = ("        // boring-remote: a Machine ID is verified against the baked server key only (ticket 07).\n"
+             "        if boring_is_machine_id(peer) && !crate::trust_policy::baked_key(key) {\n"
+             '            bail!("Boring Remote checks Machine IDs against its own servers only");\n'
+             "        }\n")
+_START_HEAD = "        interface.update_direct(None);\n        interface.update_received(false);\n"
+# A Machine-ID session that didn't verify the Target is an attack or a fault: refused, no Continue.
+# One that did keeps the identity key it was first verified with, over a Direct Link or the Hosted
+# path alike (base::direct_link::Known): another key is refused as the Direct Link refuses it.
+REFUSE_UNVERIFIED = (
+    "                // boring-remote: a Machine ID that didn't verify the Target against the baked\n"
+    "                // server key is refused, no Continue (ticket 07). One that did keeps the key it was\n"
+    "                // first verified with (base::direct_link::Known, as a Direct Link does).\n"
+    "                let boring_refused = if !is_secured && crate::client::boring_is_machine_id(&self.handler.get_id()) {\n"
+    "                    Some(crate::client::BORING_UNVERIFIED)\n"
+    "                } else if is_secured\n"
+    "                    && crate::client::boring_is_machine_id(&self.handler.get_id())\n"
+    "                    && !crate::connect_plan::pin_target(&self.handler.get_id(), pk.as_deref())\n"
+    "                {\n"
+    "                    Some(base::direct_link::IDENTITY_CHANGED)\n"
+    "                } else {\n"
+    "                    None\n"
+    "                };\n"
+    "                if let Some(why) = boring_refused {\n"
+    '                    self.handler.msgbox("error", "Connection Error", why, "");\n'
+    '                    self.send_close_reason(&mut peer, "").await;\n'
+    "                    if kcp.is_some() {\n"
+    "                        tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;\n"
+    "                    }\n"
+    "                    self.handle_disconnected(round);\n"
+    "                    return;\n"
+    "                }\n")
+_INSECURE_PROMPT = ("                if !is_secured\n"
+                    "                    && !crate::common::is_direct_ip_access(&self.handler.get_id())\n")
+REFUSE_UNVERIFIED_PF = (
+    "    // boring-remote: a Machine ID that didn't verify the Target is refused, no Continue (ticket 07);\n"
+    "    // one that did keeps the key it was first verified with (base::direct_link::Known).\n"
+    "    if !stream.is_secured() && crate::client::boring_is_machine_id(id) {\n"
+    "        bail!(crate::client::BORING_UNVERIFIED);\n"
+    "    }\n"
+    "    if stream.is_secured() && crate::client::boring_is_machine_id(id) && !crate::connect_plan::pin_target(id, _pk.as_deref()) {\n"
+    "        bail!(base::direct_link::IDENTITY_CHANGED);\n"
+    "    }\n")
+_PF_PROMPT = "    if !stream.is_secured() && !crate::common::is_direct_ip_access(id) {\n"
+# Upstream stores the Target's Hash only after sending the login; the signature needs it first.
+HASH_FIRST_OLD = ("    send_login(lc.clone(), String::new(), String::new(), password, peer).await;\n"
+                  "    lc.write().unwrap().hash = hash;\n    true\n}\n")
+HASH_FIRST_NEW = ("    lc.write().unwrap().hash = hash; // boring-remote: the login signs its challenge (ticket 06)\n"
+                  "    send_login(lc.clone(), String::new(), String::new(), password, peer).await;\n    true\n}\n")
+# Two LoginRequest fields, numbered far from upstream's. A 1.7 Target or stock RustDesk ignores
+# them; a 1.7 Controller leaves them empty. check.py undoes exactly this to compare the proto
+# with upstream's pinned hash (boring/protocol.sha256, boring/REBASE.md).
+PROTO_FIELDS = (
+    "  // boring-remote: trusted Controllers (ticket 06). The Controller's own Ed25519 public key\n"
+    "  // and its signature over this login (src/trust_policy.rs). Empty from older Controllers.\n"
+    "  bytes boring_controller_pk = 1000;\n"
+    "  bytes boring_login_sig = 1001;\n")
+PROTO_PATCH = ("libs/base/protos/message.proto", "  string avatar = 17;\n}\n",
+               "  string avatar = 17;\n" + PROTO_FIELDS + "}\n",
+               "LoginRequest carries the Controller's key and login signature")
+PATCHES += [
+    ("src/lib.rs", "mod password_lock; // boring-remote: permanent password only (ticket 05)\n",
+     "mod password_lock; // boring-remote: permanent password only (ticket 05)\n"
+     "mod trust_policy; // boring-remote: Trusted Controllers' signed login (ticket 06); iOS Controllers sign too\n",
+     "trust policy module (Controllers on every platform sign their logins)"),
+    PROTO_PATCH,
+    ("src/client.rs", _SEND_LOGIN, SEND_LOGIN_SIGNED,
+     "Controller signs each login with its own key, from the stream that carries it"),
+    ("src/client.rs", HASH_FIRST_OLD, HASH_FIRST_NEW, "the login knows the Target's challenge before it is built"),
+    ("src/client.rs", _START_HEAD, _START_HEAD + KEY_GUARD,
+     "a Machine ID is verified against the baked server key only"),
+    ("src/client/io_loop.rs", _INSECURE_PROMPT, REFUSE_UNVERIFIED + _INSECURE_PROMPT,
+     "an unverified Machine-ID session is refused, no Continue; a verified one keeps its pinned key"),
+    ("src/port_forward.rs", _PF_PROMPT, REFUSE_UNVERIFIED_PF + _PF_PROMPT,
+     "an unverified Machine-ID port forward is refused, no Continue; a verified one keeps its pinned key"),
+    (HOME, '                          translate("ID"),\n',
+     f'                          translate("{MACHINE_ID_LABEL}"), // boring-remote (ticket 07)\n',
+     "the Target shows its Machine ID (upstream home page)"),
+    ("src/server/connection.rs", _PW_OK, TRUST_GATE + _PW_OK,
+     "new Controller waits for Allow after the right password"),
+    ("src/server/connection.rs", _AUTHORIZE,
+     _AUTHORIZE.replace("                            conn.set_conn_audit", ACCEPT_GATE
+                        + "                            conn.set_conn_audit", 1),
+     "Allow only for a login waiting on it"),
+    ("src/server/connection.rs", _LOGIN, _LOGIN.replace("            if !self.check_login_scope", FORGET_ON_LOGIN
+                                                        + "            if !self.check_login_scope", 1),
+     "a new login on a waiting connection ends it"),
+    ("src/server/connection.rs", EMPTY_PASSWORD_CM, EMPTY_PASSWORD_NO_CM, "no Allow prompt without a password"),
+    ("src/server/connection.rs", WRONG_PASSWORD_CM, WRONG_PASSWORD_CM.replace(
+        "                    self.try_start_cm(lr.my_id, lr.my_name, false);\n", ""),
+     "no Allow prompt after a wrong password"),
+]
+
+# --- ticket 08: a Machine ID's Direct Link first, the Hosted servers after (src/connect_plan.rs) ---
+# The connect itself is DIRECT_LINK_CALL. Here: the Hosted-down errors, and the tailnet address a
+# Target reports after login, kept for the next connect's Direct Link only from a keyed stream to a
+# pinned Machine ID (connect_plan::save_reported).
+REMEMBER_TAILNET = (
+    "                        // boring-remote: a Machine ID keeps the tailnet address its pinned Target\n"
+    "                        // reports over a keyed stream, for its next Direct Link (ticket 08).\n"
+    "                        crate::connect_plan::save_reported(\n"
+    "                            &self.handler.get_id(),\n"
+    "                            peer.is_secured(),\n"
+    "                            &pi.platform_additions,\n"
+    "                        );\n")
+_PEER_INFO_IN = "                        let peer_platform = pi.platform.clone();\n                        self.set_peer_info(&pi);\n"
+REPORT_TAILNET = (
+    "        // boring-remote: this Target's tailnet address, for a Controller's tailnet-first path (ticket 08).\n"
+    '        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]\n'
+    "        crate::connect_plan::add_own_tailnet(&mut platform_additions);\n")
+_ADDITIONS_OUT = ('        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]\n'
+                  "        if !platform_additions.is_empty() {\n")
+_SOCKET_OUT = "        let mut socket = socket?;\n"
+HOSTED_DOWN_ERR = ("        let socket = socket.map_err(crate::connect_plan::hosted_down); "
+                   "// boring-remote: say so, naming them (ticket 08)\n")
+_START_ERR = ("            Err(err) => {\n                let err_str = err.to_string();\n"
+              "                if err_str.starts_with(\"Failed\") {\n")
+HOSTED_RELAY_ERR = "                let err = crate::connect_plan::hosted_error(err); // boring-remote: our relay (ticket 08)\n"
+PATCHES += [
+    ("src/lib.rs", "mod trust_policy; // boring-remote: Trusted Controllers' signed login (ticket 06); iOS Controllers sign too\n",
+     "mod trust_policy; // boring-remote: Trusted Controllers' signed login (ticket 06); iOS Controllers sign too\n"
+     "mod connect_plan; // boring-remote: a Machine ID's Direct Link first, Hosted after (ticket 08)\n",
+     "connect plan module (Direct Link first, Hosted fallback)"),
+    ("src/client.rs", _SOCKET_OUT, HOSTED_DOWN_ERR + _SOCKET_OUT,
+     "Hosted servers unreachable: a plain error naming them"),
+    ("src/client.rs", _START_ERR, _START_ERR.replace("                let err_str", HOSTED_RELAY_ERR + "                let err_str", 1),
+     "our relay unreachable: the same plain error"),
+    ("src/client/io_loop.rs", _PEER_INFO_IN, _PEER_INFO_IN.replace(
+        "                        self.set_peer_info", REMEMBER_TAILNET + "                        self.set_peer_info", 1),
+     "a Machine ID records the tailnet address its verified Target reports"),
+    ("src/server/connection.rs", _ADDITIONS_OUT, REPORT_TAILNET + _ADDITIONS_OUT,
+     "the Target reports its tailnet address after login"),
+]
+
+# --- 1.8.0 first launch: a generated Unattended Password before Hosted access (ticket 09) --------
+# A Target without an app-generated password registers with no rendezvous server, so the Hosted
+# servers never learn its Machine ID (src/password_lock.rs hosted_on: the daemon's marker, set only
+# with a generated password). A 1.7.x typed password keeps the Direct Link only. The Direct Link
+# listener is spawned before this loop and is never gated. The loop re-reads the gate every pass
+# (CONNECT_TIMEOUT), so Generate turns Hosted on in seconds; every tick re-reads it too. The screen
+# that asks is 1.7's Setup, its password step alone (kit/setup.dart, T06_SETUP_PAGE).
+HOSTED_GATE = (
+    "                let servers = crate::password_lock::hosted_servers(\n"
+    "                    Config::get_rendezvous_servers(),\n"
+    "                    crate::password_lock::hosted_on(),\n"
+    "                ); // boring-remote: no generated Permanent password, no Hosted servers (ticket 09)\n")
+# Every tick of a live registration (TCP and UDP) re-checks the gate, so a password removed or
+# replaced by any path (IPC, config sync, in-process, file edit) drops the registration.
+_TICK = ("                _ = timer.tick() => {\n"
+         "                    if SHOULD_EXIT.load(Ordering::SeqCst) {\n"
+         "                        break;\n"
+         "                    }\n")
+TICK_EXIT = ("                    if !crate::password_lock::hosted_on() {\n"
+             "                        break; // boring-remote: generated password gone, off Hosted (ticket 09)\n"
+             "                    }\n")
+# The generator's own IPC write: the daemon sets the password and the Hosted marker together.
+GENERATED_ARM = (
+    "                } else if name == crate::password_lock::GENERATED_CONFIG {\n"
+    "                    // boring-remote: an app-generated password turns Hosted on (ticket 09).\n"
+    "                    updated = crate::password_lock::set_generated(&value);\n"
+    "                    let ack = if updated { \"Y\" } else { \"N\" }.to_owned();\n"
+    "                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);\n")
+_PW_ARM = '                } else if name == "permanent-password" {\n'
+CLEAR_MARKER = ("                        if updated {\n"
+                "                            crate::password_lock::clear_generated(); // boring-remote: Hosted off (ticket 09)\n"
+                "                        }\n")
+_SET_PW = "                        updated = Config::set_permanent_password(&value);\n"
+PASSWORD_SETUP_STATE = "  bool _boringPasswordSetup = false; // 1.8 ticket 09: set up before, no password made here yet\n"
+PASSWORD_SETUP_INIT = (
+    "    // boring-remote (1.8, ticket 09): set up before 1.8 but no password made here: Setup's password step alone.\n"
+    "    if ((isMacOS || isWindows) && !_boringSetup && bind.mainGetOptionSync(key: kBoringPasswordGenerated) != 'Y') {\n"
+    "      _boringPasswordSetup = true;\n"
+    "    }\n")
+PASSWORD_SETUP_BRANCH = (
+    "    if ((isMacOS || isWindows) && _boringPasswordSetup && !_boringSetup) { // 1.8 ticket 09\n"
+    "      return _buildBlock(\n"
+    "          child: boringSetupPage(passwordOnly: true, onDone: () => setState(() => _boringPasswordSetup = false)));\n"
+    "    }\n")
+_SETUP_STATE = "  bool _boringSetup = false; // v1.7 t06: first launch shows Setup until it is finished\n"
+_SETUP_T31 = "    // v1.7 t31: macOS's Quit & Reopen killed Setup partway, also when Settings opened it again.\n"
+_SETUP_BRANCH = "    if ((isMacOS || isWindows) && _boringSetup) {\n"
+PATCHES += [
+    (HOME, _SETUP_STATE, _SETUP_STATE + PASSWORD_SETUP_STATE, "first launch on 1.8: password step state"),
+    (HOME, _SETUP_T31, PASSWORD_SETUP_INIT + _SETUP_T31, "first launch on 1.8: no password made here asks for one"),
+    (HOME, _SETUP_BRANCH, PASSWORD_SETUP_BRANCH + _SETUP_BRANCH, "first launch on 1.8: Setup's password step alone"),
+    ("src/rendezvous_mediator.rs", "                let servers = Config::get_rendezvous_servers();\n", HOSTED_GATE,
+     "no Hosted registration until a generated Unattended Password is set"),
+    ("src/rendezvous_mediator.rs", _TICK, _TICK + TICK_EXIT, "a live registration ends once the generated password is gone"),
+    ("src/ipc.rs", _PW_ARM, GENERATED_ARM + _PW_ARM, "the generator's password write sets the Hosted marker"),
+    ("src/ipc.rs", _SET_PW, _SET_PW + CLEAR_MARKER, "any other password write clears the Hosted marker"),
+]
+
 COPIES = [
     ("msi/WixUIBannerBmp.bmp", f"{MSI}/Resources/WixUIBannerBmp.bmp", "MSI banner art, 493x58"),
     ("msi/WixUIDialogBmp.bmp", f"{MSI}/Resources/WixUIDialogBmp.bmp", "MSI dialog art, 493x312"),
@@ -3856,6 +4468,36 @@ RUSTDESK_LINK = re.compile(r"rustdesk\.com|github\.com/rustdesk")
 def _lang_value(m):
     value = "" if RUSTDESK_LINK.search(m.group(2)) else m.group(2).replace("RustDesk", DISPLAY_NAME)
     return m.group(1) + value + m.group(3)
+
+
+def read_server_key(path):
+    """(the Hosted servers' public key as base64, None) or (None, why it can't be baked)."""
+    import base64
+    try:
+        text = pathlib.Path(path).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as e:
+        return None, f"missing or unreadable ({e.__class__.__name__})"
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError:
+        return None, "not base64"
+    if len(raw) != 32 or base64.b64encode(raw).decode() != text:
+        return None, f"not a 32-byte Ed25519 public key ({len(raw)} bytes)"
+    if text == RUSTDESK_PUB_KEY:
+        return None, "RustDesk's public servers' key, not ours"
+    return text, None
+
+
+def server_patches(key):
+    """The patches that bake the server key: RS_PUB_KEY and the locked "key" option."""
+    return [
+        (HBB, f'pub const RS_PUB_KEY: &str = "{RUSTDESK_PUB_KEY}";', f'pub const RS_PUB_KEY: &str = "{key}";',
+         "the Hosted servers' key, baked in (only Boring Remote builds use them)"),
+        (HBB, "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+         "pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = "
+         + _rust_map({**LOCKED, "key": key}) + ";",
+         "servers and key forced to ours, Direct IP, no auto update, no LAN discovery, password + click"),
+    ]
 
 
 def _read(path):
@@ -3912,7 +4554,10 @@ def plan(root):
     Returns (writes {rel: bytes}, deletes [rel], changed [msg], moved [msg])."""
     root = pathlib.Path(root)
     changed, moved, texts = [], [], {}
-    for rel, old, new, why in PATCHES:
+    key, why_not = read_server_key(SERVER_KEY_FILE)
+    if why_not:
+        moved.append(f"{SERVER_KEY_FILE.name}: server key {why_not}")
+    for rel, old, new, why in PATCHES + server_patches(key or "<no server key>"):
         if rel not in texts:
             texts[rel] = _read(root / rel)
         text, crlf = texts[rel]
@@ -3937,12 +4582,13 @@ def plan(root):
             texts[rel] = _read(p)
         text, crlf = texts[rel]
         text2 = LANG_VALUE.sub(_lang_value, text)
-        for msg in CONNECT_ERROR_KEYS:
-            if f'("{msg}", ' not in text2:
-                text2 = LANG_END.sub(f'),\n        ("{msg}", ""),\n\\1', text2, count=1)
+        keys = [k for k in LANG_KEYS if not (p.name == "en.rs" and k in NOT_IN_EN)]
+        missing = "".join(f'        ("{k}", ""),\n' for k in keys if f'("{k}", ' not in text2)
+        if missing:
+            text2 = LANG_END.sub(lambda m: "),\n" + missing + m.group(1), text2, count=1)
         if text2 != text:
             texts[rel] = (text2, crlf)
-            changed.append(f"{rel}: translations say {DISPLAY_NAME}, plain not-found error")
+            changed.append(f"{rel}: translations say {DISPLAY_NAME}, new keys (not-found error, tickets 05/06/09)")
     writes, deletes = {}, []
     for rel, (text, crlf) in texts.items():
         if text is not None:

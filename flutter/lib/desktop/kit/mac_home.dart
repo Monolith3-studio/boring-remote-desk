@@ -86,6 +86,12 @@ class MacHome extends StatefulWidget {
   /// Page-level notices (the update banner), shown above the Address box.
   final List<Widget> notices;
 
+  /// 1.8 (ADR 0005, ticket 07): this computer's Machine ID, what another computer types to reach it
+  /// through the Hosted servers from anywhere; null or empty hides it. [hostedOn]: it has a
+  /// password made in Settings, so the Hosted servers know it (ticket 09).
+  final String? machineId;
+  final bool hostedOn;
+
   const MacHome({
     super.key,
     required this.macs,
@@ -95,6 +101,8 @@ class MacHome extends StatefulWidget {
     this.notices = const [],
     this.lan = const [],
     this.discover,
+    this.machineId,
+    this.hostedOn = false,
   });
 
   @override
@@ -126,6 +134,9 @@ class _MacHomeState extends State<MacHome> {
   /// (its IP), then a recent one, else whatever was typed (an IP).
   String _typedTarget(String text) {
     final q = text.trim();
+    // 1.8: a Machine ID typed in groups ("123 456 789") is the Machine ID.
+    final digits = q.replaceAll(RegExp(r'[\s-]'), '');
+    if (digits.isNotEmpty && RegExp(r'^\d+$').hasMatch(digits)) return digits;
     final low = q.toLowerCase();
     final here = widget.lan.where((m) => m.name.toLowerCase() == low);
     final recent = widget.macs.where((m) => m.name.toLowerCase() == low);
@@ -172,7 +183,7 @@ class _MacHomeState extends State<MacHome> {
             controller: _address,
             autofocus: true,
             decoration: InputDecoration(
-              hintText: "Type a computer's name",
+              hintText: "Type a computer's name or Machine ID",
               prefixIcon: const Icon(Icons.search, color: Kit.muted),
               // boring-remote (v1.7 t29): Return is control, this is transfer, for the same target.
               suffixIcon: q.isEmpty || widget.onTransferFiles == null
@@ -240,7 +251,8 @@ class _MacHomeState extends State<MacHome> {
               onPressed: () => showModalBottomSheet<void>(
                 context: context,
                 isScrollControlled: true,
-                builder: (_) => OutsideBuildingSheet(tailscaleAddress: widget.tailscaleAddress),
+                builder: (_) => OutsideBuildingSheet(
+                    tailscaleAddress: widget.tailscaleAddress, machineId: widget.machineId, hostedOn: widget.hostedOn),
               ),
             ),
           ),
@@ -252,9 +264,23 @@ class _MacHomeState extends State<MacHome> {
 
 /// For a computer that isn't on this network: the way in is Tailscale (ADR 0004), so the thing to
 /// type over there is this computer's Tailscale address. No Tailscale here: how to get it.
+/// 1.8: a Machine ID shown in groups of three, as people read it out.
+String machineIdGroups(String id) {
+  final b = StringBuffer();
+  for (var i = 0; i < id.length; i++) {
+    if (i > 0 && (id.length - i) % 3 == 0) b.write(' ');
+    b.write(id[i]);
+  }
+  return b.toString();
+}
+
 class OutsideBuildingSheet extends StatefulWidget {
   final Future<String?> Function() tailscaleAddress;
-  const OutsideBuildingSheet({super.key, required this.tailscaleAddress});
+
+  /// 1.8: this computer's Machine ID (the Hosted servers' way in); null or empty hides it.
+  final String? machineId;
+  final bool hostedOn;
+  const OutsideBuildingSheet({super.key, required this.tailscaleAddress, this.machineId, this.hostedOn = false});
 
   @override
   State<OutsideBuildingSheet> createState() => _OutsideBuildingSheetState();
@@ -262,7 +288,37 @@ class OutsideBuildingSheet extends StatefulWidget {
 
 class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
   late Future<String?> _address = widget.tailscaleAddress();
-  bool _copied = false;
+  bool _copied = false, _idCopied = false;
+
+  /// 1.8: the Machine ID first; Tailscale is the backup path below it.
+  List<Widget> _machineId(TextTheme t, String one) {
+    final id = widget.machineId ?? '';
+    if (id.isEmpty) return const [];
+    return [
+      Text('From anywhere, type this $one\'s Machine ID on the other computer:'),
+      const SizedBox(height: Kit.s3),
+      Row(children: [
+        Flexible(child: SelectableText(machineIdGroups(id), style: t.headlineSmall)),
+        const SizedBox(width: Kit.s4),
+        OutlinedButton(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: id));
+            if (mounted) setState(() => _idCopied = true);
+          },
+          child: Text(_idCopied ? 'Copied' : 'Copy'),
+        ),
+      ]),
+      const SizedBox(height: Kit.s3),
+      if (!widget.hostedOn)
+        Text('It works once this $one has a password made in Settings.', style: t.bodySmall)
+      else
+        Text('The other computer also needs this $one\'s password, and someone here clicks Allow the first time.',
+            style: t.bodySmall),
+      const SizedBox(height: Kit.s5),
+      Text('Or use Tailscale', style: t.titleMedium),
+      const SizedBox(height: Kit.s3),
+    ];
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -280,6 +336,7 @@ class _OutsideBuildingSheetState extends State<OutsideBuildingSheet> {
             children: [
               Text('Connect from outside the building', style: t.titleLarge),
               const SizedBox(height: Kit.s4),
+              ..._machineId(t, one),
               if (snap.connectionState != ConnectionState.done)
                 Text('Checking…', style: t.bodySmall)
               else if (address != null) ...[

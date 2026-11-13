@@ -2,9 +2,12 @@
 # Sign the Mac app, build the branded DMG with dmgbuild, mount and verify it, write its sha256.
 #   boring/dmg/release-mac.sh "<Boring Remote.app>" <version> <out dir>     (run from the repo root)
 #
-# Signing identity comes from the environment (GitHub Actions secrets):
+# Signing identity, one of:
+#   BR_SIGN_KEYCHAIN=1     the pinned "Boring Remote Code Signing" identity already in your keychains
+#                          (the local release, boring/release/build-mac); no secret passes through here.
 #   MAC_SIGN_P12           base64 of a PKCS#12 holding ONLY "Boring Remote Code Signing"
-#   MAC_SIGN_P12_PASSWORD  its passphrase
+#   MAC_SIGN_P12_PASSWORD  its passphrase (the test suite's throwaway identities use this path)
+# Keychain   -> signed in place with the pinned certificate, BoringRemote-<v>-macos-arm64.dmg.
 # Both set   -> imported into a temp keychain (deleted on exit, search list restored), the app is
 #               signed with the pinned certificate, the DMG is BoringRemote-<v>-macos-arm64.dmg.
 # Neither    -> ad-hoc signed, BoringRemote-<v>-macos-arm64-adhoc.dmg, and the log says so.
@@ -27,7 +30,10 @@ unset MAC_SIGN_P12 MAC_SIGN_P12_PASSWORD  # nothing below needs them in the envi
 die() { echo "release-mac: $*" >&2; exit 1; }
 [ -d "$APP" ] || die "no app at $APP"
 
-if [ -n "$p12" ] && [ -n "$p12pw" ]; then
+if [ "${BR_SIGN_KEYCHAIN:-}" = 1 ]; then
+  [ -z "$p12$p12pw" ] || die "BR_SIGN_KEYCHAIN=1 and MAC_SIGN_P12 both set; pick one"
+  MODE=keychain
+elif [ -n "$p12" ] && [ -n "$p12pw" ]; then
   MODE=signed
 elif [ -n "$p12" ] || [ -n "$p12pw" ]; then
   die "only one of MAC_SIGN_P12 / MAC_SIGN_P12_PASSWORD is set; set both or neither"
@@ -49,7 +55,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ $MODE = signed ]; then
+if [ $MODE = keychain ]; then
+  security find-identity -p codesigning | grep -q " $PIN \"Boring Remote Code Signing\"" \
+    || die "no \"Boring Remote Code Signing\" identity $PIN in your keychains"
+  codesign --force --deep --sign "$PIN" "$APP"
+  echo "release-mac: signed with the pinned Boring Remote Code Signing certificate ($PIN) from your keychain"
+  NAME="BoringRemote-$VER-macos-arm64.dmg"
+elif [ $MODE = signed ]; then
   while IFS= read -r k; do ORIG_LIST+=("$k"); done < <(security list-keychains -d user | sed -e 's/^ *"//' -e 's/"$//')
   KC="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/boring-sign-$$.keychain-db"
   kcpw=$(openssl rand -hex 24)
@@ -72,8 +84,7 @@ if [ $MODE = signed ]; then
   echo "release-mac: signed with the pinned Boring Remote Code Signing certificate ($PIN)"
   NAME="BoringRemote-$VER-macos-arm64.dmg"
 else
-  echo "::warning::No MAC_SIGN_P12 secrets (fork or PR): ad-hoc signed. TCC grants will not survive an update with this build."
-  echo "release-mac: ad-hoc signed (no signing secrets)"
+  echo "release-mac: WARNING: ad-hoc signed (no signing identity). TCC grants will not survive an update with this build."
   codesign --force --deep --sign - "$APP"
   NAME="BoringRemote-$VER-macos-arm64-adhoc.dmg"
 fi
@@ -83,6 +94,6 @@ mkdir -p "$OUT"
 DMG="$OUT/$NAME"
 rm -f "$DMG" "$DMG.sha256"
 dmgbuild -s "$HERE/settings.py" -D app="$APP" -D art="$HERE" "Boring Remote" "$DMG"
-if [ $MODE = signed ]; then "$HERE/verify-dmg.sh" "$DMG" "$VER" "$PIN"; else "$HERE/verify-dmg.sh" "$DMG" "$VER"; fi
+if [ $MODE != adhoc ]; then "$HERE/verify-dmg.sh" "$DMG" "$VER" "$PIN"; else "$HERE/verify-dmg.sh" "$DMG" "$VER"; fi
 (cd "$OUT" && shasum -a 256 "$NAME" > "$NAME.sha256")
 cat "$DMG.sha256"

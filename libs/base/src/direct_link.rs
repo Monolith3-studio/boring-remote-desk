@@ -410,6 +410,38 @@ impl Known {
         self.addresses(id).iter().find(|a| a.ip == ip).map_or(Default::default(), |a| a.link)
     }
 
+    /// 1.8 (Hosted, ADR 0005): the Hosted servers vouched `sign_pk` for Machine ID `id`, under the
+    /// baked server key. A Machine ID already met (over a Direct Link or Hosted) keeps its key:
+    /// false for another one, so a server that changed its word is refused (a reinstalled Target
+    /// needs Forget, as for a Direct Link). A new one is pinned here, trust on first use.
+    pub fn pin_id(&mut self, id: &str, sign_pk: &[u8]) -> bool {
+        let pk = hex(sign_pk);
+        match self.0.get(id) {
+            Some(t) => t.pk == pk,
+            None => {
+                self.0.insert(id.to_owned(), KnownTarget { pk, ..Default::default() });
+                true
+            }
+        }
+    }
+
+    /// 1.8: the Tailscale address a pinned Target reported over a verified Hosted session, for the
+    /// next connect's Direct Link (which checks the pin again). Only a Tailscale address, only for
+    /// a Target already pinned. True if it changed.
+    pub fn learn_tailscale(&mut self, id: &str, ip: IpAddr) -> bool {
+        if !is_tailscale(ip) {
+            return false;
+        }
+        let Some(t) = self.0.get_mut(id) else { return false };
+        let addr = SocketAddr::new(hbb_common::try_into_v4(SocketAddr::new(ip, 0)).ip(), hbb_common::config::RELAY_PORT as u16 + 1)
+            .to_string();
+        if t.tailscale == addr {
+            return false;
+        }
+        t.tailscale = addr;
+        true
+    }
+
     /// The Tailscale address of whoever last answered at `direct`, if it told us one.
     pub fn tailscale_for(&self, direct: SocketAddr) -> Option<SocketAddr> {
         let lan = direct.to_string();
@@ -519,6 +551,38 @@ pub async fn plan_for_recent(id: &str, name: &str, known: &Known, ms: u64) -> Re
         (None, Some(ts)) => Ok(Plan::single(ts, None)),
         (None, None) => bail!(NO_ADDRESS),
     }
+}
+
+/// 1.8: where a Machine ID can be dialled as a Direct Link before the Hosted servers: its LAN
+/// addresses while LAN Discovery sees it on this network right now (elsewhere they would only
+/// time out), and its known Tailscale address. Strict: only that Machine ID answering counts
+/// (`target`, and no address is exempt from the who-check), so a failure goes on to Hosted, never
+/// to another computer at an old address. No name lookups: a Machine ID is not a name.
+fn plan_for_machine_id(id: &str, known: &Known) -> Option<Plan> {
+    let port = hbb_common::config::RELAY_PORT as u16 + 1;
+    let tailscale = known.tailscale_of(id);
+    let direct = crate::lan::advert_of(id).first().map(|a| SocketAddr::new(a.ip, port));
+    let mut plan = match (direct, tailscale) {
+        (Some(direct), ts) => widen(direct, ts, Some(id), known, None),
+        (None, Some(ts)) => Plan::single(ts, None),
+        (None, None) => return None,
+    };
+    plan.target = Some(id.to_owned());
+    plan.dialled = None;
+    Some(plan)
+}
+
+/// 1.8: whether a Machine ID has anywhere to try as a Direct Link (`plan_for_machine_id`).
+pub fn machine_id_known(id: &str, known: &Known) -> bool {
+    plan_for_machine_id(id, known).is_some()
+}
+
+/// 1.8: a Machine ID as a Direct Link (`plan_for_machine_id`), before the Hosted servers.
+/// `slow_ms` is the Tailscale (or last) address's budget. Every session comes back encrypted and
+/// pinned to that Machine ID, or not at all.
+pub async fn connect_machine_id(id: &str, slow_ms: u64, known: Known) -> ResultType<(Stream, Route, Option<Vec<u8>>)> {
+    let plan = plan_for_machine_id(id, &known).ok_or_else(|| anyhow!(NO_ADDRESS))?;
+    dial(plan, slow_ms, known).await
 }
 
 /// Home's recents are stored by Target ID (digits); the connect box takes names and addresses.
@@ -1234,4 +1298,48 @@ mod tests {
         let s = connect_from(addr, Some("192.0.2.1".parse().unwrap()), 500).await.expect("falls back to the routed way");
         assert_eq!(s.local_addr().ip().to_string(), "127.0.0.1");
     }
+
+    // --- 1.8: a Machine ID's Direct Link before the Hosted servers --------------------------
+
+    #[test]
+    fn a_machine_id_keeps_the_key_it_was_first_verified_with_on_the_hosted_path_too() {
+        let mut known = Known::default();
+        assert!(known.pin_id("123456789", &[1u8; 32]), "first meeting: pinned");
+        assert!(known.pin_id("123456789", &[1u8; 32]));
+        assert!(!known.pin_id("123456789", &[2u8; 32]), "the servers' word changed: refused");
+        // One met over a Direct Link first: the same pin.
+        let mut known = Known::default();
+        let who = Verified { id: "555".into(), sign_pk: vec![3u8; 32], tailscale: None };
+        known.record(&who, sa(LAN));
+        assert!(!known.pin_id("555", &[4u8; 32]));
+        assert!(known.pin_ok(sa(LAN), "555", &[3u8; 32]));
+    }
+
+    #[test]
+    fn a_reported_tailscale_address_is_kept_only_for_a_pinned_target_and_only_tailscale() {
+        let mut known = Known::default();
+        assert!(!known.learn_tailscale("123", "100.101.102.103".parse().unwrap()), "not pinned: nothing kept");
+        known.pin_id("123", &[1u8; 32]);
+        assert!(!known.learn_tailscale("123", "192.168.1.20".parse().unwrap()), "not a Tailscale address");
+        assert!(known.learn_tailscale("123", "100.101.102.103".parse().unwrap()));
+        assert!(!known.learn_tailscale("123", "100.101.102.103".parse().unwrap()), "unchanged");
+        assert_eq!(known.tailscale_of("123"), Some(sa(TS)));
+        // Its next connect dials that address first, strictly as that Machine ID.
+        let plan = plan_for_machine_id("123", &known).unwrap();
+        assert_eq!((plan.direct, plan.target.as_deref(), plan.dialled), (sa(TS), Some("123"), None));
+        assert!(machine_id_known("123", &known));
+        assert!(!machine_id_known("999", &known), "never met: Hosted only, no name lookups");
+    }
+
+    #[tokio::test]
+    async fn another_computer_answering_at_a_machine_ids_address_is_passed_over() {
+        // Strict plan: the who-check holds at every address, so the connect goes on to Hosted.
+        let plan = Plan { target: Some("123".into()), dialled: None, ..Plan::single(sa(TS), None) };
+        let other = Verified { id: "999".into(), sign_pk: vec![9u8; 32], tailscale: None };
+        let got = judge(&plan, sa(TS), Ok::<_, Failure>(((), Some(other))));
+        assert!(matches!(got, Err(Failure::Stale(_))));
+        let refused = judge::<()>(&plan, sa(TS), Err(Failure::Refused(anyhow!(IDENTITY_CHANGED))));
+        assert!(matches!(refused, Err(Failure::Stale(_))));
+    }
 }
+
